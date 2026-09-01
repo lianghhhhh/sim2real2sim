@@ -1,0 +1,11 @@
+groups:
+  - name: localization.rules
+    rules:
+      - alert: LocalizationServiceDown
+        expr: up{job="ros2_localization"} == 0
+        for: 30s                     # 30s if the service is down
+        labels:
+          severity: critical
+        annotations:
+          summary: "Localization Service Down"
+          description: "The localization service at {{ $labels.instance }} has not responded for >30s."

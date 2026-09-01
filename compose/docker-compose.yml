@@ -1,0 +1,48 @@
+version: '3'
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: always
+    ports:
+      - "8001:8001"  
+    volumes:
+      - ../settings/localization.rules.yml:/etc/prometheus/localization.rules.yml
+      - ../settings/prometheus.yml:/etc/prometheus/prometheus.yml 
+      - prometheus_data:/prometheus
+    networks:
+      - "compose_my_bridge_network"
+    command:
+      - "--web.listen-address=0.0.0.0:8001" 
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus' 
+  # alertmanager:
+  #   image: prom/alertmanager:latest
+  #   container_name: alertmanager
+  #   restart: always
+  #   ports:
+  #     - "9093:9093"
+  #   volumes:
+  #     - ../settings/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+  #   networks:
+  #     - compose_my_bridge_network
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: always
+    ports:
+      - "3000:3000" 
+    networks:
+      - "compose_my_bridge_network"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin" 
+    volumes:
+      - grafana_data:/var/lib/grafana  
+networks:
+  "compose_my_bridge_network":
+    driver: bridge
+
+volumes:
+  prometheus_data: 
+  grafana_data:   

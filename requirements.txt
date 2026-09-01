@@ -1,0 +1,6 @@
+norfair
+pytest
+onnx
+prometheus_client
+opencv-contrib-python==4.6.0.66
+ultralytics

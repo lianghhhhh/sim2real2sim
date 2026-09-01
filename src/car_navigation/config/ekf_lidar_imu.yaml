@@ -1,0 +1,54 @@
+# 只用 LiDAR(scan matching) + IMU 的 2D 位姿估計。
+# odom0 提供絕對的 x/y/yaw (由 ICP 累積, 連續不跳動)
+# imu0  提供高頻的 yaw 角速度與縱向加速度, 補掃描比對之間的空檔
+ekf_filter_node:
+  ros__parameters:
+    use_sim_time: true
+    frequency: 50.0
+    sensor_timeout: 0.2
+    two_d_mode: true
+    publish_tf: true            # 由 EKF 發 odom -> base_link
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom           # 純里程計模式, 不做全域定位
+
+    # ---- 1. LiDAR scan matching odometry ----
+    #        x      y      z
+    #        roll   pitch  yaw
+    #        vx     vy     vz
+    #        vroll  vpitch vyaw
+    #        ax     ay     az
+    odom0: /odom_lidar
+    odom0_config: [true,  true,  false,
+                   false, false, true,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+
+    # ---- 2. IMU ----
+    # 只吃 yaw 角速度。
+    # 不吃 orientation: 真車沒有磁力計時 yaw 是會漂的, 絕對角度應該交給 LiDAR。
+    # (在 Isaac Sim 裡 orientation 是完美的, 想作弊可把第 6 格改成 true)
+    #
+    # 也不吃縱向加速度 (ax), 雖然直覺上它可以補掃描之間的空檔:
+    #   加速度計量到的是「比力」, 車子在轉的時候裡面包含向心加速度 w^2 * r,
+    #   而 r 是 IMU 離旋轉中心的距離 —— 那不是車子真的在前進。這台車的轉向
+    #   測試實測角速度到 24.6 rad/s, 就算 IMU 只偏離旋轉中心 5 cm,
+    #   向心項也有 0.05 * 24.6^2 = 30 m/s^2 (3 個 g), 全部會被 EKF 當成
+    #   縱向加速度積分進速度與位置。掃描比對本來就以 20 Hz 提供 x/y,
+    #   這個空檔不值得用一個會在旋轉時噴出 3g 假訊號的來源去補。
+    imu0: /imu
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 10
+    imu0_remove_gravitational_acceleration: true
