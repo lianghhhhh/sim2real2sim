@@ -1,0 +1,26 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# 虛擬環境
+.venv/
+venv/
+
+# ---- ROS 2 / colcon ----
+# colcon build 產生的, 全部可以重跑 `colcon build` 生回來。
+# 只擋 workspace 根目錄的那三個, 不要誤傷 src/ 底下同名的東西。
+/build/
+/install/
+/log/
+.colcon_install_layout
+
+# ---- 編輯器 / 作業系統 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
