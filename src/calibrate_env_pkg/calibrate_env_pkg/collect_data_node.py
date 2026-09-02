@@ -67,6 +67,18 @@ class CollectDataNode(Node):
             10
         )
 
+        # car_localization 的純 LiDAR+IMU 定位結果 (ros2 launch car_localization
+        # localization.launch.py)。它發的是 map -> base_link 的絕對位姿, 誤差不累積,
+        # 所以跟 /odom (Isaac ground truth) 逐列比對就知道定位有多準。
+        # 這條是「有就記, 沒有就留 NaN」—— 沒開定位節點時照樣可以蒐資料。
+        self.loc_odom_subscriber = self.create_subscription(
+            Odometry,
+            '/localization/odom',
+            self.loc_odom_callback,
+            10
+        )
+        self.latest_loc_odom = self._nan_odom()
+
         # 可透過 ROS2 參數自訂輸出資料夾與檔名，例如：
         #   ros2 run calibrate_env_pkg calibrate_env_node --ros-args \
         #       -p output_dir:=/workspaces -p csv_filename:=gravel_run.csv
@@ -105,14 +117,14 @@ class CollectDataNode(Node):
                 'front_right_velocity',
                 'rear_left_velocity',
                 'rear_right_velocity',
-                'car_position_x', 'yolo_x', 'filtered_car_position_x',
-                'car_position_y', 'yolo_y', 'filtered_car_position_y',
+                'car_position_x', 'yolo_x', 'loc_car_position_x',
+                'car_position_y', 'yolo_y', 'loc_car_position_y',
                 'yolo_px', 'yolo_py', 'yolo_conf',
                 'car_position_z',
-                'car_orientation_x', 'filtered_car_orientation_x',
-                'car_orientation_y', 'filtered_car_orientation_y',
-                'car_orientation_z', 'filtered_car_orientation_z',
-                'car_orientation_w', 'filtered_car_orientation_w',
+                'car_orientation_x', 'loc_car_orientation_x',
+                'car_orientation_y', 'loc_car_orientation_y',
+                'car_orientation_z', 'loc_car_orientation_z',
+                'car_orientation_w', 'loc_car_orientation_w',
                 'car_linear_velocity_x',
                 'car_linear_velocity_y',
                 'car_linear_velocity_z',
@@ -132,6 +144,25 @@ class CollectDataNode(Node):
 
     def odom_callback(self, msg):
         self.latest_odom = msg
+
+    @staticmethod
+    def _nan_odom():
+        # 定位節點沒開的時候用它佔位, 讓 log_data 那邊不用為了少一個來源多寫分支。
+        od = Odometry()
+        od.pose.pose.position.x = float('nan')
+        od.pose.pose.position.y = float('nan')
+        od.pose.pose.orientation.x = float('nan')
+        od.pose.pose.orientation.y = float('nan')
+        od.pose.pose.orientation.z = float('nan')
+        od.pose.pose.orientation.w = float('nan')
+        return od
+
+    def loc_odom_callback(self, msg):
+        # 不做座標轉換: 地圖是從 car.usd 的幾何直接切出來的, 原點就是世界原點,
+        # 跟 Isaac 的 /odom 本來就同一個座標系。改用 slam_toolbox 建的地圖時,
+        # 兩者會差一個常數平移 (見 car_localization/README.md), 那要在地圖 .yaml
+        # 的 origin 修, 不是在這裡修。
+        self.latest_loc_odom = msg
 
     def odom_filtered_callback(self, msg):
         # 把 /odometry/filtered 轉到 Isaac ground truth 的座標系。
@@ -180,8 +211,9 @@ class CollectDataNode(Node):
         if hasattr(self, 'latest_joint_command') and \
             hasattr(self, 'latest_joint_state') and \
             hasattr(self, 'latest_odom') and \
-            hasattr(self, 'latest_odom_filtered') and \
-            hasattr(self, 'latest_yolo_coords'):
+            hasattr(self, 'latest_yolo_coords') and \
+            hasattr(self, 'latest_loc_odom') and \
+            hasattr(self, 'latest_yolo_px'):
             names = self.latest_joint_state.name
             positions = self.latest_joint_state.position
             velocities = self.latest_joint_state.velocity
@@ -211,14 +243,14 @@ class CollectDataNode(Node):
                     cmd_efforts[cmd_fl_idx], cmd_efforts[cmd_fr_idx], cmd_efforts[cmd_rl_idx], cmd_efforts[cmd_rr_idx],
                     positions[fl_idx], positions[fr_idx], positions[rl_idx], positions[rr_idx],
                     velocities[fl_idx], velocities[fr_idx], velocities[rl_idx], velocities[rr_idx],
-                    self.latest_odom.pose.pose.position.x, self.latest_yolo_coords[0], self.latest_odom_filtered.pose.pose.position.x,
-                    self.latest_odom.pose.pose.position.y, self.latest_yolo_coords[1], self.latest_odom_filtered.pose.pose.position.y,
+                    self.latest_odom.pose.pose.position.x, self.latest_yolo_coords[0], self.latest_loc_odom.pose.pose.position.x,
+                    self.latest_odom.pose.pose.position.y, self.latest_yolo_coords[1], self.latest_loc_odom.pose.pose.position.y,
                     self.latest_yolo_px[0], self.latest_yolo_px[1], self.latest_yolo_px[2],
                     self.latest_odom.pose.pose.position.z,
-                    self.latest_odom.pose.pose.orientation.x, self.latest_odom_filtered.pose.pose.orientation.x,
-                    self.latest_odom.pose.pose.orientation.y, self.latest_odom_filtered.pose.pose.orientation.y,
-                    self.latest_odom.pose.pose.orientation.z, self.latest_odom_filtered.pose.pose.orientation.z,
-                    self.latest_odom.pose.pose.orientation.w, self.latest_odom_filtered.pose.pose.orientation.w,
+                    self.latest_odom.pose.pose.orientation.x, self.latest_loc_odom.pose.pose.orientation.x,
+                    self.latest_odom.pose.pose.orientation.y, self.latest_loc_odom.pose.pose.orientation.y,
+                    self.latest_odom.pose.pose.orientation.z, self.latest_loc_odom.pose.pose.orientation.z,
+                    self.latest_odom.pose.pose.orientation.w, self.latest_loc_odom.pose.pose.orientation.w,
                     self.latest_odom.twist.twist.linear.x, self.latest_odom.twist.twist.linear.y, self.latest_odom.twist.twist.linear.z,
                     self.latest_odom.twist.twist.angular.x, self.latest_odom.twist.twist.angular.y, self.latest_odom.twist.twist.angular.z
                 ]

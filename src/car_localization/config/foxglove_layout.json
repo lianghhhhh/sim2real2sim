@@ -1,0 +1,60 @@
+{
+  "configById": {
+    "3D!map": {
+      "cameraState": {
+        "distance": 18,
+        "perspective": false,
+        "phi": 0,
+        "thetaOffset": 0,
+        "target": [0, 0, 0],
+        "targetOffset": [0, 0, 0],
+        "fovy": 45,
+        "near": 0.01,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "followTf": "map",
+      "scene": { "transforms": { "showLabel": false, "axisScale": 0.5 } },
+      "topics": {
+        "/map": { "visible": true, "colorMode": "map", "frameLocked": true },
+        "/scan": { "visible": true, "colorField": "intensity", "pointSize": 3 },
+        "/localization/scan_matched": { "visible": true, "pointSize": 2 },
+        "/localization/pose": { "visible": true }
+      },
+      "layers": {},
+      "publish": { "type": "pose", "poseTopic": "/initialpose" }
+    },
+    "Teleop!drive": {
+      "topic": "/cmd_vel",
+      "publishRate": 10,
+      "upButton": { "field": "linear-x", "value": 0.35 },
+      "downButton": { "field": "linear-x", "value": -0.35 },
+      "leftButton": { "field": "angular-z", "value": 0.6 },
+      "rightButton": { "field": "angular-z", "value": -0.6 }
+    },
+    "Plot!err": {
+      "paths": [
+        { "value": "/localization/odom.pose.pose.position.x", "enabled": true, "timestampMethod": "receiveTime" },
+        { "value": "/localization/odom.pose.pose.position.y", "enabled": true, "timestampMethod": "receiveTime" }
+      ],
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "RawMessages!status": { "topicPath": "/localization/odom.pose.covariance" }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "direction": "row",
+    "first": "3D!map",
+    "second": {
+      "direction": "column",
+      "first": "Teleop!drive",
+      "second": { "direction": "column", "first": "Plot!err", "second": "RawMessages!status", "splitPercentage": 60 },
+      "splitPercentage": 30
+    },
+    "splitPercentage": 68
+  }
+}

@@ -1,0 +1,91 @@
+# car_localization 的預設參數。
+# launch 檔會載入這份, 命令列上再指定的參數會蓋掉這裡的值。
+#
+# 標了「量出來的」的數字不要憑感覺改 —— 它們是從 car.usd 的幾何算出來的,
+# 改了就跟模擬器對不上。想確認可以在 host 上重跑:
+#     python3 -c "..."  或直接看 README 的「外參是怎麼來的」那一節。
+
+car_localizer:
+  ros__parameters:
+    use_sim_time: true
+
+    # ---- topics ----
+    input_type: pointcloud       # pointcloud (Isaac RTX LiDAR) | scan (一般 2D 雷射)
+    cloud_topic: /lidar/point_cloud
+    scan_topic: /scan
+    imu_topic: /imu
+    odom_topic: /localization/odom
+    pose_topic: /localization/pose
+
+    # ---- frames ----
+    map_frame: map
+    odom_frame: odom
+    base_frame: base_link
+    publish_tf: true
+    tf_mode: direct              # direct = 直接發 map->base_link
+
+    # ---- LiDAR 外參 (量出來的) ----
+    # /World/small_car/Cube/World/multiScan136 的世界高度 = 0.200 m,
+    # 相對車體的旋轉是單位矩陣。
+    lidar_translation: [0.0, 0.0, 0.20]
+    lidar_rpy_deg: [0.0, 0.0, 0.0]
+
+    # ---- 地圖 ----
+    map_path: ''                 # 空 = 用 package 內附的 maps/car_usd.npz
+                                 # 也吃 nav2 / slam_toolbox 的 .yaml
+    # localize | mapping | odometry (見 README「三種模式」)
+    mode: localize
+    map_resolution: 0.05
+
+    # ---- 建圖時哪些幀准寫進地圖 (mapping / odometry 模式) ----
+    map_insert_min_inlier: 0.60
+    map_insert_max_residual: 0.05   # 開頭速度還沒估出來的那幾幀殘差會偏大, 擋掉
+
+    # ---- odometry 模式的滾動子圖 ----
+    keyframe_dist: 0.5
+    keyframe_angle: 0.35
+    submap_keyframes: 15
+    submap_radius: 15.0
+    submap_voxel: 0.05
+
+    # ---- 點雲過濾 (z 是世界高度, 地面在 0) ----
+    range_min: 0.30
+    range_max: 40.0
+    z_min: 0.15                  # 地面回波在 z=0, 留 15 cm 餘裕
+    z_max: 0.90                  # 牆頂在 1.00, 避開掠過牆頂的回波
+    max_points: 1500
+
+    # ---- 初始化 ----
+    global_init: true            # 自己在地圖上找車子在哪, 不用填初始位姿
+    initial_pose: [0.0, 0.0, 0.0]
+    global_search_step: 0.20
+    global_search_clearance: 0.25
+
+    # ---- 配準 ----
+    huber: 0.10
+    max_iter: 30
+    inlier_dist: 0.30
+    min_inlier_ratio: 0.50
+    max_residual: 0.25
+    max_failures: 10
+
+    # ---- yaw ----
+    # imu_orientation: 吃 Isaac IMU 的絕對姿態 (模擬裡是精確值), 只解 x/y
+    # gyro           : 陀螺儀積分 + 掃描比對修正 yaw (真車路線, 精度會差一截)
+    yaw_source: imu_orientation
+
+    # ---- 運動補償 ----
+    deskew: true
+    scan_period: 0.0             # 0 = 自己量 (SICK multiScan136 是 20 Hz -> 0.05)
+    scan_stamp: end
+    auto_scan_stamp: true
+    stamp_calib_scans: 20
+    stamp_calib_gyro: 2.0         # 角速度要大於這個 (rad/s) 才拿來校正時戳
+    stamp_calib_giveup: 600
+    deskew_bins: 64
+    deskew_bin_angle: 0.02
+
+    # ---- 輸出 ----
+    extrapolate: true
+    status_period: 2.0
+    publish_debug_cloud: false

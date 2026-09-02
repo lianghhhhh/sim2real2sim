@@ -22,8 +22,8 @@ print(df.head())
 # ==========================================
 df["x_yolo_error"] = df["car_position_x"] - df["yolo_x"]
 df["y_yolo_error"] = df["car_position_y"] - df["yolo_y"]
-df["x_filtered_error"] = df["car_position_x"] - df["filtered_car_position_x"]
-df["y_filtered_error"] = df["car_position_y"] - df["filtered_car_position_y"]
+df["x_loc_error"] = df["car_position_x"] - df["loc_car_position_x"]
+df["y_loc_error"] = df["car_position_y"] - df["loc_car_position_y"]
 
 # ==========================================
 # 4. Plot 1: X 座標比較
@@ -42,19 +42,20 @@ plt.plot(
     label="YOLO X"
 )
 
-# plt.plot(
-#     df["timestamp"],
-#     df["filtered_car_position_x"],
-#     label="Filtered Car Position X"
-# )
+plt.plot(
+    df["timestamp"],
+    df["loc_car_position_x"],
+    label="loc Car Position X"
+)
 
 plt.xlabel("Timestamp")
 plt.ylabel("X Position")
-plt.title("Car Position X vs YOLO X vs Filtered Car Position X")
+plt.title("Car Position X vs YOLO X vs loc Car Position X")
 plt.legend()
 plt.grid(True)
 
 plt.tight_layout()
+plt.savefig("car_run_data/position_x_comparison.png")  # 儲存圖表為 PNG 檔案
 plt.show()
 
 # ==========================================
@@ -74,21 +75,21 @@ plt.plot(
     label="YOLO Y"
 )
 
-# plt.plot(
-#     df["timestamp"],
-#     df["filtered_car_position_y"],
-#     label="Filtered Car Position Y"
-# )
+plt.plot(
+    df["timestamp"],
+    df["loc_car_position_y"],
+    label="loc Car Position Y"
+)
 
 plt.xlabel("Timestamp")
 plt.ylabel("Y Position")
-plt.title("Car Position Y vs YOLO Y vs Filtered Car Position Y")
+plt.title("Car Position Y vs YOLO Y vs loc Car Position Y")
 plt.legend()
 plt.grid(True)
 
 plt.tight_layout()
+plt.savefig("car_run_data/position_y_comparison.png")  # 儲存圖表為 PNG 檔案
 plt.show()
-
 # ==========================================
 # 6. Plot 3: X / Y 誤差 yolo
 # ==========================================
@@ -118,24 +119,25 @@ plt.legend()
 plt.grid(True)
 
 plt.tight_layout()
+plt.savefig("car_run_data/yolo_position_error.png")  # 儲存圖表為 PNG 檔案
 plt.show()
 
 
 
 # ==========================================
-# 7. Plot 4: X / Y 誤差 filtered
+# 7. Plot 4: X / Y 誤差 loc
 # ==========================================
 plt.figure(figsize=(12, 5))
 
 plt.plot(
     df["timestamp"],
-    df["x_filtered_error"],
+    df["x_loc_error"],
     label="X Error"
 )
 
 plt.plot(
     df["timestamp"],
-    df["y_filtered_error"],
+    df["y_loc_error"],
     label="Y Error"
 )
 
@@ -146,11 +148,12 @@ plt.axhline(
 
 plt.xlabel("Timestamp")
 plt.ylabel("Position Error")
-plt.title("Car Position - Filtered Car Position Error")
+plt.title("Car Position - loc Car Position Error")
 plt.legend()
 plt.grid(True)
 
 plt.tight_layout()
+plt.savefig("car_run_data/loc_position_error.png")  # 儲存圖表為 PNG 檔案
 plt.show()
 
 
@@ -171,14 +174,14 @@ print(f"MAE        : {df['y_yolo_error'].abs().mean():.6f}")
 print(f"Max Error  : {df['y_yolo_error'].abs().max():.6f}")
 print(f"RMSE       : {(df['y_yolo_error'] ** 2).mean() ** 0.5:.6f}")
 
-print("\nX Error Filtered:")
-print(f"Mean Error : {df['x_filtered_error'].mean():.6f}")
-print(f"MAE        : {df['x_filtered_error'].abs().mean():.6f}")
-print(f"Max Error  : {df['x_filtered_error'].abs().max():.6f}")
-print(f"RMSE       : {(df['x_filtered_error'] ** 2).mean() ** 0.5:.6f}")
+print("\nX Error loc:")
+print(f"Mean Error : {df['x_loc_error'].mean():.6f}")
+print(f"MAE        : {df['x_loc_error'].abs().mean():.6f}")
+print(f"Max Error  : {df['x_loc_error'].abs().max():.6f}")
+print(f"RMSE       : {(df['x_loc_error'] ** 2).mean() ** 0.5:.6f}")
 
-print("\nY Error Filtered:")
-print(f"Mean Error : {df['y_filtered_error'].mean():.6f}")
-print(f"MAE        : {df['y_filtered_error'].abs().mean():.6f}")
-print(f"Max Error  : {df['y_filtered_error'].abs().max():.6f}")
-print(f"RMSE       : {(df['y_filtered_error'] ** 2).mean() ** 0.5:.6f}")
+print("\nY Error loc:")
+print(f"Mean Error : {df['y_loc_error'].mean():.6f}")
+print(f"MAE        : {df['y_loc_error'].abs().mean():.6f}")
+print(f"Max Error  : {df['y_loc_error'].abs().max():.6f}")
+print(f"RMSE       : {(df['y_loc_error'] ** 2).mean() ** 0.5:.6f}")
