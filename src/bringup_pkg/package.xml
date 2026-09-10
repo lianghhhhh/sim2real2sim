@@ -7,6 +7,16 @@
   <maintainer email="selenahuang0218@gmail.com">liangh</maintainer>
   <license>TODO: License declaration</license>
 
+  <!-- collect_all.launch.py 會叫到的節點 (五條定位線 + 蒐集 + 遙控) -->
+  <exec_depend>calibrate_env_pkg</exec_depend>
+  <exec_depend>car_loc_camera</exec_depend>
+  <exec_depend>car_loc_lidar</exec_depend>
+  <exec_depend>car_loc_imu</exec_depend>
+  <exec_depend>car_loc_wheel</exec_depend>
+  <exec_depend>car_loc_fusion</exec_depend>
+  <exec_depend>car_teleop</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

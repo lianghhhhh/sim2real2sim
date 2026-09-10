@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'calibrate_env_node = calibrate_env_pkg.main:main',
+            # 只蒐資料、不自動開車 (手動 teleop 跑三種定位比較時用這個)
+            'collect_data_node = calibrate_env_pkg.collect_data_node:main',
         ],
     },
 )

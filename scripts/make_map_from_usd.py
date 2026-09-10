@@ -16,11 +16,11 @@
 
 用法 (在 host 上跑, 不是在 docker 裡):
     ./scripts/make_map_from_usd.py
-    ./scripts/make_map_from_usd.py --resolution 0.02 --out src/car_localization/maps/room.npz
-    ./scripts/make_map_from_usd.py car_sim.usd --out src/car_localization/maps/room_sim.npz
+    ./scripts/make_map_from_usd.py --resolution 0.02 --out src/car_loc_lidar /maps/room.npz
+    ./scripts/make_map_from_usd.py car_sim.usd --out src/car_loc_lidar /maps/room_sim.npz
 
 輸出:
-    <out>.npz        car_localization 定位用的地圖
+    <out>.npz        car_loc_lidar  定位用的地圖
     <out>.pgm/.yaml  nav2 / rviz 看得懂的同一張圖 (只是為了肉眼檢查)
 """
 import argparse
@@ -40,8 +40,8 @@ def run_worker(args):
     import numpy as np
     from pxr import Usd, UsdGeom
 
-    sys.path.insert(0, os.path.join(REPO, 'src', 'car_localization'))
-    from car_localization.gridmap import GridMap
+    sys.path.insert(0, os.path.join(REPO, 'src', 'car_loc_lidar '))
+    from car_loc_lidar .gridmap import GridMap
 
     stage = Usd.Stage.Open(args.usd)
     if stage is None:
@@ -277,7 +277,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('usd', nargs='?', default=os.path.join(REPO, 'car.usd'))
-    ap.add_argument('--out', default=os.path.join(REPO, 'src', 'car_localization',
+    ap.add_argument('--out', default=os.path.join(REPO, 'src', 'car_loc_lidar ',
                                                   'maps', 'car_usd.npz'),
                     help='輸出的 .npz (同名的 .pgm/.yaml 也會一起產生)')
     ap.add_argument('--resolution', type=float, default=0.05, help='格點大小 (m)')

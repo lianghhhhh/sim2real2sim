@@ -1,12 +1,144 @@
 # sim2real2sim
 
-Isaac Sim `car.usd` 場景的 LiDAR + IMU 定位 / 建圖。
+Isaac Sim `car.usd` 場景的車輛定位。
+
+## 五種定位方式
+
+**相機、LiDAR、IMU、IMU+輪速 各自獨立成一條路線。** 這四個 package 之間不互相
+import, 每一條也不訂閱別人的 topic —— 這樣才能拿同一趟資料把它們放在一起比較。
+**第五條 (`car_loc_fusion`) 是把它們結合起來的那一個**, 所以那條規則對它不適用。
+
+| package | 感測器 | 怎麼定位 | 細節 |
+| --- | --- | --- | --- |
+| `car_loc_camera` | 只有 `/rgb` | YOLO 找出車在畫面中的位置 -> 單應性投影成世界座標 -> 等速卡爾曼濾波 | [README](src/car_loc_camera/README.md) |
+| `car_loc_lidar` | 只有 `/scan` (Oradar MS200) | 手動開車用 slam_toolbox 建圖 -> 掃描對地圖 3 自由度配準 | [README](src/car_loc_lidar/README.md) |
+| `car_loc_imu` | 只有 `/imu` | EKF 慣性推算 + ZUPT / ZARU / NHC / 零偏估計 抗漂移 | [README](src/car_loc_imu/README.md) |
+| `car_loc_wheel` | `/imu` + `/joint_states` | 7 維 EKF 航位推算: 輪速給前進速度、陀螺儀給 yaw、打滑三道防線 | [README](src/car_loc_wheel/README.md) |
+| `car_loc_fusion` | **全部** | 方法五: 遞推 (IMU+輪速) + 絕對量測 (相機/LiDAR) + 倒帶重放補延遲 | [README](src/car_loc_fusion/README.md) |
+| `car_teleop` | — | 手動開車 (建圖時要用) | [README](src/car_teleop/README.md) |
+
+> 五種方法的實作細節、誤差量測與橫向比較: **[report_5methods.md](report_5methods.md)**
+
+前四條**互不相干** (才能公平比較); `car_loc_fusion` 是把它們結合起來的那一條 ——
+它訂閱前兩條的輸出當絕對量測, 自己吃 `/imu` + `/joint_states` 做高頻遞推。
+離線 bench 上融合 **1.35 cm** vs 只有相機 5.42 / 只有 LiDAR 6.97 / 只有航位推算
+7.55 cm; 但它真正的價值在**相機被擋住的那 10 秒** (174 cm -> 1.5 cm)。
+
+```bash
+# 方法一
+ros2 launch car_loc_camera camera_loc.launch.py evaluate:=true
+
+# 方法二 —— 先建圖 (手動開一圈), 再定位
+# (第一次要先在 host 上跑 ./scripts/setup_oradar_lidar.py 把 car.usd 的雷射
+#  設成 MS200, 見 src/car_loc_lidar/README.md 第 0 節)
+ros2 launch car_loc_lidar mapping.launch.py
+ros2 run nav2_map_server map_saver_cli -f /workspaces/src/car_loc_lidar/maps/room
+ros2 launch car_loc_lidar lidar_loc.launch.py evaluate:=true
+
+# 方法三 (開始前先讓車停幾秒, 要做靜止校正)
+ros2 launch car_loc_imu imu_loc.launch.py evaluate:=true
+
+# 方法四 (同上, 但只要停 1 秒)
+ros2 launch car_loc_wheel wheel_loc.launch.py evaluate:=true
+
+# 方法五 —— 相機 + LiDAR + 融合一起開 (要先有地圖與 YOLO 模型)
+ros2 launch car_loc_fusion fusion_loc.launch.py evaluate:=true
+```
+
+每一條都有 `evaluate:=true`, 會拿 Isaac 的 ground truth `/odom` 當尺即時報誤差,
+Ctrl-C 印總結。多條同時跑的時候**只能留一條發 `map -> base_link`**, 其他的
+加 `publish_tf:=false`。
+
+### 五條一起跑, 跟 GT 記成同一份 CSV
+
+```bash
+# 車子生在哪裡: ros2 topic echo /odom --once --field pose.pose.position
+ros2 launch bringup_pkg collect_all.launch.py \
+    imu_initial_pose:="[2.0, -0.3, 0.0]" csv_filename:=all_loc.csv
+ros2 run car_teleop teleop_key          # 另開 terminal 手動開車
+```
+
+一列 = 一個時刻的六個答案 (`car_run_data/all_loc.csv`):
+
+| 欄位 | 來源 |
+| --- | --- |
+| `car_position_x/y`, `gt_yaw` | `/odom` — Isaac ground truth |
+| `cam_x/y/yaw` | `/camera_loc/odom` |
+| `lid_x/y/yaw` | `/lidar_loc/odom` |
+| `imu_x/y/yaw` | `/imu_loc/odom` |
+| `whl_x/y/yaw` | `/wheel_loc/odom` |
+| `fus_x/y/yaw` | `/fusion_loc/odom` (方法五, 吃 cam_ 與 lid_ 的輸出) |
+
+每一組還配 `_stamp` 跟 `_age`, **兩個都要用**:
+
+- `_stamp` 是那個來源自己的時戳。同一列的五個值**不是同一個時刻**的
+  (相機 ~30 Hz、LiDAR 10 Hz、IMU 200 Hz、記錄器 20 Hz), 算誤差前要先用它內插
+  對齊。0.8 m/s 時 50 ms 的錯位就是 4 cm —— 跟 LiDAR 的真實誤差同一個量級。
+- `_age` 是「這個值放多久了」。節點掛掉時最後一個值會被一路複製到檔尾, 看起來
+  像車子停著不動, 統計出來的誤差是假的。先 `df[df.lid_age < 0.3]` 再算 RMS。
+
+`tf_source` 決定誰發 `map -> base_link` (預設 `fusion`), 只蒐 CSV 的話設
+`tf_source:=none`。不想跑 YOLO 就加 `camera:=false` (那時 `fus_` 也跟著少一個
+來源)。**IMU 與輪速那兩條一定要給 `imu_initial_pose`**, 它們從那裡開始積分,
+沒對到出生點的話整段差一個常數平移, 看起來像超大飄移 —— **融合那條不用給**,
+它拿第一則絕對量測當起點。
+
+`fus_` 跟 `cam_`/`lid_` **不獨立** (融合吃的就是那兩條的輸出), 拿它們比是公平的
+但不要當成獨立樣本。`fus_sigma` 也不同: 它不是單調長大的 (那是 `imu_`/`whl_`),
+也不是「這一幀追丟了」(那是 `lid_`), 而是「所有來源合起來還剩多少不確定」——
+用它切出「那幾秒只有遞推在撐」的片段。
+
+每一條路線都有**不需要 ROS / Isaac 的離線測試**, README 裡的每一個數字都是
+它印出來的 —— 改了參數想知道值不值得就重跑它:
+
+```bash
+cd src/car_loc_camera && python3 test/test_tracker.py    # 秒級
+cd src/car_loc_lidar  && python3 test/test_matcher.py    # 約 20 秒
+cd src/car_loc_imu    && python3 test/test_ins.py        # 秒級
+```
+
+各自的精度上限 (每一條的 README 都有實測數字與推導):
+
+| 方法 | 誤差主要來自 | 大概的量級 |
+| --- | --- | --- |
+| 相機 | **校正模型**, 不是 YOLO (校正殘差 7.26 cm ≈ 實測誤差 7.4 cm) | 濾波後 5~6.5 cm, yaw 只有 ~20°; 看不到車就完全沒有輸出 |
+| LiDAR | **地圖解析度** (誤差 ≈ 0.7 x 格點大小) | 5 cm 的圖 -> 一般行駛 5 cm; 轉速 >8 rad/s 或走廊等幾何退化處會追丟 |
+| IMU | **姿態誤差** (傾斜 1 度 = 0.17 m/s² 的假加速度) | 隨時間長大; 撐多久取決於多久停一次車 |
+| IMU+輪速 | **yaw 誤差 x 走過的距離** (輪速把 t² 變成距離的一次式) | 走 100 m 而 yaw 差 1 度 = 1.7 m |
+| 融合 | **絕對量測的延遲**沒補的話 = v x 80 ms (不是精度問題, 是時間軸) | 補了 1.4 cm; 沒補 3 m/s 時 27 cm |
+
+---
+
+## 感測器 (2026-09 換過)
+
+車上的雷射已經從模擬用的 SICK multiScan136 (3D, 16 線, 40 m) 換成實體車那顆
+**Oradar MS200** (2D 單線, 12 m, 10 Hz, 一圈 450 點)。`car.usd` 裡的 prim 是
+`/World/small_car/Cube/oradar_ms200`, 掛在 world z = 0.200。
+
+* 設定的方法與踩過的坑: [src/car_loc_lidar/README.md](src/car_loc_lidar/README.md) 第 0 節
+* topic 從 `/lidar/point_cloud` (PointCloud2) 換成 **`/scan`** (LaserScan),
+  跟實體車的 MS200 驅動完全一致
+* `car.usd` 的原始備份在 `car.usd.bak`
+
+---
+
+## 舊的做法 (LiDAR + IMU 融合, 保留參考)
+
+下面這一整段是把 LiDAR 與 IMU **融合**在一起的舊路線。它精度最好, 但三種感測器
+綁在一起, 沒辦法單獨評估任何一種。
+
+> **這一段的指令現在不會直接跑起來** —— 它們吃的是 `/lidar/point_cloud`, 而雷射
+> 換成 MS200 之後那個 topic 不存在了。`car_localization` 本來就有
+> `input_type:=scan` 這條路, 要跑的話加上
+> `input_type:=scan scan_topic:=/scan range_max:=12.5`。
+> `scripts/fix_car_usd_lidar.py` 也已經過時 (它找的是 multiScan136 那顆 prim)。
 
 | package | 做什麼 | 細節 |
 | --- | --- | --- |
 | `car_localization` | 定位、建圖、Foxglove 橋接 | [README](src/car_localization/README.md) |
-| `car_teleop` | 手動開車 (建圖時要用) | [README](src/car_teleop/README.md) |
-| `car_navigation` | 舊的做法 (rf2o / ICP + EKF), 保留參考 | |
+| `car_inference` | 相機 + YOLO (只發位置, 沒有濾波) | |
+| `car_loc_eskf` / `car_loc_mcl` / `car_loc_graph` / `car_loc_robust` | 各種融合濾波器 | |
+| `car_navigation` | 更舊的做法 (rf2o / ICP + EKF) | |
 
 ---
 
@@ -69,8 +201,9 @@ tmux  # 再 ctrl+b, shift+' -> 多開幾個終端
 **先確認 Isaac 真的在發資料**:
 
 ```bash
-ros2 topic hz /lidar/point_cloud   # 應該 ~20 Hz
+ros2 topic hz /scan                # 應該 ~10 Hz (Oradar MS200)
 ros2 topic hz /imu                 # 應該 ~60 Hz
+ros2 topic echo /scan --field ranges --once | head -3   # 一圈應該是 450 筆
 ```
 
 ---
