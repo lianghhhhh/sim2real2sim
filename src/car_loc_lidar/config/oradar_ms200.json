@@ -1,0 +1,56 @@
+{
+    "_comment_what": "Oradar MS200 的 Isaac RTX Lidar profile。scripts/setup_oradar_lidar.py 會把這裡的 profile 寫進 car.usd 裡 OmniLidar prim 的 omni:sensor:Core:* 屬性。",
+    "_comment_why": "Isaac Sim 5.x 的 IsaacSensorCreateRtxLidar 只認 SUPPORTED_LIDAR_CONFIGS 裡註冊過的『名字』(對應 assets server 上的 .usd), 給絕對路徑不會生效 —— 它會印一行 warning 然後退回預設的 Generic/LidarCore (128 線, 仰角 ±15 度, 200 m)。而 data/lidar_configs/ 這個 JSON 資料夾在 extension.toml 裡註明是給『(deprecated) camera-based Lidar』用的。新的 OmniLidar prim 是直接讀 USD 屬性, 所以正確做法是把 profile 寫進屬性。",
+    "_comment_specs": "數值取自 MS200 規格書: 量程 0.03~12 m, 掃描 10 Hz (可調 5~15), 取樣 4500 Hz, 角解析度 0.8 度 (= 4500/10 = 450 點/圈), 905 nm。跟你手上那顆對不上就改這裡再重跑腳本。",
+    "_comment_measured": "**規格書是名目值, 實測不一樣**: Isaac 實際一圈只打到約 300 點, 而 /scan 的 bin 數仍是 450 -> 有 150 個 bin 永遠是 -1 (下游 scan.py 的 laserscan_to_xyz 會濾掉, 不影響定位)。離線 bench 量過 450 vs 300 的差別: 8 rad/s 以內**完全一樣** (8 字形 5.02 vs 5.03 cm), 只有超過 8 rad/s 時 300 點比較容易鎖到 180 度。所以**不需要**為了補滿 450 去動 reportRateBaseHz。用 scripts/check_scan.py 量。",
+
+    "class": "sensor",
+    "type": "lidar",
+    "name": "Oradar MS200",
+    "driveWorksId": "GENERIC",
+    "profile":
+    {
+        "scanType": "rotary",
+        "intensityProcessing": "normalization",
+        "rotationDirection": "CW",
+        "rayType": "IDEALIZED",
+
+        "nearRangeM": 0.03,
+        "farRangeM": 12.0,
+        "minDistBetweenEchos": 0.05,
+
+        "rangeResolutionM": 0.01,
+        "rangeAccuracyM": 0.02,
+
+        "avgPowerW": 0.004,
+        "minReflectance": 0.1,
+        "minReflectanceRange": 12.0,
+        "wavelengthNm": 905.0,
+        "pulseTimeNs": 5,
+
+        "azimuthErrorMean": 0.0,
+        "azimuthErrorStd": 0.0,
+        "elevationErrorMean": 0.0,
+        "elevationErrorStd": 0.0,
+
+        "maxReturns": 1,
+
+        "scanRateBaseHz": 10.0,
+
+        "_comment_reportRate": "每秒打幾個點 = 每圈點數 x 掃描頻率 = 450 x 10。NVIDIA 自己的 Debug_Rotary.json 就是這樣註記的 ('36 * 6')。原本填 14 的話一圈只會有 1.4 個點。實際打到的比這個少, 見上面的 _comment_measured。",
+        "reportRateBaseHz": 4500,
+
+        "_comment_emitter": "單線 2D 雷射: 一顆發射器, 仰角 0。**少了 emitterStates 就不會變成 2D** —— 那是原本那份設定最關鍵的缺漏, 沒有它會沿用預設的 128 線 ±15 度排列。",
+        "numberOfEmitters": 1,
+        "emitterStateCount": 1,
+        "emitterStates": [
+        {
+          "azimuthDeg": [0],
+          "elevationDeg": [0],
+          "fireTimeNs": [0]
+        }
+        ],
+
+        "intensityMappingType": "LINEAR"
+    }
+}

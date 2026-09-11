@@ -1,0 +1,121 @@
+# 方法二 (只用 LiDAR) 的定位節點參數。
+# 感測器: Oradar MS200 —— 2D 單線, 360 度, 0.03~12 m, 10 Hz。
+# 一圈 450 個 bin 是規格書的名目值 (4500/10), **Isaac 實際打到的是約 300 點**
+# —— 剩下的 bin 是 -1, 由 scan.py 濾掉。用 scripts/check_scan.py 量。
+# 模擬與實體車是同一顆規格, 所以這份參數兩邊共用。
+lidar_localizer:
+  ros__parameters:
+    input_type: scan              # MS200 發的是 LaserScan
+    scan_topic: /scan
+    cloud_topic: /lidar/point_cloud    # 只有換回 3D 雷射 (input_type: pointcloud) 才用
+    map_frame: map
+    base_frame: base_link
+    publish_tf: true
+    tf_mode: direct               # 直接發 map->base_link (這條路沒有別的里程計)
+
+    # 從 car.usd 量出來的掛載位置, 不要憑感覺改。
+    # /World/small_car/Cube/oradar_ms200 的世界高度就是 0.200 ——
+    # scripts/setup_oradar_lidar.py 每次都會把實際值印出來, 兩邊要一致。
+    lidar_translation: [0.0, 0.0, 0.20]
+    lidar_rpy_deg: [0.0, 0.0, 0.0]
+
+    map_path: ''                  # 空 = 用 package 內附的 maps/room.yaml
+
+    # MS200 量程 0.03~12 m。
+    # range_max 要**比感測器上限大一點**: 11.99 m 的牆被雜訊推到 12.01 就整個
+    # 被丟掉了; 真的沒打到東西的射線是 inf/0, 本來就會被 finite 跟 range_min 擋掉。
+    # range_min 一定要 > 0 —— 無效回波的座標是 0, 靠它濾。
+    range_min: 0.05
+    range_max: 12.5
+    # z_min/z_max 只有 input_type: pointcloud 才會用到 (2D 雷射本來就只有一個
+    # 水平切片, 沒有高度可以濾)。
+    z_min: 0.15
+    z_max: 0.90
+    max_points: 1500              # 一圈才 300~450 點, 這個上限不會觸發
+
+    global_init: true             # 自己在整張地圖找, 不用填初始位姿
+    initial_pose: [0.0, 0.0, 0.0]
+    global_search_step: 0.30
+    global_search_clearance: 0.25
+    global_yaw_bins: 72           # 5 度一格。只有雷射的時候 yaw 也是未知的
+
+    huber: 0.10
+    max_iter: 40
+    inlier_dist: 0.30
+    min_inlier_ratio: 0.50
+    max_residual: 0.25
+    max_failures: 8
+
+    # 鎖死偵測: 追丟之後鎖到 180 度對稱解, 殘差 3~7 cm / inlier 52~77% 還是過得了
+    # 上面那兩個門檻, 永遠不會連續失敗 max_failures 次 -> 永遠不會重定位。
+    # 2026-09-11 全開測試就這樣從 t=82 s 鎖到結束 (131 s)。實測的分界 (lidar_loc 記錄):
+    #   正確 靜止  殘差 p90 0.25 cm, 直線 (v 最高 2.8 m/s) 最大 1.87 cm, inlier >= 95%
+    #   鎖死 180°  殘差 2.66~7.05 cm, inlier 52~77%
+    # 所以車子幾乎沒在轉 (|omega| < lock_omega) 時, 連續 lock_scans 幀殘差 > lock_residual
+    # 或 inlier < lock_inlier 就判定鎖死, **整張地圖**重新全域定位 (不限半徑 ——
+    # 鎖死時的位置本身就在房間對面, 在它附近找永遠找不到真值)。
+    # 轉彎時殘差本來就會變大 (補償誤差), 那時候不判斷。
+    lock_residual: 0.025
+    lock_inlier: 0.85
+    lock_omega: 0.5
+    lock_scans: 15
+
+    # 配準失敗時先掃一圈角度再試一次。
+    # **MS200 (10 Hz) 上預設關掉**, 這是量出來的結論 (test/test_matcher.py):
+    #   可追蹤範圍內 (自旋 <= 8 rad/s) 配準根本不會失敗, 重試永遠不會觸發;
+    #   超出範圍 (9 rad/s) 時它用一個蓋不住真值的範圍去掃, 反而更容易鎖到
+    #   180 度反方向 —— 85 cm 變成 160 cm。
+    # 換回 20 Hz 的 3D 雷射 (input_type: pointcloud) 時請打開, 那邊是大勝:
+    #   20 rad/s 自旋 200 幀, 不重試 114.60 cm / 122 幀失敗 -> 有重試 3.53 cm / 0 幀。
+    sweep_on_fail: false
+    sweep_yaw_span: 0.7
+    sweep_yaw_max: 1.2
+    sweep_xy_span: 0.3
+
+    v_max: 4.0
+    omega_max: 25.0
+    twist_alpha: 0.5
+
+    # 運動補償。MS200 一圈是 100 ms —— 比之前的 20 Hz 3D 雷射**長一倍**,
+    # 所以這一項現在更重要, 不是可有可無。
+    deskew: true
+    scan_period: 0.0              # 0 = 從連續兩則訊息的時間差自己量
+    # Isaac 的 laser_scan 依**方位角遞增**排序, 而 MS200 是 CW 旋轉 ->
+    # 索引順序跟發射順序相反。猜錯的症狀: 直線走正常, 一轉彎殘差變兩倍。
+    #
+    # !! 2026-09-08 曾經照 auto_scan_stamp 的投票改成 forward/mid, **結果是錯的**:
+    #    用它建出來的地圖從 10.15x6.30 m 爛成 11.75x11.15 m (房間被剪切成菱形),
+    #    到真實牆面的中位誤差 3.7 cm -> 45.4 cm。已改回 reverse/end。
+    #    投票會出錯的原因見下面 stamp_calib_omega 的說明。
+    scan_stamp: end
+    time_order: reverse
+    # 開著就自己把 (頭/中/尾) x (順/逆) 六種組合試一遍用殘差投票, 並印出結果。
+    #
+    # !! **它的結論不可以直接採信** —— 2026-09-08 它投給 forward/mid (殘差 3.79 cm
+    #    vs reverse/end 5.12 cm), 但拿那組值重新建圖, 地圖直接爛掉 (見上面)。
+    #    要採信一個新結論, **唯一的驗收是重建一次地圖再量佔據範圍**, 不是看殘差。
+    #
+    # !! 2026-09-11 **預設關掉**。跟 bringup collect_all (摩擦力腳本, 自旋到 12 rad/s)
+    #    一起跑時又投錯一次: 在 w0=11 自旋那 15 幀投給 forward/end, 之後每次轉彎
+    #    補償都補反, 慢速移位也一直配準失敗 (inlier 38~49%)。reverse/end 已經由
+    #    建圖驗收過, 直接用寫死的值。要重新校正時才手動打開, 並且只用 teleop 慢慢開。
+    auto_scan_stamp: false
+    stamp_calib_scans: 15
+    # 角速度要大於這個才拿來投票 —— 直線走的時候六種組合的殘差幾乎一樣, 投不出
+    # 東西。**這個值一定要低於 car_teleop 的轉向上限** (cmd_vel_bridge.py 的
+    # max_angular, 預設 1.2), 否則手開車時永遠觸發不到, 校正等於沒開。
+    # 原本填 1.5 > 1.2, 所以從來沒有校正過一次。
+    #
+    # !! 這是**下限**, 沒有上限 —— 跑摩擦力測試腳本時車子會自旋到 14 rad/s,
+    #    遠超過追蹤上限 8 rad/s (見 README 第 4 節)。那些幀的配準本來就是壞的,
+    #    拿它們投票投出來的答案沒有意義。2026-09-08 投錯就是這樣來的。
+    #    **要校正就用 teleop 慢慢開**, 不要跟摩擦力腳本一起跑。
+    stamp_calib_omega: 1.0
+
+    publish_scan: true
+    scan_out_topic: /lidar_loc/scan     # 不要蓋掉感測器自己的 /scan
+    scan_out_bins: 450
+    publish_map: true
+    map_topic: /map
+    publish_debug_cloud: false
+    status_period: 2.0

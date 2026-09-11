@@ -3,7 +3,7 @@
 
 用法:
     python3 scripts/calibrate_camera_ground.py car_run_data/sim_data.csv
-    python3 scripts/calibrate_camera_ground.py run.csv -o src/car_inference/config/camera_ground.yaml
+    python3 scripts/calibrate_camera_ground.py run.csv -o src/car_loc_camera/config/camera_ground.yaml
     python3 scripts/calibrate_camera_ground.py run.csv --model homography+radial
 
 CSV 需要的欄位:
@@ -84,7 +84,7 @@ def report(name, err):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('csv')
-    ap.add_argument('-o', '--output', default='src/car_inference/config/camera_ground.yaml')
+    ap.add_argument('-o', '--output', default='src/car_loc_camera/config/camera_ground.yaml')
     ap.add_argument('--model', default='homography',
                     choices=['affine', 'homography', 'homography+radial'],
                     help='預設 homography。實測這台相機幾乎是純針孔投影, '

@@ -1,0 +1,81 @@
+# 方法一 (相機 + YOLO) 的節點參數。
+# 只列跟預設值不同或是最常調的; 完整清單看 camera_loc_node.py 的 declare_parameter。
+camera_localizer:
+  ros__parameters:
+    image_topic: /rgb
+    map_frame: map
+    base_frame: base_link
+    publish_tf: true
+    publish_annotated: true
+
+    # YOLO —— imgsz 必須跟 best.onnx 匯出時的尺寸一致 (512), 改了會直接報
+    # "Got invalid dimensions for input: images"
+    imgsz: 512
+    conf: 0.25
+
+    # 挑框: 離預測位置 1 m 內的才算。誤判 (影子/反光) 幾乎都在別的地方。
+    gate_radius: 1.0
+    gate_giveup: 10
+
+    # 濾波器 —— accel_sigma 是唯一真的需要調的那一個。
+    # 規則: **設成車子的峰值加速度 (m/s^2)**。設太小比設太大危險得多 ——
+    # 合成軌跡實測 (test/test_tracker.py, 量測雜訊照校正檔的 1.53 cm),
+    # 峰值 1.66 m/s^2 的高機動軌跡上:
+    #   accel_sigma=1 -> 4.63 cm, 而且 800 幀裡有 **108** 幀**正確的**量測被
+    #                    卡方閘門擋掉 (濾波器過度自信的典型症狀)
+    #   accel_sigma=3 -> 1.61 cm, 擋掉 2 幀
+    #   accel_sigma=5 -> 1.70 cm, 擋掉 0 幀
+    # 代價是設大了低速段會稍差 (慢速軌跡 1.31 -> 1.69 cm), 但那是 4 mm 的事,
+    # 而設小了是 3 cm + 擋掉正確量測。
+    #
+    # 2026-09-09: 原本是 2.0, 但 car_run_data/sim_data.csv 的 B1~B4 機動測試
+    # 量到峰值加速度 **4.78 m/s^2** (峰值速度 3.74 m/s), 照上面的規則就該是 5.0。
+    # 拿那份資料的原始 yolo_px 離線重跑真正的 ConstVelTracker 掃一遍
+    # (配新的 camera_ground.yaml: delay=0.0795, 重擬的 H + distortion):
+    #   sa=2 -> RMS 2.72 cm, 而且擋掉 **44** 幀正確的量測  <-- 就是上面那個症狀
+    #   sa=3 -> RMS 2.30 cm, 擋掉 23 幀
+    #   sa=5 -> RMS 2.12 cm, 擋掉  7 幀   <-- 這裡開始平掉
+    #   sa=8 -> RMS 2.09 cm, 擋掉  3 幀
+    # 5.0 以上就沒有再變好, 所以取 5.0 (= 量到的峰值加速度, 不是掃出來的最佳值,
+    # 兩者剛好一致才是這個規則可信的理由)。
+    accel_sigma: 5.0
+    meas_sigma: -1.0        # <0 = 用校正檔自己報的 residual_rms
+    # 這份資料量到的峰值速度是 3.74 m/s, 只差 7% 就頂到這個上限。
+    # 車再快一點 (或 B3 的目標速度再往上調) 就要一起放大, 不然濾波器會削速度,
+    # 而削掉的速度會直接變成朝向 (yaw 從速度方向推) 與延遲補償的誤差。
+    v_max: 4.0
+    chi2: 9.21              # 2 自由度卡方 99%
+    force_accept_after: 8   # 連續擋這麼多次就強制接受 (車被搬走時的逃生門)
+
+    # 朝向: 從速度方向推。低於 yaw_min_speed 就維持上一個值。
+    # allow_reverse 見 tracker._update_yaw 的說明 —— 預設關著是刻意的。
+    yaw_min_speed: 0.15
+    yaw_init_speed: 0.30
+    allow_reverse: false
+
+    # base_link 的 x 軸領先行進方向多少度。濾波器只看得到行進方向, 這一項把它
+    # 轉成 base_frame 真正的朝向。
+    # car.usd 量出來是 +90 度 —— GT 的行進方向減 gt_yaw 是 -90.00 度,
+    # IQR [-90, -90] (n=508, car_run_data/sim_data.csv), 也就是這台車
+    # base_link 的前方是 -y 不是 x。
+    # 之前是 0 (等於假設 x 就是前方), 所以發出去的 map->base_link 整個轉了
+    # 90 度, twist 也把前進速度掛到錯的軸 —— 位置準到 2 cm 也一樣不能用。
+    # 換車 / 改 USD 的軸向就要重量。
+    yaw_offset_deg: 90.0
+
+    lost_after: 1.0
+    reset_after: 3.0
+    status_period: 2.0
+
+    # 額外發 /camera_loc/odom_now = 外推到現在的位姿, 並且讓 TF 走這條路。
+    # 為什麼需要: /camera_loc/odom 是**影像時刻**的狀態配影像時刻的時戳
+    # (依時戳內插的融合節點要的是那個), 但 TF / nav 問的是「現在在哪」,
+    # 而最新一則已經是 delay + 半個影像週期 = 中位數 100 ms 之前的事。
+    # 離線實測 (50 Hz 查詢, car_run_data/sim_data.csv):
+    #   不外推: RMS 7.25 cm, spd>1.5 時 24.98 cm, 最大 67.3 cm
+    #   外推:   RMS 2.65 cm, spd>1.5 時  8.95 cm, 最大 29.9 cm
+    # 代價: 靜止時 0.55 -> 0.63 cm (推的是速度雜訊), 急加速時等速模型會衝過頭
+    # (|a|>3 m/s^2: 17.48 -> 7.49 cm)。兩者都遠小於省下來的。
+    # 追丟超過 lost_after 就停止外推, 不會愈推愈假。
+    predict_rate: 50.0
+    tf_predict: true

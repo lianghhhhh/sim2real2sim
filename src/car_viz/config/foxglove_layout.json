@@ -1,0 +1,85 @@
+{
+  "configById": {
+    "3D!map": {
+      "cameraState": {
+        "distance": 14,
+        "perspective": false,
+        "phi": 0,
+        "thetaOffset": 0,
+        "target": [0, 0, 0],
+        "targetOffset": [0, 0, 0],
+        "fovy": 45,
+        "near": 0.01,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "followTf": "map",
+      "scene": {
+        "transforms": { "showLabel": false, "axisScale": 0.5 }
+      },
+      "topics": {
+        "/map": { "visible": true, "colorMode": "map", "frameLocked": true },
+        "/scan": { "visible": true, "pointSize": 3 },
+        "/lidar_loc/scan_matched": { "visible": true, "pointSize": 2 },
+        "/odom": { "visible": true },
+        "/camera_loc/pose": { "visible": true },
+        "/lidar_loc/pose": { "visible": true },
+        "/imu_loc/pose": { "visible": false },
+        "/wheel_loc/pose": { "visible": true },
+        "/fusion_loc/pose": { "visible": true }
+      },
+      "layers": {}
+    },
+    "Image!yolo": {
+      "cameraState": {},
+      "imageMode": { "imageTopic": "/camera_loc/detections/compressed" }
+    },
+    "Teleop!drive": {
+      "topic": "/cmd_vel",
+      "publishRate": 10,
+      "upButton": { "field": "linear-x", "value": 0.35 },
+      "downButton": { "field": "linear-x", "value": -0.35 },
+      "leftButton": { "field": "angular-z", "value": 0.6 },
+      "rightButton": { "field": "angular-z", "value": -0.6 }
+    },
+    "Plot!x": {
+      "paths": [
+        { "value": "/odom.pose.pose.position.x", "enabled": true, "timestampMethod": "receiveTime" },
+        { "value": "/camera_loc/odom.pose.pose.position.x", "enabled": true, "timestampMethod": "receiveTime" },
+        { "value": "/lidar_loc/odom.pose.pose.position.x", "enabled": true, "timestampMethod": "receiveTime" },
+        { "value": "/wheel_loc/odom.pose.pose.position.x", "enabled": true, "timestampMethod": "receiveTime" },
+        { "value": "/fusion_loc/odom.pose.pose.position.x", "enabled": true, "timestampMethod": "receiveTime" }
+      ],
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp"
+    },
+    "RawMessages!cov": {
+      "topicPath": "/fusion_loc/odom.pose.covariance"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "direction": "row",
+    "first": "3D!map",
+    "second": {
+      "direction": "column",
+      "first": "Image!yolo",
+      "second": {
+        "direction": "column",
+        "first": "Teleop!drive",
+        "second": {
+          "direction": "column",
+          "first": "Plot!x",
+          "second": "RawMessages!cov",
+          "splitPercentage": 65
+        },
+        "splitPercentage": 25
+      },
+      "splitPercentage": 35
+    },
+    "splitPercentage": 65
+  }
+}

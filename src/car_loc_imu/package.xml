@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>car_loc_imu</name>
+  <version>1.0.0</version>
+  <description>方法三: 只用 IMU 定位 (慣性推算)。EKF + 零速更新 / 零角速更新 / 非完整約束 / 線上零偏估計, 盡量壓住漂移。不吃 LiDAR, 不吃相機。</description>
+  <maintainer email="selenahuang0218@gmail.com">liangh</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <depend>python3-numpy</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <!-- 只有 launch 的 teleop:=true 會用到 (拿來開車, 跟定位無關) -->
+  <exec_depend>car_teleop</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

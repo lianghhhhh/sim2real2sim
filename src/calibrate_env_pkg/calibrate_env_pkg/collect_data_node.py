@@ -223,10 +223,10 @@ class CollectDataNode(Node):
                 lambda msg, s=src: s.update(msg, self._now()), 10)
 
         # ------------------------------------------------------------------
-        # 以下兩條是**舊做法**的欄位 (相機/雷射/IMU 融合成一個估計)。留著是為了
-        # 讓既有的 CSV 分析腳本 (scripts/calibrate_camera_ground.py、
-        # car_cam_calib/fit_csv.py) 跟舊資料還能對得起來; 新的評估請用上面
-        # cam_/lid_/imu_/whl_ 那四組。沒開那些節點時整欄都是 NaN, 不用管。
+        # 以下兩條是**舊做法**的欄位 (car_inference 的 /camera/pose 與
+        # car_localization 的 /localization/odom)。那兩個 package 已經刪掉, 所以
+        # 現在這幾欄**永遠是 NaN** —— 留著只是為了 CSV 欄位格式不變, 讓舊資料跟
+        # 舊的分析腳本還對得起來。新的評估請用上面 cam_/lid_/imu_/whl_/fus_ 那五組。
         # ------------------------------------------------------------------
         self.camera_pose_subscriber = self.create_subscription(
             PoseStamped,
@@ -345,10 +345,10 @@ class CollectDataNode(Node):
         return od
 
     def loc_odom_callback(self, msg):
-        # 不做座標轉換: 地圖是從 car.usd 的幾何直接切出來的, 原點就是世界原點,
-        # 跟 Isaac 的 /odom 本來就同一個座標系。改用 slam_toolbox 建的地圖時,
-        # 兩者會差一個常數平移 (見 car_localization/README.md), 那要在地圖 .yaml
-        # 的 origin 修, 不是在這裡修。
+        # 不做座標轉換: 舊的 car_localization (已刪) 用的地圖是從 car.usd 的幾何
+        # 直接切出來的, 原點就是世界原點, 跟 Isaac 的 /odom 同一個座標系。改用
+        # slam_toolbox 建的地圖時兩者會差一個常數平移, 那要在地圖 .yaml 的 origin
+        # 修, 不是在這裡修。
         self.latest_loc_odom = msg
 
     def scenario_callback(self, msg):

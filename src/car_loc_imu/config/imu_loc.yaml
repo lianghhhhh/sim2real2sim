@@ -1,0 +1,89 @@
+# 方法三 (只用 IMU) 的節點參數。
+imu_localizer:
+  ros__parameters:
+    imu_topic: /imu
+    map_frame: map
+    base_frame: base_link
+    publish_tf: true
+
+    # 重力怎麼扣 —— 這是整個方法最重要的一個選擇。
+    # 傾斜 1 度 = 0.17 m/s^2 的假加速度 = 10 秒後 8.5 公尺。姿態誤差比零偏更致命。
+    #   orientation   : 用訊息裡的 orientation (Isaac / 9 軸 IMU) <- 模擬用這個
+    #   complementary : 陀螺儀積分 + 靜止時用加速度校正 (真車的 6 軸 IMU)
+    #   none          : 假設車身永遠水平
+    gravity_mode: orientation
+    yaw_source: imu_orientation      # 真車改成 gyro
+    imu_yaw_sigma: 0.02
+    tilt_alpha: 0.02
+
+    # 純 IMU 不知道自己在世界的哪裡, 只能從一個給定的起點開始推。
+    initial_pose: [0.0, 0.0, 0.0]
+    initial_yaw_from_imu: true
+
+    # 開機靜止校正: 車子還沒動的時候把零偏量掉。最便宜也最有效的一步。
+    calib_time: 1.5
+    calib_timeout: 10.0
+
+    # 靜止偵測 —— ZUPT / ZARU 的觸發條件, 整個抗漂移的核心。
+    # still_var 是關鍵: 等速直線行駛時陀螺儀跟加速度都接近靜止值, 純慣性量測
+    # 分不出「靜止」與「等速直線」, 只有一段視窗內的**變異數**分得出來。
+    # 太鬆 -> 開直線時誤觸發 ZUPT, 速度被歸零, 位置直接停住;
+    # 太緊 -> 真的停車時不觸發, 抗漂移完全沒作用。調的時候看 status 那行的
+    # 「靜止 xx%」跟實際停車比例對不對得上。
+    still_gyro: 0.03
+    still_acc: 0.25
+    still_var: 0.05
+    still_window: 0.30
+
+    sigma_gyro: 0.02
+    sigma_gyro_scale: 0.01     # 陀螺儀比例因子誤差; 轉得越快這一項越大
+    # 加速度過程雜訊 = sqrt(sigma_acc^2 + (sigma_acc_omega*|w|)^2)。
+    # 用 test/replay_bag.py --measure 對著自己錄的 bag 量出來, 不要用猜的。
+    # Isaac + car.usd 量到的: |w|<0.2 時殘差 0.064 m/s^2 (連續時間 0.008),
+    # |w|>12 時 14.7 m/s^2 (連續時間 1.9)。差 230 倍 —— 常數不可能同時對。
+    sigma_acc: 0.03
+    sigma_acc_omega: 0.15
+    sigma_bg: 1.0e-4
+    sigma_ba: 1.0e-3
+
+    zupt_sigma: 0.02
+    zaru_sigma: 0.002
+    nhc_sigma: 0.15            # skid-steer 打滑會違反 NHC, 所以給鬆一點
+    nhc_min_speed: 0.20
+    nhc_max_omega: 1.5         # 原地打滑轉彎時關掉 NHC
+
+    # base_link 的 +X 量到「車頭」的角度 (度)。**這台車不是 0。**
+    # car.usd 的 base_link 是 +X 朝左、車頭 -Y (car_teleop/cmd_vel_bridge.py
+    # 裡也寫著同一件事), 所以是 -90。
+    # 從 sim_data.csv 量出來的佐證: 車子在動的時候
+    #   atan2(dy_gt, dx_gt) - gt_yaw = -90.0° (中位數, 標準差 0.6°, n=1159)
+    # NHC 約束的是**垂直車頭**的那一軸。給 0 的話它會把前進速度當成側滑歸零,
+    # 估計裡的車子幾乎不前進, 而真正的側向 (body x) 完全沒有約束 ->
+    # 誤差自由累積。實測就是 213 秒漂了 11 公尺的原因。
+    forward_deg: -90.0
+    anchor_sigma: 0.02
+    anchor_after: 0.5
+    v_max: 4.0
+
+    # 單次更新最多能把位置搬多少 (m)。速度偽量測 (ZUPT/ZARU/NHC) 透過 P 的
+    # 位置-速度相關項改到位置, P 一大就會一次搬走好幾公尺。卡方閘門擋不住
+    # (P 大 S 也大, NIS 反而小), 所以要另外設一道絕對上限。0 = 不設限。
+    max_pos_correction: 0.5
+
+    # 原地自旋時宣告「平移速度 = 0」。ZUPT 要求陀螺儀也小, 所以 skid-steer
+    # 原地打轉時不會觸發 —— 但那時平移速度確實是 0, 這是 ZUPT 的一個洞。
+    # **預設關**: 偵測本身準 (spin12 bag 85% 精確度), 但端到端量不出差別
+    # (RMS 14.32 -> 14.18 m)。用 test/replay_bag.py 對自己的 bag 開關看看。
+    enable_spin_zupt: false
+    spin_omega_min: 0.5
+    spin_omega_max: 6.0        # 60 Hz 撐不住更快的自旋
+    spin_acc_th: 0.2
+    spin_zupt_sigma: 0.15
+
+    # 四道防線, 可以個別關掉做 A/B (離線實測的效果見 README)
+    enable_zupt: true
+    enable_zaru: true
+    enable_nhc: true
+    enable_anchor: true
+
+    status_period: 2.0

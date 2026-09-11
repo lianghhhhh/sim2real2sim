@@ -1,0 +1,64 @@
+# 方法二的建圖階段: 純雷射里程計 (餵給 slam_toolbox 的 odom->base_link)。
+# 感測器: Oradar MS200 (2D 單線, 0.03~12 m, 10 Hz)。
+# 一圈 450 個 bin 是名目值, Isaac 實際打到約 300 點 (scripts/check_scan.py 量得到)。
+lidar_odometry:
+  ros__parameters:
+    input_type: scan
+    scan_topic: /scan
+    cloud_topic: /lidar/point_cloud
+    odom_frame: odom
+    base_frame: base_link
+    publish_tf: true
+
+    lidar_translation: [0.0, 0.0, 0.20]
+    lidar_rpy_deg: [0.0, 0.0, 0.0]
+
+    range_min: 0.05
+    range_max: 12.5
+    z_min: 0.15
+    z_max: 0.90
+    max_points: 3000              # 2D 雷射一圈 300~450 點, 不會觸發
+
+    # 滾動子圖: 對最近 15 個關鍵幀疊出來的小地圖配準。
+    # 掃描對掃描的誤差是純隨機遊走, 走幾公尺就明顯歪; 對子圖配準等於一次跟
+    # 好幾百幀的資訊比對, 局部精度高很多而且輸出連續不跳。
+    keyframe_dist: 0.4
+    keyframe_angle: 0.30
+    submap_keyframes: 15
+    submap_radius: 12.0           # 沒必要超過感測器量程
+    submap_voxel: 0.05
+    submap_resolution: 0.05
+    # 殘差比這個大的幀不准寫進子圖。開頭幾幀速度還沒估出來, 補償的平移項是 0,
+    # 掃描會被抹開幾公分 —— 那幾幀寫進去就是一道鬼牆, 之後所有幀都會對齊到它。
+    keyframe_max_residual: 0.06
+    keyframe_min_inlier: 0.60
+
+    huber: 0.10
+    max_iter: 40
+    inlier_dist: 0.30
+    min_inlier_ratio: 0.45
+    max_residual: 0.30
+    sweep_on_fail: false        # 見 lidar_loc.yaml 的說明 (MS200 上關掉)
+    sweep_yaw_max: 1.2
+
+    v_max: 4.0
+    omega_max: 25.0
+    twist_alpha: 0.5
+
+    deskew: true
+    # **這一端沒有 auto_scan_stamp** (只有 lidar_loc_node 有), 這兩個值是寫死的。
+    #
+    # !! **不要照定位節點的投票結果改這裡。** 2026-09-08 照它改成 forward/mid,
+    #    重建出來的地圖從 10.15x6.30 m 爛成 11.75x11.15 m, 房間被剪切成菱形,
+    #    到真實牆面的中位誤差 3.7 cm -> 45.4 cm。已改回 reverse/end。
+    #    要動這兩個值, **唯一的驗收方式是重建地圖再量佔據範圍** (應該接近
+    #    10.00 x 6.00 m), 殘差投票不算數。
+    scan_stamp: end
+    time_order: reverse           # 見 lidar_loc.yaml 的說明
+
+    publish_scan: true
+    # **不要發回 /scan** —— 那是感測器自己的 topic (實體車也一樣), 蓋掉會變成
+    # 自己吃自己。slam_toolbox 改吃這個去畸變過的版本。
+    scan_out_topic: /scan_deskewed
+    scan_out_bins: 450
+    status_period: 3.0
