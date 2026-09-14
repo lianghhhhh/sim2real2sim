@@ -4,7 +4,7 @@
 地圖才會完整。
 
 ```bash
-# 終端 1: 速度控制層 (通常由 slam.launch.py 自動帶起來, 不用另外跑)
+# 終端 1: 速度控制層 (通常由 mapping.launch.py 自動帶起來, 不用另外跑)
 ros2 launch car_teleop teleop.launch.py
 
 # 終端 2: 鍵盤遙控 (要真的 TTY, 所以要 docker exec -it)

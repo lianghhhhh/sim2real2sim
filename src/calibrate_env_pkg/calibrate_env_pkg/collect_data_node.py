@@ -84,7 +84,6 @@ import os
 import csv
 import math
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String, Float32MultiArray
@@ -160,8 +159,7 @@ class CollectDataNode(Node):
         p('imu_odom_topic', '/imu_loc/odom')
         p('wheel_odom_topic', '/wheel_loc/odom')
         p('fusion_odom_topic', '/fusion_loc/odom')
-        p('legacy_camera_pose_topic', '/camera/pose')
-        p('legacy_loc_odom_topic', '/localization/odom')
+        p('camera_px_topic', '/camera_loc/detection_px')
         p('status_period', 10.0)
 
         def topic(n):
@@ -223,39 +221,22 @@ class CollectDataNode(Node):
                 lambda msg, s=src: s.update(msg, self._now()), 10)
 
         # ------------------------------------------------------------------
-        # 以下兩條是**舊做法**的欄位 (car_inference 的 /camera/pose 與
-        # car_localization 的 /localization/odom)。那兩個 package 已經刪掉, 所以
-        # 現在這幾欄**永遠是 NaN** —— 留著只是為了 CSV 欄位格式不變, 讓舊資料跟
-        # 舊的分析腳本還對得起來。新的評估請用上面 cam_/lid_/imu_/whl_/fus_ 那五組。
+        # YOLO bbox 中心的原始像素 [px, py, conf] (car_loc_camera 發的)。
+        # 重新校正相機 (擬合 camera_ground.yaml) 與 scripts/replay_camera_csv.py
+        # 量延遲都要吃這個 —— 只有 cam_x/y 的話, 公式一改就對不回去了。
+        # 欄名沿用舊的 yolo_px/yolo_py/yolo_conf, 那些腳本照這個名字讀。
+        # 相機那條沒開就是 NaN。
+        #
+        # (以前還記了 yolo_x/yolo_y 與 loc_* 那兩組, 來源是已經刪掉的
+        #  car_inference 與 car_localization, 永遠是 NaN, 2026-09 拿掉了。)
         # ------------------------------------------------------------------
-        self.camera_pose_subscriber = self.create_subscription(
-            PoseStamped,
-            topic('legacy_camera_pose_topic'),
-            self.camera_pose_callback,
-            10
-        )
-        self.latest_yolo_coords = (NAN, NAN)
-        self.latest_yolo_stamp = NAN
-
-        # 記下 bbox 中心的原始像素, 之後重新校正相機時可以直接拿這個 CSV 去擬合,
-        # 不必從 yolo_x/yolo_y 反推當時用的公式 (公式一改就對不回去了)。
-        # car_loc_camera 也發同名內容到 /camera_loc/detection_px, 要記那一份就
-        # 用 --ros-args -r /yolo/detection_px:=/camera_loc/detection_px。
         self.yolo_px_subscriber = self.create_subscription(
             Float32MultiArray,
-            '/yolo/detection_px',
+            topic('camera_px_topic'),
             self.yolo_px_callback,
             10
         )
         self.latest_yolo_px = (NAN, NAN, NAN)
-
-        self.loc_odom_subscriber = self.create_subscription(
-            Odometry,
-            topic('legacy_loc_odom_topic'),
-            self.loc_odom_callback,
-            10
-        )
-        self.latest_loc_odom = self._nan_odom()
 
         # 可透過 ROS2 參數自訂輸出資料夾與檔名，例如：
         #   ros2 run calibrate_env_pkg calibrate_env_node --ros-args \
@@ -288,26 +269,25 @@ class CollectDataNode(Node):
                 'front_right_velocity',
                 'rear_left_velocity',
                 'rear_right_velocity',
-                'car_position_x', 'yolo_x', 'loc_car_position_x',
-                'car_position_y', 'yolo_y', 'loc_car_position_y',
+                'car_position_x',
+                'car_position_y',
                 'yolo_px', 'yolo_py', 'yolo_conf',
-                # 各來源自己的時戳 (秒)。分析時用它逐筆內插對齊, 而不是假設
-                # 同一列的三個來源是同一個時刻。
-                'odom_stamp', 'yolo_stamp', 'loc_stamp',
+                # ground truth 自己的時戳 (秒)。各定位線的時戳在後面的 <pre>_stamp,
+                # 分析時用它們逐筆內插對齊, 不要假設同一列是同一個時刻。
+                'odom_stamp',
                 'car_position_z',
-                'car_orientation_x', 'loc_car_orientation_x',
-                'car_orientation_y', 'loc_car_orientation_y',
-                'car_orientation_z', 'loc_car_orientation_z',
-                'car_orientation_w', 'loc_car_orientation_w',
+                'car_orientation_x',
+                'car_orientation_y',
+                'car_orientation_z',
+                'car_orientation_w',
                 'car_linear_velocity_x',
                 'car_linear_velocity_y',
                 'car_linear_velocity_z',
                 'car_angular_velocity_x',
                 'car_angular_velocity_y',
                 'car_angular_velocity_z',
-                # --- 五種定位 + GT 的 yaw。上面那些欄位一個都沒動, 而且新的
-                #     whl_* / fus_* 都是**接在最後面**的, 舊腳本照樣讀得到
-                #     (pandas 是照欄名取的, 多幾欄不影響)。
+                # --- 五種定位 + GT 的 yaw。分析腳本都是照欄名取的 (pandas),
+                #     所以欄位順序變了、多幾欄少幾欄都不影響。
                 'gt_yaw',
             ]
             for pre in ('cam', 'lid', 'imu', 'whl', 'fus'):
@@ -332,25 +312,6 @@ class CollectDataNode(Node):
     def odom_callback(self, msg):
         self.latest_odom = msg
 
-    @staticmethod
-    def _nan_odom():
-        # 定位節點沒開的時候用它佔位, 讓 log_data 那邊不用為了少一個來源多寫分支。
-        od = Odometry()
-        od.pose.pose.position.x = NAN
-        od.pose.pose.position.y = NAN
-        od.pose.pose.orientation.x = NAN
-        od.pose.pose.orientation.y = NAN
-        od.pose.pose.orientation.z = NAN
-        od.pose.pose.orientation.w = NAN
-        return od
-
-    def loc_odom_callback(self, msg):
-        # 不做座標轉換: 舊的 car_localization (已刪) 用的地圖是從 car.usd 的幾何
-        # 直接切出來的, 原點就是世界原點, 跟 Isaac 的 /odom 同一個座標系。改用
-        # slam_toolbox 建的地圖時兩者會差一個常數平移, 那要在地圖 .yaml 的 origin
-        # 修, 不是在這裡修。
-        self.latest_loc_odom = msg
-
     def scenario_callback(self, msg):
         self.latest_scenario_name = msg.data
 
@@ -366,10 +327,6 @@ class CollectDataNode(Node):
     @staticmethod
     def _stamp_sec(header):
         return header.stamp.sec + header.stamp.nanosec * 1e-9
-
-    def camera_pose_callback(self, msg):
-        self.latest_yolo_coords = (msg.pose.position.x, msg.pose.position.y)
-        self.latest_yolo_stamp = self._stamp_sec(msg.header)
 
     # ------------------------------------------------------------------
     def status(self):
@@ -430,7 +387,6 @@ class CollectDataNode(Node):
 
         now = self._now()
         gt = self.latest_odom
-        loc = self.latest_loc_odom
         with open(self.filepath, 'a') as f:
             writer = csv.writer(f)
             row = [
@@ -440,20 +396,16 @@ class CollectDataNode(Node):
                 eff[0], eff[1], eff[2], eff[3],
                 pos[0], pos[1], pos[2], pos[3],
                 vel[0], vel[1], vel[2], vel[3],
-                gt.pose.pose.position.x, self.latest_yolo_coords[0],
-                loc.pose.pose.position.x,
-                gt.pose.pose.position.y, self.latest_yolo_coords[1],
-                loc.pose.pose.position.y,
+                gt.pose.pose.position.x,
+                gt.pose.pose.position.y,
                 self.latest_yolo_px[0], self.latest_yolo_px[1],
                 self.latest_yolo_px[2],
                 self._stamp_sec(gt.header),
-                self.latest_yolo_stamp,
-                self._stamp_sec(loc.header),
                 gt.pose.pose.position.z,
-                gt.pose.pose.orientation.x, loc.pose.pose.orientation.x,
-                gt.pose.pose.orientation.y, loc.pose.pose.orientation.y,
-                gt.pose.pose.orientation.z, loc.pose.pose.orientation.z,
-                gt.pose.pose.orientation.w, loc.pose.pose.orientation.w,
+                gt.pose.pose.orientation.x,
+                gt.pose.pose.orientation.y,
+                gt.pose.pose.orientation.z,
+                gt.pose.pose.orientation.w,
                 gt.twist.twist.linear.x, gt.twist.twist.linear.y,
                 gt.twist.twist.linear.z,
                 gt.twist.twist.angular.x, gt.twist.twist.angular.y,

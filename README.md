@@ -44,7 +44,7 @@ Isaac Sim `car.usd` 場景的車輛定位。五種方法各自一個 package, �
 ```
 
 📦 **LiDAR 那條要一張地圖。** repo 裡已經有一張 `src/car_loc_lidar/maps/room.yaml`
-(5 cm 格點)。改過 `car.usd` 的幾何 (搬牆、加柱子) 就要照第 3 節重建。
+(2.5 cm 格點)。改過 `car.usd` 的幾何 (搬牆、加柱子) 就要照第 3 節重建, 並重新校正 origin。
 
 📦 **相機那條要 YOLO 模型**, 放在 `src/car_loc_camera/resource/best.onnx`
 (已經放了)。
@@ -219,8 +219,15 @@ ros2 run nav2_map_server map_saver_cli -f /workspaces/src/car_loc_lidar/maps/roo
 r
 ```
 
-> SLAM 地圖的原點由建圖時的起點決定, 位置可能會跟 Isaac 的 `/odom` 差一個固定
-> 平移 —— 那不是定位在漂。誤差是一個不會變的常數時, 去改地圖 `.yaml` 的 `origin`。
+**🖥 校正 origin (建完圖一定要做)。** SLAM 地圖的原點與方向由建圖時的起點決定, 會跟
+Isaac 的 `/odom` 差一個平移加一個小旋轉 —— 那不是定位在漂。用新地圖錄一輪 (車子開到
+房間各處), 然後:
+
+```bash
+./scripts/calibrate_map_origin.py car_run_data/<run>.csv --write    # 擬合平移 + 旋轉, 寫進 room.yaml
+```
+
+再 `r` 一次。細節見 [src/car_loc_lidar/maps/README.md](src/car_loc_lidar/maps/README.md)。
 
 ---
 
@@ -321,7 +328,8 @@ commit `b029732` 刪掉, 要翻舊程式就 `git show 7c984df:src/<package>/...`
 | LiDAR 位置還算合理但 yaw 差 180° | 自旋太快 (> 8 rad/s) 鎖到對稱解。看 `lid_sigma` (> 0.0025 就是)。車子停下來約 1.5 s 鎖死偵測會自己整張地圖重定位 (記錄印「疑似鎖在對稱解」); 一直沒回來才手動呼叫 `relocalize` |
 | LiDAR 一轉彎就大量「配準失敗」 | `lidar_loc.yaml` 的 `auto_scan_stamp` 被打開、投錯了時序。保持 `false` + `reverse/end` |
 | 掃描在 Foxglove 上是幾段斷開的弧 | `car.usd` 的 `fullScan` 沒開, 重跑 `./scripts/setup_oradar_lidar.py` |
-| 誤差是一個不會變的常數 | 地圖原點跟 `/odom` 原點差一個平移, 不是在漂。改地圖 `.yaml` 的 `origin` |
+| 誤差是一個不會變的常數 | 地圖原點跟 `/odom` 原點差一個平移, 不是在漂。跑 `./scripts/calibrate_map_origin.py` |
+| LiDAR 在房間中央很準、開到兩端就不準 (yaw 誤差是固定角度) | 地圖轉歪了。同上, 腳本會連旋轉一起量, 寫成 `origin` 的 yaw |
 | IMU / 輪速一開始就差很遠 | `imu_initial_pose` 沒對到出生點 |
 | CSV 裡 `cam_stamp` 比 `/odom` 多了上千秒 | 時鐘基準不一樣 (`eval_loc_csv.py` 會警告)。分析時要先扣掉; **開融合之前要先查** |
 | 車子按前進鍵一直加速 | `car_teleop` 的 bridge 沒起來, 或收不到 `/joint_states`+`/imu` 回授 |

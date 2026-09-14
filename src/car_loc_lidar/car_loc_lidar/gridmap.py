@@ -280,16 +280,54 @@ class GridMap:
         img = _read_pnm(img_path)
 
         origin = cfg.get('origin', [0.0, 0.0, 0.0])
-        if len(origin) > 2 and abs(float(origin[2])) > 1e-6:
-            raise ValueError(f'{yaml_path} 的 origin 帶了 yaw={origin[2]}, '
-                             '這裡沒有支援 (整張圖要先旋轉)。請用 yaw=0 的地圖。')
+        yaw = float(origin[2]) if len(origin) > 2 else 0.0
         p = img.astype(np.float64) / 255.0
         occupancy = p if int(cfg.get('negate', 0)) else (1.0 - p)
         # 影像 row0 是 y 最大, 地圖 row0 是 y 最小
         occ = np.flipud(occupancy > float(cfg.get('occupied_thresh', 0.65)))
-        return cls(occ, float(cfg['resolution']),
-                   [float(origin[0]), float(origin[1])],
-                   meta={'source': os.path.basename(yaml_path), 'format': 'nav2'})
+        res = float(cfg['resolution'])
+        meta = {'source': os.path.basename(yaml_path), 'format': 'nav2'}
+        if abs(yaw) < 1e-9:
+            return cls(occ, res, [float(origin[0]), float(origin[1])], meta=meta)
+        meta['yaw'] = yaw
+        return cls._resample_rotated(occ, res, (float(origin[0]), float(origin[1])),
+                                     yaw, meta)
+
+    @classmethod
+    def _resample_rotated(cls, occ: np.ndarray, resolution: float, origin_xy,
+                          yaw: float, meta: dict) -> 'GridMap':
+        """origin 帶 yaw 的 nav2 地圖 -> 跟世界座標軸對齊的 GridMap。
+
+        nav2 的定義: 影像格點 (col, row) 的中心在世界座標是
+            origin_xy + R(yaw) @ ((col + 0.5) * res, (row + 0.5) * res)
+        也就是整張圖繞左下角轉 yaw。本 package 的 GridMap 永遠軸對齊 (距離場、
+        雙線性取樣都靠這個), 所以讀進來時重新取樣成一張新的軸對齊格點。
+
+        用**反向查表**: 新格點的每一格中心轉回舊影像去查它落在哪一格。反過來
+        「把每個佔據格轉過去」的話, 斜線上會漏格 (牆出現破洞) 或為了補洞把牆
+        加粗 —— 加粗會讓牆面往空地移, 等於把房間縮小, 直接變成定位誤差。
+
+        SLAM 地圖轉歪 (建圖起點的車頭沒對齊世界座標軸) 時, 就是靠這個在 yaml
+        裡填 yaw 修正, 不用重建地圖。量法見 scripts/calibrate_map_origin.py。
+        """
+        h, w = occ.shape
+        c, s = np.cos(yaw), np.sin(yaw)
+        R = np.array([[c, -s], [s, c]])
+        o = np.asarray(origin_xy, dtype=np.float64)
+        corners = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype=np.float64) * resolution
+        wc = corners @ R.T + o
+        lo, hi = wc.min(axis=0), wc.max(axis=0)
+        n = np.ceil((hi - lo) / resolution).astype(int)
+        cols, rows = np.meshgrid(np.arange(n[0]), np.arange(n[1]))
+        centers = np.stack([lo[0] + (cols + 0.5) * resolution,
+                            lo[1] + (rows + 0.5) * resolution], axis=-1).reshape(-1, 2)
+        src = (centers - o) @ R                  # 每一列乘 R = 套用 R^T (轉回影像座標)
+        sc = np.floor(src[:, 0] / resolution).astype(np.int64)
+        sr = np.floor(src[:, 1] / resolution).astype(np.int64)
+        ok = (sc >= 0) & (sc < w) & (sr >= 0) & (sr < h)
+        new = np.zeros(centers.shape[0], dtype=bool)
+        new[ok] = occ[sr[ok], sc[ok]]
+        return cls(new.reshape(int(n[1]), int(n[0])), resolution, lo, meta=meta)
 
     def save_nav2(self, stem: str) -> str:
         """存成 .pgm + .yaml, rviz / nav2 / 肉眼都看得懂。"""

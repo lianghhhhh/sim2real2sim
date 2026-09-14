@@ -29,7 +29,7 @@ slam_toolbox:
     throttle_scans: 1
     transform_publish_period: 0.02
     map_update_interval: 0.5
-    resolution: 0.05
+    resolution: 0.025
     max_laser_range: 12.0        # Oradar MS200 的量程就是 12 m, 填大只是浪費
     minimum_time_interval: 0.2   # MS200 是 10 Hz -> 大約每兩幀取一幀
     transform_timeout: 0.2
