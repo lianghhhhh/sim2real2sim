@@ -1,0 +1,175 @@
+# 方法五 (全感測器融合) 的節點參數。
+#
+# 遞推那一段的值**必須跟 car_loc_wheel/config/wheel_loc.yaml 一致** —— 它們是
+# 同一個濾波器 (car_loc_fusion 直接用 WheelIns), 分岔的話兩條路線就沒得比了。
+# 改了那邊記得改這邊。融合層自己的參數在最下面。
+fusion_localizer:
+  ros__parameters:
+    imu_topic: /imu
+    joint_states_topic: /joint_states
+    # 絕對量測 = 另外兩條定位線的輸出。它們要先開起來
+    # (fusion_loc.launch.py 預設會一起開)。
+    camera_topic: /camera_loc/odom
+    lidar_topic: /lidar_loc/odom
+    odom_topic: /fusion_loc/odom
+    pose_topic: /fusion_loc/pose
+    map_frame: map
+    base_frame: base_link
+    publish_tf: true
+
+    # --- 車體 (跟 wheel_loc.yaml 相同) ---------------------------------------
+    wheel_names: [front_left_joint, front_right_joint,
+                  rear_left_joint, rear_right_joint]
+    wheel_radius: 0.075
+    # 有效輪半徑 / 幾何值。跟牽引狀態有關: 有扭矩 0.93, 滑行 1.008 (= 幾何值)。
+    # 融合對這個值比純航位推算**不敏感** —— 尺度誤差被絕對量測按住了, 只影響
+    # 兩則絕對量測之間的那 30~100 ms。但還是給對的好: 絕對量測掉線時它就是全部。
+    wheel_scale: 0.93
+    # base_link +X 量到車頭的角度。car.usd 是 +X 朝左、車頭 -Y, 所以 -90。
+    # REP-103 的車給 0。給錯的話遞推會往垂直於實際行進的方向跑, 然後絕對量測
+    # 一直在把它拉回來 —— 症狀是「閘門擋掉的數量很大, 但位置看起來還行」。
+    forward_deg: -90.0
+
+    # --- 重力 / yaw 的來源 ----------------------------------------------------
+    gravity_mode: orientation        # 真車 6 軸 IMU 改 complementary (+ sigma_acc 0.35)
+    yaw_source: imu_orientation      # 真車改 gyro
+    imu_yaw_sigma: 0.02
+    tilt_alpha: 0.02
+
+    # --- 起點 -----------------------------------------------------------------
+    # **融合不需要 initial_pose。** 第一則絕對量測 (相機或 LiDAR) 就是起點 ——
+    # 這是相對於 car_loc_imu / car_loc_wheel 的一個實質差別: 那兩條沒給起點就
+    # 整段差一個常數平移, 看起來像超大漂移。
+    # 真的要在沒有絕對量測的情況下跑 (例如只想看遞推), 才設 false + initial_pose。
+    wait_for_absolute: true
+    initial_pose: [0.0, 0.0, 0.0]
+    initial_yaw_from_imu: true
+
+    # --- 開機靜止校正 ---------------------------------------------------------
+    # 融合一樣要做。絕對量測會把**位置**按住, 但陀螺零偏不會被它修掉, 而零偏會
+    # 讓兩則絕對量測之間的遞推歪掉 (相機 30 Hz 就是 33 ms, 影響不大; 絕對量測
+    # 掉線時就是全部)。
+    calib_time: 1.0
+    calib_timeout: 10.0
+
+    still_wheel: 0.5
+    still_gyro: 0.05
+    still_window: 0.15
+
+    # --- 遞推濾波器 (理由見 car_loc_wheel 的 README) --------------------------
+    sigma_gyro: 0.02
+    sigma_gyro_scale: 0.01
+    sigma_acc: 0.05                  # complementary 模式要 0.35
+    sigma_acc_omega: 0.15            # 過程雜訊一定要跟著角速度走 (實測差 230 倍)
+    sigma_cross: 0.02
+    sigma_bg: 1.0e-4
+    sigma_ba: 1.0e-3
+    sigma_k: 0.0                     # 0 = 凍結輪速尺度
+    wheel_sigma: 0.07
+    wheel_sigma_slip: 10.0           # 嚴重打滑時等於丟掉 (增益 ~1e-4)
+    slip_spread: 2.0
+    slip_spread_max: 8.0
+    wheel_reject_time: 2.0
+    zupt_sigma: 0.01
+    zaru_sigma: 0.002
+    anchor_sigma: 0.02
+    anchor_after: 0.5
+    v_max: 4.0
+    max_pos_correction: 0.5          # 高頻偽量測 (ZUPT/輪速) 的單次上限
+
+    # ==========================================================================
+    # 融合層 —— 這個 package 真正新加的東西
+    # ==========================================================================
+
+    # 倒帶重放。**絕對量測的時戳是過去的**: 相機那條的延遲是量出來的 79.5 ms
+    # (曝光 + 傳輸 + YOLO 推論), 而它很誠實地把時戳往回填成影像時刻。把它當成
+    # 「現在」直接更新 = 灌一個 v x delay 的位置誤差進去, 而且方向跟著車頭轉,
+    # 平均不掉。實測 (test/test_fusion.py [B], 誤差 RMS):
+    #   0.6 m/s  倒帶 1.39 cm  不倒帶  5.24 cm   (v x delay =  4.8 cm)
+    #   1.8 m/s  倒帶 2.65 cm  不倒帶 15.62 cm   (         = 14.3 cm)
+    #   3.0 m/s  倒帶 4.17 cm  不倒帶 27.11 cm   (         = 23.8 cm)
+    # 差距跟 v x delay 對得上 —— 這不是調參能解決的, 是時間軸的問題。
+    rewind: true
+    # 視窗要蓋得住最慢那一條的延遲 + 抖動。相機 79.5 ms, 0.4 s 有五倍餘裕。
+    # status 那行的「太舊」不是 0 就是不夠, 調大 (代價只有記憶體與 CPU:
+    # 每則絕對量測要重跑 horizon x IMU 頻率 步)。
+    rewind_horizon: 0.4
+
+    # 絕對量測的單次修正上限 (m)。比 max_pos_correction (0.5) 大是刻意的 ——
+    # 絕對量測本來就該有把跑掉的估計拉回來的權力, 那正是它存在的理由。
+    # 但仍然要有上限: 一則誤判 (相機認到影子) 不該讓車子瞬間搬家。
+    abs_max_correction: 1.0
+
+    # 逃生口: 連續這麼久沒有任何絕對量測通過卡方閘門, 就進入**恢復模式**
+    # (強制接受, R 放大 9 倍), 直到有一則自己通過為止。
+    # 處理的是「P 很小但**是錯的**」—— 卡方閘門對這種情況完全沒有辦法, 因為它
+    # 只會拿量測跟濾波器自己的信念比。實測 (test/test_fusion.py [F], 車子被
+    # 瞬間搬走 3 m, IMU 與輪速完全看不到):
+    #   有逃生口 -> 5.0 秒收斂回 20 cm 以內;  沒有 -> **永遠回不來**
+    # 給太短的話正常的離群值 (相機誤判、LiDAR 追丟) 會被硬吃進來, 3 秒是
+    # 「一次離群 vs 濾波器自己錯了」的分界。
+    abs_reject_time: 3.0
+    chi2_scale: 1.0
+
+    # --- 每個來源的收件政策 (三道防線都**不看濾波器狀態**) --------------------
+    camera_enabled: true
+    # R 的下限。相機實測單軸 1.53 cm / 二維 RMS 2.09 cm, 給 3 cm 是保守的 ——
+    # 它回報的共變異數是**它自己濾波器**的, 不是相對於我們狀態的獨立量測雜訊。
+    camera_sigma_floor: 0.03
+    camera_sigma_max: 0.0            # 相機沒有「鎖到對稱解」這種失效模式
+    camera_r_inflate: 1.5            # 見 README [G]: 相關量測要放大 R
+    # 限流。**預設 0 (不限流)** —— 原本以為 30 Hz 的相關量測該降到 10 Hz,
+    # 但量出來限流之後 NEES 反而變差 (2.26 -> 2.62): 兩次更新之間 P 長回來的
+    # 速度追不上誤差長大的速度。真車上如果來源的平滑比模擬更重再打開。
+    camera_min_dt: 0.0
+    # 相機的 yaw 是**從速度方向推的**, 實測 RMS 15~22 度 (而且車越慢越差)。
+    # 這裡的 yaw 已經有 IMU 的絕對姿態 (0.07 度), 吃它只會變差。
+    camera_use_yaw: false
+    camera_timeout: 0.5
+
+    # --- 時鐘 (2026-09-10 踩到的真問題, 見 README [H]) -------------------------
+    # 時戳跟濾波器差超過這麼多、**或是持續落在未來**, 就認定是時鐘基準不一樣,
+    # 量一次鎖定並從此扣掉。實測那一輪 /rgb 比 /imu 早 **625.55 秒** (std 10 ms),
+    # 沒有這道偵測的話估計會整段凍結在起點 (RMS 1.35 -> 112 cm)。
+    camera_clock_max_offset: 1.0
+    # 時鐘沒對好的時候, 真正的延遲就沒辦法從資料裡分離出來 —— 這一項是手動把它
+    # 加回去。**先量再填, 不要猜**:
+    #   python3 test/replay_csv.py <你的 CSV>      <- 第 [5] 節就是在掃這個
+    # 2026-09-10 兩輪資料都量到同一件事 (誤差向量與速度方向的 cos = -1.000,
+    # 純延遲的簽名):
+    #   * 直接對 ground truth 掃相機自己的誤差: **50 ms** (RMS 3.31 -> 0.53 cm)
+    #     —— 這是 camera_ground.yaml 的 `delay` 該填的值
+    #   * 拿整條融合的產線掃: **70 ms** (RMS 4.34 -> 1.79 cm)
+    #     —— 多出來的 20 ms 是時鐘偏移的估計方式不同造成的 (to_filter_clock 用
+    #        `ins.t` 當基準, 它比列的時刻落後半拍)。時鐘修好之後這個差別會消失。
+    #   填這裡的話用**後者** (它是對著這條產線量的)。
+    # **但如果去源頭把時鐘修好了 (讓 /rgb 跟 /clock 同一個基準), 這裡要設回 0** ——
+    # 那時倒帶重放會自己處理延遲, 填了就是扣兩次。
+    camera_extra_delay: 0.0
+
+    lidar_enabled: true
+    lidar_sigma_floor: 0.04          # 5 cm 地圖 -> 誤差 ~3.5 cm (0.7 x 解析度)
+    # **追丟偵測用來源自己回報的 sigma, 不要自己猜。**
+    # car_loc_lidar 在長方形房間裡會鎖到 180 度的對稱解, 鎖住之後位置看起來還
+    # 合理、殘差也很漂亮, 但**回不來**。實測 (collect_data_node 的三輪資料):
+    #   正常 sigma ~0.0015,  追丟 ~0.0145  -> 門檻 0.0025, 0 漏網
+    # 這道防線在「只有 LiDAR」時是關鍵 (test_fusion.py [D]):
+    #   有 sigma 閘門 2.80 cm  /  沒有 338 cm (鎖住的量測彼此一致, 卡方閘門擋久
+    #   了會觸發逃生口, 然後估計整個被搬到鏡射的位置)
+    # 相機也在的時候卡方閘門一個人就夠 —— 但不要因此拿掉它, 相機會被擋住。
+    lidar_sigma_max: 0.0025
+    lidar_r_inflate: 1.5
+    lidar_min_dt: 0.0
+    lidar_use_yaw: true              # LiDAR 的 yaw 是幾何配準出來的 (2.9 度)
+    lidar_yaw_sigma: 0.05
+    lidar_timeout: 1.0
+    lidar_clock_max_offset: 1.0
+    lidar_extra_delay: 0.0           # /scan 那條的時鐘實測是對的 (差 -0.067 s)
+
+    enable_wheel: true
+    enable_zupt: true
+    enable_zaru: true
+    enable_anchor: true
+    enable_slip_gate: true
+    wheel_timeout: 0.5
+    status_period: 2.0

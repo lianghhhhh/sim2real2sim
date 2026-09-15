@@ -79,16 +79,39 @@ yaw RMS 就從 1.69 被拉到 9.15 度)。**看中位數不要只看 RMS** —�
 的共變異數, 不是「這一幀追丟了」的指標 (它們根本沒有絕對參考可以追丟)。所以
 `eval_loc_csv.py` 的 sigma 門檻掃描對 imu_/whl_ 只是在切「跑了多久」, 不要照
 lid_ 那套讀。看它們要看**誤差 / 已走距離**。
+
+沒有 ground truth 也照記 (真車)
+------------------------------
+以前 GT 是硬需求, 真車上一列都記不到。現在 GT 那幾欄是 NaN, 其他照記。
+
+IMU 全速率另存一個檔: `<csv 檔名>_imu.csv`
+-----------------------------------------
+摩擦力分析 (scripts/estimate_friction.py) 最敏感的特徵是**自旋斷油後的角減速度**,
+高摩擦地面 0.15~0.3 秒就停住 —— 主 CSV 20 Hz 取樣只剩 3~6 個點, 而且是「最新
+一則」的取樣 (時間點不準)。所以 /imu 每一則訊息都在 callback 裡直接寫一列:
+
+    stamp, recv, scenario_name, phase, gyro_x/y/z, acc_x/y/z,
+    effort_command_* (最新), *_velocity (最新輪速)
+
+檔案一直開著、定期 flush (200 Hz 每則 open/close 太貴)。沒有 IMU 就是空檔 (只有
+header)。`imu_csv:=false` 可以關掉。
+
+各定位線另外記 `<pre>_v` (twist.linear.x) 與 `<pre>_wz` (twist.angular.z)。
+**`fus_v` / `whl_v` 吃輪速, 打滑時是錯的** —— 別拿它量摩擦。
 """
 import os
 import csv
 import math
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import String, Float32MultiArray
 
 NAN = float('nan')
+JOINT_NAMES = ('front_left_joint', 'front_right_joint',
+               'rear_left_joint', 'rear_right_joint')
+WHEEL_KEYS = ('front_left', 'front_right', 'rear_left', 'rear_right')
 
 
 def quat_yaw(q) -> float:
@@ -103,12 +126,13 @@ class Source:
     寫 0 會讓「沒開這條線」跟「車子剛好在原點」分不出來。
     """
 
-    __slots__ = ('name', 'x', 'y', 'yaw', 'stamp', 'sigma', 'recv', 'count')
+    __slots__ = ('name', 'x', 'y', 'yaw', 'stamp', 'sigma', 'recv', 'count', 'v', 'wz')
 
     def __init__(self, name):
         self.name = name
         self.x = self.y = self.yaw = NAN
         self.stamp = self.sigma = NAN
+        self.v = self.wz = NAN
         self.recv = NAN
         self.count = 0
 
@@ -124,12 +148,16 @@ class Source:
         cov = msg.pose.covariance
         s = cov[0] + cov[7]
         self.sigma = math.sqrt(s) if s > 0.0 else NAN
+        self.v = msg.twist.twist.linear.x
+        self.wz = msg.twist.twist.angular.z
         self.recv = now
         self.count += 1
 
+    COLUMNS = ('x', 'y', 'yaw', 'stamp', 'age', 'sigma', 'v', 'wz')
+
     def row(self, now: float):
         age = NAN if math.isnan(self.recv) else now - self.recv
-        return [self.x, self.y, self.yaw, self.stamp, age, self.sigma]
+        return [self.x, self.y, self.yaw, self.stamp, age, self.sigma, self.v, self.wz]
 
 
 class CollectDataNode(Node):
@@ -291,9 +319,32 @@ class CollectDataNode(Node):
                 'gt_yaw',
             ]
             for pre in ('cam', 'lid', 'imu', 'whl', 'fus'):
-                header += [f'{pre}_x', f'{pre}_y', f'{pre}_yaw',
-                           f'{pre}_stamp', f'{pre}_age', f'{pre}_sigma']
+                header += [f'{pre}_{c}' for c in Source.COLUMNS]
+            # /imu 原始值的最新一則 (全速率的在 _imu.csv)
+            header += ['gyro_z', 'acc_x', 'acc_y', 'imu_msg_stamp']
             writer.writerow(header)
+
+        # ---- IMU 全速率檔 ----
+        p('imu_topic', '/imu')
+        p('imu_csv', True)
+        self.latest_imu = None
+        self.imu_count = 0
+        self._imu_file = None
+        if self.get_parameter('imu_csv').value:
+            stem, _ = os.path.splitext(self.filepath)
+            self.imu_filepath = stem + '_imu.csv'
+            self._imu_file = open(self.imu_filepath, 'w', newline='')
+            self._imu_writer = csv.writer(self._imu_file)
+            self._imu_writer.writerow(
+                ['stamp', 'recv', 'scenario_name', 'phase',
+                 'gyro_x', 'gyro_y', 'gyro_z', 'acc_x', 'acc_y', 'acc_z']
+                + [f'effort_command_{w}' for w in WHEEL_KEYS]
+                + [f'{w}_velocity' for w in WHEEL_KEYS])
+            self.get_logger().info(f'IMU 全速率記到: {self.imu_filepath}')
+        self.create_subscription(
+            Imu, topic('imu_topic'), self.imu_callback,
+            QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                       history=HistoryPolicy.KEEP_LAST, depth=50))
 
         self.timer = self.create_timer(0.05, self.log_data)
         self.create_timer(
@@ -308,6 +359,36 @@ class CollectDataNode(Node):
 
     def joint_state_callback(self, msg):
         self.latest_joint_state = msg
+
+    @staticmethod
+    def _by_joint(msg, field):
+        """依輪子名稱取欄位 (effort / position / velocity), 缺就是 NaN。"""
+        if msg is None:
+            return [NAN] * 4
+        try:
+            vals = getattr(msg, field)
+            return [vals[msg.name.index(n)] for n in JOINT_NAMES]
+        except (ValueError, IndexError):
+            return [NAN] * 4
+
+    def imu_callback(self, msg):
+        self.latest_imu = msg
+        self.imu_count += 1
+        if self._imu_file is None:
+            return
+        a, g = msg.linear_acceleration, msg.angular_velocity
+        self._imu_writer.writerow(
+            [self._stamp_sec(msg.header), self._now(),
+             self.latest_scenario_name, self.latest_phase,
+             g.x, g.y, g.z, a.x, a.y, a.z]
+            + self._by_joint(getattr(self, 'latest_joint_command', None), 'effort')
+            + self._by_joint(getattr(self, 'latest_joint_state', None), 'velocity'))
+
+    def destroy_node(self):
+        if self._imu_file is not None:
+            self._imu_file.close()
+            self._imu_file = None
+        return super().destroy_node()
 
     def odom_callback(self, msg):
         self.latest_odom = msg
@@ -335,13 +416,20 @@ class CollectDataNode(Node):
         誤差是「同一列直接相減」, 沒有做時間對齊, 所以只能當**健康檢查**看
         (常數偏移 = 起點沒對齊, 一路長大 = 飄移)。正式數字要用 _stamp 內插算。
         """
+        if self._imu_file is not None:
+            self._imu_file.flush()
+        now = self._now()
+        imu = f'IMU {self.imu_count} 則' if self.imu_count else 'IMU=off'
         if not hasattr(self, 'latest_odom'):
-            self.get_logger().warn('還沒收到 ground truth /odom')
+            # 真車沒有 GT 是正常的; 只印各條線有沒有在跑
+            parts = [s.name + '=' + ('off' if s.count == 0 else '%.1fs' % (now - s.recv))
+                     for s in (self.src_cam, self.src_lid, self.src_imu,
+                               self.src_whl, self.src_fus)]
+            self.get_logger().info(f'{self.count} 列 | 無 GT | {imu} | ' + ' '.join(parts))
             return
         gx = self.latest_odom.pose.pose.position.x
         gy = self.latest_odom.pose.pose.position.y
-        now = self._now()
-        parts = []
+        parts = [imu]
         for src in (self.src_cam, self.src_lid, self.src_imu, self.src_whl,
                     self.src_fus):
             if src.count == 0:
@@ -357,66 +445,42 @@ class CollectDataNode(Node):
             f'{self.count} 列 | GT({gx:+.2f},{gy:+.2f}) | ' + ' '.join(parts))
 
     def log_data(self):
-        # ground truth 是唯一的硬需求 —— 沒有它這一列沒得比。joint_command /
-        # joint_state 缺了就寫 NaN, **不整列丟掉**: 用 car_teleop 手開車蒐定位
-        # 資料時沒有 control_car_node, 舊的寫法會一列都記不到。摩擦力分析本來
-        # 就只取 phase=='measure', 那段一定有 joint_command, 不受影響。
-        if not hasattr(self, 'latest_odom'):
+        # **沒有任何必要欄位**: GT (真車沒有)、joint_command (teleop 時沒有)、
+        # 各定位線 (沒開) 缺了都寫 NaN, 不整列丟掉。但一個訊號都還沒收到的話
+        # 就先不寫, 免得開頭一大段全 NaN。摩擦力分析只取 phase=='measure'。
+        gt = getattr(self, 'latest_odom', None)
+        js = getattr(self, 'latest_joint_state', None)
+        jc = getattr(self, 'latest_joint_command', None)
+        srcs = (self.src_cam, self.src_lid, self.src_imu, self.src_whl, self.src_fus)
+        if gt is None and js is None and jc is None and self.latest_imu is None \
+                and not any(s.count for s in srcs):
             return
 
-        eff = [NAN] * 4
-        pos = [NAN] * 4
-        vel = [NAN] * 4
-        names = ('front_left_joint', 'front_right_joint',
-                 'rear_left_joint', 'rear_right_joint')
-        js = getattr(self, 'latest_joint_state', None)
-        if js is not None:
-            try:
-                idx = [js.name.index(n) for n in names]
-                pos = [js.position[i] for i in idx]
-                vel = [js.velocity[i] for i in idx]
-            except (ValueError, IndexError):
-                pass
-        jc = getattr(self, 'latest_joint_command', None)
-        if jc is not None:
-            try:
-                idx = [jc.name.index(n) for n in names]
-                eff = [jc.effort[i] for i in idx]
-            except (ValueError, IndexError):
-                pass
+        eff = self._by_joint(jc, 'effort')
+        pos = self._by_joint(js, 'position')
+        vel = self._by_joint(js, 'velocity')
 
         now = self._now()
-        gt = self.latest_odom
+        if gt is not None:
+            P, O = gt.pose.pose.position, gt.pose.pose.orientation
+            L, A = gt.twist.twist.linear, gt.twist.twist.angular
+            gt_cols = [P.x, P.y]
+            gt_rest = [self._stamp_sec(gt.header), P.z, O.x, O.y, O.z, O.w,
+                       L.x, L.y, L.z, A.x, A.y, A.z, quat_yaw(O)]
+        else:
+            gt_cols = [NAN] * 2
+            gt_rest = [NAN] * 13
+        imu = self.latest_imu
+        imu_cols = ([imu.angular_velocity.z, imu.linear_acceleration.x,
+                     imu.linear_acceleration.y, self._stamp_sec(imu.header)]
+                    if imu is not None else [NAN] * 4)
         with open(self.filepath, 'a') as f:
             writer = csv.writer(f)
-            row = [
-                now,
-                self.latest_scenario_name,
-                self.latest_phase,
-                eff[0], eff[1], eff[2], eff[3],
-                pos[0], pos[1], pos[2], pos[3],
-                vel[0], vel[1], vel[2], vel[3],
-                gt.pose.pose.position.x,
-                gt.pose.pose.position.y,
-                self.latest_yolo_px[0], self.latest_yolo_px[1],
-                self.latest_yolo_px[2],
-                self._stamp_sec(gt.header),
-                gt.pose.pose.position.z,
-                gt.pose.pose.orientation.x,
-                gt.pose.pose.orientation.y,
-                gt.pose.pose.orientation.z,
-                gt.pose.pose.orientation.w,
-                gt.twist.twist.linear.x, gt.twist.twist.linear.y,
-                gt.twist.twist.linear.z,
-                gt.twist.twist.angular.x, gt.twist.twist.angular.y,
-                gt.twist.twist.angular.z,
-                quat_yaw(gt.pose.pose.orientation),
-            ]
-            row += self.src_cam.row(now)
-            row += self.src_lid.row(now)
-            row += self.src_imu.row(now)
-            row += self.src_whl.row(now)
-            row += self.src_fus.row(now)
+            row = ([now, self.latest_scenario_name, self.latest_phase]
+                   + eff + pos + vel + gt_cols + list(self.latest_yolo_px) + gt_rest)
+            for s in srcs:
+                row += s.row(now)
+            row += imu_cols
             writer.writerow(row)
             self.count += 1
 

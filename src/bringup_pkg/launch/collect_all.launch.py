@@ -96,6 +96,9 @@ def generate_launch_description():
         DeclareLaunchArgument('imu_initial_pose', default_value='[0.0, 0.0, 0.0]',
                               description='x, y, yaw(度)。imu_ 與 whl_ 兩條的起點, '
                                           '要對到車子的實際出生點。fusion 不需要'),
+        DeclareLaunchArgument('collector', default_value='true',
+                              description='開 collect_data_node。friction_test.launch.py '
+                                          '會關掉 (calibrate_env_node 自己帶一個)'),
         DeclareLaunchArgument('output_dir', default_value='/workspaces/car_run_data'),
         DeclareLaunchArgument('csv_filename', default_value='all_loc.csv'),
     ]
@@ -179,6 +182,7 @@ def generate_launch_description():
     collector = Node(
         package='calibrate_env_pkg', executable='collect_data_node',
         name='collect_data_node', output='screen',
+        condition=IfCondition(LaunchConfiguration('collector')),
         parameters=[{
             'use_sim_time': use_sim_time,
             'output_dir': LaunchConfiguration('output_dir'),

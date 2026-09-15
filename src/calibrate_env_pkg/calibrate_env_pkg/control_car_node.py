@@ -58,15 +58,43 @@ Block 3/4 量到的滾動阻力與 slip ratio 跟 Block 1/2 的滑動摩擦是�
       aborted     撞牆保護中止的殘缺資料
       idle        腳本跑完
 * 新增 geofence: 訂 /odom, 離牆太近就中止當前情境、標成 aborted、開回起點重試。
+
+────────────────────────────────────────────────────────────────────────
+狀態從哪裡來: state_source = sensor (預設) | gt
+────────────────────────────────────────────────────────────────────────
+真車沒有 ground truth, 所以預設就用感測器跑, 模擬器裡的 /odom 只拿來**對答案**
+(gt_check_topic, 定期印誤差, 不參與控制)。每一個量用的來源刻意不一樣:
+
+  量                  sensor 模式                      為什麼
+  ─────────────────── ──────────────────────────────── ─────────────────────────
+  位置 / 朝向         /fusion_loc/odom 的 pose         geofence 與歸位要絕對位置
+  轉速 wz             /imu gyro z (扣開機零偏)          LiDAR 自旋 >8 rad/s 會追丟;
+                                                       gyro 不受打滑、不會斷
+  stop_at_speed       IMU 前向加速度從靜止積分          融合的速度吃輪速, 打滑時是
+                                                       錯的, 而打滑就是摩擦造成的
+                                                       -> coast 進入速度會跟著 mu
+                                                       跑 (循環論證)。量測段只有
+                                                       1~3 秒, 積分漂移可忽略。
+  煞車 / 歸位的速度   /fusion_loc/odom twist.linear.x   閉迴路段, 準不準只影響收斂
+  靜止判定            gyro + 加速度抖動 + 融合速度
+
+安全上的差別: GT 不會斷, 感測器會。所以 sensor 模式下
+  * 定位過期 (pose_timeout) 或 sigma 太大 (pose_sigma_max) -> 量測段直接中止、煞停,
+    **不是**像舊版那樣「沒有 odom 就不檢查」繼續開迴路衝。
+  * 牆邊餘裕再加 sigma_margin_k x 定位 sigma。
+  * 歸位前先等定位回到可信 (repos_sigma_max) —— 自旋完 LiDAR 可能還沒重新鎖定。
+  * 自旋目標轉速上限 spin_max_w 預設 7.5 rad/s (低於 LiDAR 追蹤上限, 也要低於真車
+    IMU 的 gyro 量程: 常見的 ±250 dps 只有 4.4 rad/s, 買之前/設定時要確認)。
 """
 import math
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import String
 
 JOINT_NAMES = ['front_left_joint', 'front_right_joint',
@@ -82,29 +110,35 @@ MAX_EFFORT = 10.0
 # steer effort 3/5/7/10) 在 4 秒內就衝到 wz≈20~30 rad/s, 遠超過高 mu 下的
 # 穩態假設 (mu=0.8, S=10 只到 16.4)。位移在自轉時 ~0, 幾何圍籬完全看不到
 # 這個危險, 車子會一路轉到失控飄移、甚至撞牆。
-SPIN_MAX_SAFE_W = 12.0                   # rad/s
+SPIN_MAX_SAFE_W = 12.0                   # rad/s   (gt 模式; sensor 模式見 spin_max_w 參數)
 
-# 四個目標初始角速度 (不是 effort!)。用跟 B3/B4 的 stop_at_speed 同一招:
+# 四個目標初始角速度 (不是 effort!)。實際值由 spin_targets() 依 spin_max_w 縮放,
+# spin_max_w = 12 時就是下面這組。用跟 B3/B4 的 stop_at_speed 同一招:
 # 轉速觸發取代時間觸發, 用固定的 SPIN_UP_STEER 衝上去, 到了目標值就放開。
 # 舊版是固定 4 個 steer effort, 在低 mu 下沒有阻力矩制衡, S=5/7/10 全部會
 # 衝破安全上限被同一個 SPIN_MAX_SAFE_W 拍平成幾乎一樣的 w0 (實測只剩
 # ~1.5 跟 ~13 兩檔), 驗證「衰減斜率跟初始 w 無關」的 Coulomb 假設就沒意義
-# 了。改成直接指定目標轉速, 四檔在任何 mu 下都是四個真正分開的初始條件；
+# 了。改成直接指定目標轉速, 在任何 mu 下都是真正分開的初始條件；
 # 全部低於 SPIN_MAX_SAFE_W, 觸發不到安全上限。
-SPIN_TARGET_W = [2.0, 5.0, 8.0, 11.0]    # rad/s
+#
+# **只取高轉速的三檔 (75% ~ 100%), 每檔 4 次。** 舊版 [2, 5, 8, 11] 的最低檔在
+# 高 mu 地面整段 coast 只有 ~50 ms (60 Hz IMU 3 個點), 幾乎全是放開後的過渡段,
+# 減速度系統性偏低 (2026-09-15 校正: mu 1.5 時 32 vs 其他檔 50), 分析端只好丟掉
+# —— 12 次裡能用的剩一半。總次數不變, 全部集中在量得準的區間。
+SPIN_TARGET_W = [8.25, 9.62, 11.0]       # rad/s (spin_max_w = 12 時)
 SPIN_UP_STEER = MAX_EFFORT               # 固定用最大 steer 衝, 只有目標轉速是變數
 # rate limiter 是 6 effort/s, 所以 1.67 s 就踩到底; 再給餘裕讓轉速長到目標值。
 # 高 mu 時可能衝不到某些高檔目標 (穩態轉速比目標低), 這裡當逾時保護, 跟
 # SPRINT_ACCEL_TIMEOUT 是同一個角色。
 SPIN_UP_TIMEOUT = 4.0
 SPIN_COAST_DURATION = 3.0                # ← 特徵取在這一段
-SPIN_REPEATS = 3
+SPIN_REPEATS = 4
 
 # ── Block 2: 旋轉 creep (靜摩擦臨界) ─────────────────────────────────
 # 舊版的 creep 是直線的, 10 秒會走 57 m。改成原地轉, 一樣量靜摩擦但不會跑掉。
 CREEP_STEER_START, CREEP_STEER_END = 0.0, 10.0
 CREEP_DURATION = 10.0
-CREEP_REPEATS = 2
+CREEP_REPEATS = 3                        # 靜摩擦只有這個 block 在量, 2 次太少
 
 # ── Block 3: 直線短衝 + coast (滾動阻力) ─────────────────────────────
 # 加速段刻意只有 1 秒: effort 10 時 a=3.4 m/s^2, 1 秒走 1.7 m, 進入 coast
@@ -146,6 +180,19 @@ SLIP_REPEATS = 3
 REST_DURATION = 1.0
 RATE_LIMIT = 6.0        # effort/s, 模擬人踩油門的急促程度 (instant 型會略過)
 
+# IMU 靜止判定 (sensor 模式)。門檻給的是真車 MEMS 的量級, Isaac 的 IMU 沒雜訊一定過。
+IMU_STILL_WINDOW = 0.3  # s
+STILL_GYRO = 0.03       # rad/s, 窗內平均 (扣零偏後)
+STILL_ACC_STD = 0.08    # m/s^2, 窗內抖動 (馬達 / 路面振動)
+STILL_ACC_MEAN = 0.15   # m/s^2, 窗內平均前向加速度 —— 擋掉「等加速度」被當成靜止
+LOC_WAIT_MAX = 30.0     # s, 歸位前等定位恢復的上限
+# 定位一致性檢查 (sensor 模式): 位姿 yaw 在 LOC_CHECK_WINDOW 秒內的變化 vs 同一段
+# gyro 積分。sigma 抓不到「定位很有自信地錯了」—— 2026-09-15 那一輪融合定位整輪
+# 凍結 (相機時戳跨場景沒歸零), yaw 誤差 100 度, sigma 卻只有 0.001。
+LOC_CHECK_WINDOW = 1.0  # s
+LOC_CHECK_MIN_TURN = 0.5  # rad, 兩邊都轉不到這麼多就判斷不了 (靜止時不下結論)
+LOC_CHECK_TOL = 0.35    # rad (20 度)
+
 
 def _rate_limit(target, current, max_rate, dt):
     max_delta = max_rate * dt
@@ -168,6 +215,16 @@ def _clamp(v, lo, hi):
 def _yaw_of(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                       1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def _stamp(header):
+    return header.stamp.sec + header.stamp.nanosec * 1e-9
+
+
+def spin_targets(spin_max_w):
+    """B1 的三檔目標轉速: 上限的 75% / 87.5% / 100%, 最高檔再留 8% 給 overshoot。"""
+    top = 11.0 / 12.0 * spin_max_w
+    return [round(top * f, 2) for f in (0.75, 0.875, 1.0)]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -241,7 +298,16 @@ def _repos(name, x, y, heading_deg, timeout):
             'duration': timeout, 'min_clear': 0.0, 'min_ahead': None}
 
 
-def build_scenarios(room, repos_timeout, wall_margin, blocks=(1, 2, 3, 4)):
+def _calibrate(duration, timeout):
+    """開跑前靜止: 等定位與 IMU 都有資料, 再靜止 duration 秒量 gyro 零偏與加速度基準。
+    phase 標 'calibrate' —— 分析腳本也拿這段估零偏 (比 Rest 可靠, 見 estimate_friction)。"""
+    return {'name': 'Calibrate (stand still)', 'block': '-', 'type': 'calibrate',
+            'phase': 'calibrate', 'duration': duration, 'timeout': timeout,
+            'min_clear': 0.0, 'min_ahead': None}
+
+
+def build_scenarios(room, repos_timeout, wall_margin, blocks=(1, 2, 3, 4),
+                    spin_max_w=SPIN_MAX_SAFE_W, calib_duration=2.0):
     """room = (x_min, x_max, y_min, y_max) 的內牆範圍。
 
     min_clear = 離最近的牆至少要有幾公尺 (0 = 不檢查)
@@ -254,13 +320,13 @@ def build_scenarios(room, repos_timeout, wall_margin, blocks=(1, 2, 3, 4)):
     launch = [(x_min + 1.5, cy, 0.0),        # 面向 +X
               (x_max - 1.5, cy, 180.0)]      # 面向 -X
 
-    S = []
+    S = [_calibrate(calib_duration, timeout=60.0)]
 
     # ── Block 1: 旋轉 coast-down ─────────────────────────────────────
     if 1 in blocks:
         S.append(_repos('Reposition -> center (B1)', cx, cy, 0.0, repos_timeout))
         for rep in range(SPIN_REPEATS):
-            for w0 in SPIN_TARGET_W:
+            for w0 in spin_targets(spin_max_w):
                 tag = f'w0={w0:g} rep{rep + 1}'
                 gid = f'B1_{rep}_{w0:g}'
                 S.append(_const(f'B1 spin_up {tag}', 'B1_spin_up',
@@ -280,7 +346,7 @@ def build_scenarios(room, repos_timeout, wall_margin, blocks=(1, 2, 3, 4)):
             S.append(_ramp(f'B2 creep_spin rep{rep + 1}', 'B2_creep_spin', 'steer',
                            CREEP_STEER_START, CREEP_STEER_END,
                            CREEP_DURATION, min_clear=wall_margin,
-                           group=f'B2_{rep}', stop_at_wz=SPIN_MAX_SAFE_W))
+                           group=f'B2_{rep}', stop_at_wz=spin_max_w))
             S.append(_brake(f'Brake after B2 rep{rep + 1}'))
             S.append(_rest(1.5))
 
@@ -363,7 +429,23 @@ class ControlCarNode(Node):
         #     中心 —— run2 的 block 1/2 有 14 個情境是在**幾乎停著**的時候被
         #     「離牆只剩 1.48 m」中止的。
         p('wall_margin', 0.6)
-        p('odom_topic', '/odom')
+        # ---- 狀態來源 (見檔頭「狀態從哪裡來」) ----
+        p('state_source', 'sensor')           # sensor | gt
+        # 位姿 topic。空字串 = 依 state_source: sensor -> /fusion_loc/odom, gt -> /odom
+        p('odom_topic', '')
+        p('imu_topic', '/imu')
+        # 模擬器裡拿來對答案的 GT (只印誤差, 不參與控制)。真車上不存在就自動沒事。
+        p('gt_check_topic', '/odom')
+        p('pose_timeout', 0.3)                # s, 位姿多久沒更新算斷線
+        p('imu_timeout', 0.2)                 # s
+        # 位置 1-sigma (m) 超過這個就不信 -> 量測段中止。融合在絕對量測掉線時靠
+        # IMU+輪速遞推, sigma 會慢慢長大; 自旋幾秒是撐得住的, 所以門檻給寬。
+        p('pose_sigma_max', 0.5)
+        p('repos_sigma_max', 0.10)            # 歸位前要等 sigma 降到這裡
+        p('sigma_margin_k', 3.0)              # 牆邊餘裕 += k * sigma
+        # 自旋目標轉速上限 (rad/s)。0 = 依 state_source: sensor 7.5, gt 12.0
+        p('spin_max_w', 0.0)
+        p('calib_duration', 2.0)              # 開跑前靜止量零偏的秒數
         # 想只跑其中幾個 block:
         #   ros2 run calibrate_env_pkg calibrate_env_node --ros-args -p blocks:="[1,2]"
         p('blocks', [1, 2, 3, 4])
@@ -385,25 +467,68 @@ class ControlCarNode(Node):
         self.brake_decel = max(float(g('brake_decel').value), 0.1)
         blocks = tuple(int(b) for b in g('blocks').value)
 
+        self.source = str(g('state_source').value).strip().lower()
+        if self.source not in ('sensor', 'gt'):
+            raise ValueError(f'state_source 要是 sensor 或 gt, 收到 {self.source!r}')
+        self.sensor = self.source == 'sensor'
+        odom_topic = g('odom_topic').value or ('/fusion_loc/odom' if self.sensor else '/odom')
+        self.pose_timeout = float(g('pose_timeout').value)
+        self.imu_timeout = float(g('imu_timeout').value)
+        self.pose_sigma_max = float(g('pose_sigma_max').value)
+        self.repos_sigma_max = float(g('repos_sigma_max').value)
+        self.sigma_k = float(g('sigma_margin_k').value)
+        self.spin_max_w = float(g('spin_max_w').value) or (7.5 if self.sensor else SPIN_MAX_SAFE_W)
+
         self.effort_pub = self.create_publisher(JointState, '/joint_command', 10)
         self.scenario_pub = self.create_publisher(String, '/test_scenario', 10)
         # phase 是給 collect_data_node 標 CSV 用的: 分析時只取 'measure'。
         self.phase_pub = self.create_publisher(String, '/test_phase', 10)
-        self.create_subscription(Odometry, g('odom_topic').value,
-                                 self.on_odom, ODOM_QOS)
+        self.create_subscription(Odometry, odom_topic, self.on_odom, ODOM_QOS)
+        if self.sensor:
+            self.create_subscription(Imu, g('imu_topic').value, self.on_imu, ODOM_QOS)
+            gt_topic = g('gt_check_topic').value
+            if gt_topic and gt_topic != odom_topic:
+                self.create_subscription(Odometry, gt_topic, self.on_gt, ODOM_QOS)
 
         self.hz = 20.0
         self.dt = 1.0 / self.hz
 
         # 位姿 (geofence 與 reposition 用)。世界速度用位置差分算, 避免去猜
         # Isaac 的 twist 是車體座標還是世界座標 —— 猜錯閉迴路會直接發散。
+        # 差分用訊息**自己的時戳**, 不是收到的時間: 感測器鏈有延遲而且到達時間會
+        # 抖, 用收到時間差分會出現尖峰。
         self.pos = None
         self.yaw = 0.0
         self.wz = 0.0
         self.vel_w = (0.0, 0.0)
+        self.v_fused = None          # 融合的前向速度 (twist.linear.x); gt 模式不用
+        self.pose_sigma = 0.0
         self._prev_pos = None
         self._prev_t = None
         self.t_odom = -1e9
+
+        # IMU (sensor 模式)。零偏 / 加速度基準在 calibrate 段量, 之後每次靜止時更新。
+        self.t_imu = -1e9
+        self._imu_last_stamp = None
+        self.gyro_bias = 0.0
+        self.acc_ref = None          # 靜止時的 (ax, ay), 扣掉之後就是運動加速度
+        self.v_imu = 0.0             # 前向加速度從最近一次靜止開始的積分
+        self._imu_win = deque()      # (stamp, gz, ax, ay) 最近 IMU_WIN 秒
+        self.calibrated = not self.sensor
+        self._collecting = False
+        self._calib_buf = []
+        self._calib_ready_t = None
+        self._loc_wait_since = None
+
+        # 定位一致性檢查用的歷史: (stamp, 展開後的位姿 yaw) 與 (stamp, gyro 積分)
+        self._pose_hist = deque()
+        self._gyro_hist = deque()
+        self._gyro_int = 0.0
+        self._loc_bad_since = None   # 判定「定位跟 gyro 不一致」的時刻 (node clock)
+        self._loc_bad_why = ''
+
+        self.gt = None               # (x, y, wz) 只拿來印誤差
+        self._gt_err = []
 
         self.current_efforts = [0.0, 0.0, 0.0, 0.0]
         self.finished = False
@@ -412,7 +537,8 @@ class ControlCarNode(Node):
 
         self.scenarios = build_scenarios(
             self.room, float(g('reposition_timeout').value),
-            self.wall_margin, blocks)
+            self.wall_margin, blocks, spin_max_w=self.spin_max_w,
+            calib_duration=float(g('calib_duration').value))
         # trial 的原始段落 (重試時整組重放) 與各自的重試次數
         self.trials = {}
         for sc in self.scenarios:
@@ -431,18 +557,25 @@ class ControlCarNode(Node):
         self.get_logger().info(
             f'測試腳本: {len(self.scenarios)} 個情境, block {list(blocks)}, '
             f'量測時間約 {est:.0f} s (不含 reposition)\n'
+            f'  狀態來源 {self.source}: 位姿 {odom_topic}'
+            + (f', 轉速/加速度 {g("imu_topic").value}' if self.sensor else '')
+            + f'; 自旋目標 {spin_targets(self.spin_max_w)} rad/s\n'
             f'  房間 x[{self.room[0]}, {self.room[1]}] y[{self.room[2]}, {self.room[3]}], '
             f'離牆 {self.wall_margin} m (再加上當下速度的煞停距離) 內提前結束情境\n'
             f'  分析時只取 phase == "measure" 的列')
 
         self.timer = self.create_timer(self.dt, self.control_callback)
+        if self.sensor:
+            self.create_timer(10.0, self._gt_report)
 
     # ------------------------------------------------------------------
     def _now(self):
         return self.get_clock().now().nanoseconds / 1e9
 
     def on_odom(self, msg):
-        t = self._now()
+        now = self._now()
+        # 差分用訊息時戳; 發布端沒填時戳 (0) 才退回收到的時間
+        t = _stamp(msg.header) or now
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
         if self._prev_pos is not None and self._prev_t is not None:
@@ -450,27 +583,209 @@ class ControlCarNode(Node):
             if 1e-3 < dt < 0.5:
                 vx = (x - self._prev_pos[0]) / dt
                 vy = (y - self._prev_pos[1]) / dt
-                # 輕度平滑: 差分在 20 Hz 的模擬真值上很乾淨, 但仍會有量化台階
+                # 輕度平滑: 差分在 20 Hz 的模擬真值上很乾淨, 但仍會有量化台階;
+                # 感測器位姿 (10~30 Hz 絕對量測 + 遞推) 更需要
                 self.vel_w = (0.6 * self.vel_w[0] + 0.4 * vx,
                               0.6 * self.vel_w[1] + 0.4 * vy)
-        self._prev_pos = (x, y)
-        self._prev_t = t
+        if self._prev_t is None or t > self._prev_t:
+            self._prev_pos = (x, y)
+            self._prev_t = t
         self.pos = (x, y)
         self.yaw = _yaw_of(msg.pose.pose.orientation)
-        self.wz = msg.twist.twist.angular.z
-        self.t_odom = t
+        self.t_odom = now
+        if self.sensor:
+            yaw = self.yaw
+            if self._pose_hist:
+                prev = self._pose_hist[-1][1]
+                yaw = prev + _wrap_pi(yaw - prev)
+            if not self._pose_hist or t > self._pose_hist[-1][0]:
+                self._pose_hist.append((t, yaw))
+            while self._pose_hist and t - self._pose_hist[0][0] > 3.0:
+                self._pose_hist.popleft()
+            cov = msg.pose.covariance
+            s = cov[0] + cov[7]
+            self.pose_sigma = math.sqrt(s) if s > 0.0 else 0.0
+            # 融合節點的 twist.linear.x 是沿車頭的速度 (它自己有 forward_deg)
+            self.v_fused = msg.twist.twist.linear.x
+        else:
+            self.wz = msg.twist.twist.angular.z
+
+    def on_imu(self, msg):
+        now = self._now()
+        st = _stamp(msg.header) or now
+        gz = msg.angular_velocity.z
+        ax, ay = msg.linear_acceleration.x, msg.linear_acceleration.y
+        dt = 0.0
+        if self._imu_last_stamp is not None:
+            dt = st - self._imu_last_stamp
+            if not 0.0 < dt < 0.1:           # 亂序 / 掉包太久 -> 這一步不積分
+                dt = 0.0
+        self._imu_last_stamp = st
+        self.t_imu = now
+
+        self._imu_win.append((st, gz, ax, ay))
+        while self._imu_win and st - self._imu_win[0][0] > IMU_STILL_WINDOW:
+            self._imu_win.popleft()
+        if self._collecting:
+            self._calib_buf.append((gz, ax, ay))
+
+        self.wz = gz - self.gyro_bias
+        self._gyro_int += self.wz * dt
+        self._gyro_hist.append((st, self._gyro_int))
+        while self._gyro_hist and st - self._gyro_hist[0][0] > 3.0:
+            self._gyro_hist.popleft()
+        if self.acc_ref is not None and dt > 0.0:
+            self.v_imu += self._fwd_acc(ax, ay) * dt
+
+        if self.calibrated and self._imu_still():
+            self.v_imu = 0.0
+            # 沒在出力時才更新零偏/基準: 出力但卡住不動 (高 mu 的 creep 前段)
+            # 也是靜止, 但那時車體可能被扭矩壓得微微傾斜
+            if all(e == 0.0 for e in self.current_efforts):
+                n = len(self._imu_win)
+                self.gyro_bias += 0.02 * (sum(w[1] for w in self._imu_win) / n - self.gyro_bias)
+                mx = sum(w[2] for w in self._imu_win) / n
+                my = sum(w[3] for w in self._imu_win) / n
+                self.acc_ref = (self.acc_ref[0] + 0.02 * (mx - self.acc_ref[0]),
+                                self.acc_ref[1] + 0.02 * (my - self.acc_ref[1]))
+
+    def on_gt(self, msg):
+        self.gt = (msg.pose.pose.position.x, msg.pose.pose.position.y,
+                   msg.twist.twist.angular.z)
+        if self.pos is not None and self.odom_ok:
+            self._gt_err.append((math.hypot(self.pos[0] - self.gt[0], self.pos[1] - self.gt[1]),
+                                 abs(self.wz - self.gt[2])))
+
+    def _gyro_at(self, t):
+        """gyro 積分在時刻 t 的值 (線性內插); t 落在歷史之外回 None。"""
+        h = self._gyro_hist
+        if not h or t < h[0][0] or t > h[-1][0]:
+            return None
+        prev = h[0]
+        for cur in h:
+            if cur[0] >= t:
+                if cur[0] == prev[0]:
+                    return cur[1]
+                k = (t - prev[0]) / (cur[0] - prev[0])
+                return prev[1] + k * (cur[1] - prev[1])
+            prev = cur
+        return h[-1][1]
+
+    def _check_loc_consistency(self):
+        """位姿 yaw 的變化跟 gyro 積分對不對得上 (sensor 模式每個 tick 呼叫)。
+
+        抓的是 sigma 抓不到的失效: 定位凍結、鎖到錯的解、時鐘錯位。只在車子有在轉
+        的時候下結論; 判定不一致之後, 要等到一段「有在轉而且對得上」的窗才解除。"""
+        ph = self._pose_hist
+        if len(ph) < 2 or len(self._gyro_hist) < 2:
+            return
+        t1, y1 = ph[-1]
+        old = None
+        for t, y in ph:
+            if t <= t1 - LOC_CHECK_WINDOW:
+                old = (t, y)
+            else:
+                break
+        if old is None:
+            return
+        t0, y0 = old
+        g0, g1 = self._gyro_at(t0), self._gyro_at(t1)
+        now = self._now()
+        if g0 is None or g1 is None:
+            gap = t1 - self._gyro_hist[-1][0]
+            if abs(gap) > 1.0:
+                self._set_loc_bad(now, f'位姿時戳跟 IMU 差 {gap:+.1f} s (時鐘不同步)')
+            return
+        dg, dp = g1 - g0, y1 - y0
+        if abs(dg) < LOC_CHECK_MIN_TURN and abs(dp) < LOC_CHECK_MIN_TURN:
+            return
+        if abs(dp - dg) > LOC_CHECK_TOL:
+            self._set_loc_bad(now, f'{LOC_CHECK_WINDOW:g} s 內位姿轉了 {math.degrees(dp):+.0f}°, '
+                                   f'gyro 轉了 {math.degrees(dg):+.0f}°')
+        elif self._loc_bad_since is not None:
+            self.get_logger().info(
+                f'定位跟 gyro 重新對上了 (失效 {now - self._loc_bad_since:.1f} s)')
+            self._loc_bad_since = None
+
+    def _set_loc_bad(self, now, why):
+        if self._loc_bad_since is None:
+            self._loc_bad_since = now
+            self.get_logger().error(f'定位失效: {why} —— sigma {self.pose_sigma:.3f} 看不出來')
+        self._loc_bad_why = why
+
+    def _fwd_acc(self, ax, ay):
+        """IMU 前向加速度 (扣掉靜止基準)。IMU 裝在車體上、跟 base_link 同向。"""
+        return (math.cos(self.fwd_off) * (ax - self.acc_ref[0])
+                + math.sin(self.fwd_off) * (ay - self.acc_ref[1]))
+
+    def _imu_still(self):
+        """靜止判定: 最近 IMU_STILL_WINDOW 秒的 gyro 與加速度都沒在動。"""
+        win = self._imu_win
+        if len(win) < 5 or win[-1][0] - win[0][0] < 0.8 * IMU_STILL_WINDOW:
+            return False
+        n = len(win)
+        mg = sum(w[1] for w in win) / n
+        if abs(mg - self.gyro_bias) > STILL_GYRO:
+            return False
+        mx = sum(w[2] for w in win) / n
+        my = sum(w[3] for w in win) / n
+        var = sum((w[2] - mx) ** 2 + (w[3] - my) ** 2 for w in win) / n
+        if var > STILL_ACC_STD ** 2:
+            return False
+        return self.acc_ref is None or abs(self._fwd_acc(mx, my)) < STILL_ACC_MEAN
+
+    @property
+    def imu_ok(self):
+        return (self._now() - self.t_imu) < self.imu_timeout
+
+    @property
+    def pose_fresh(self):
+        return self.pos is not None and (self._now() - self.t_odom) < self.pose_timeout
 
     @property
     def odom_ok(self):
-        return self.pos is not None and (self._now() - self.t_odom) < 1.0
+        """控制需要的狀態都在而且可信。sensor 模式 = 位姿新鮮 + sigma 夠小 + IMU 在。"""
+        if not self.pose_fresh:
+            return False
+        if self.sensor:
+            return self.imu_ok and self.pose_sigma <= self.pose_sigma_max
+        return True
 
     def _heading(self):
         """車頭在世界座標的角度。"""
         return _wrap_pi(self.yaw + self.fwd_off)
 
     def _fwd_speed(self):
+        """閉迴路 (煞車 / 歸位) 用的前向速度。sensor 模式用融合的 twist。"""
+        if self.sensor and self.v_fused is not None:
+            return self.v_fused
         h = self._heading()
         return self.vel_w[0] * math.cos(h) + self.vel_w[1] * math.sin(h)
+
+    def _trigger_speed(self):
+        """stop_at_speed 用的前向速度。sensor 模式用 IMU 積分: 不吃輪速, 不受打滑影響。"""
+        return self.v_imu if self.sensor else self._fwd_speed()
+
+    def _omni_speed(self):
+        """geofence 用的全向速率。
+
+        sensor 模式取「位姿差分」與「IMU 積分」的較大值, **不含**融合的 twist:
+        那個速度吃輪速, 起步打滑時輪子空轉, 它會報 4 m/s 而車子實際 2 m/s ——
+        假模擬器 E2E 實測, B4 在 mu=0.5 時 6 次全部被這個假速度的煞停距離中止。
+        位姿差分本身有絕對量測 (相機 / LiDAR) 按著, 不會被打滑帶跑。"""
+        s = math.hypot(self.vel_w[0], self.vel_w[1])
+        if self.sensor:
+            s = max(s, abs(self.v_imu))
+        return s
+
+    def _ahead_speed(self):
+        """geofence 前方檢查用的前向速度 (同上, sensor 模式不用融合 twist)。"""
+        h = self._heading()
+        v_pose = self.vel_w[0] * math.cos(h) + self.vel_w[1] * math.sin(h)
+        return max(v_pose, self.v_imu) if self.sensor else self._fwd_speed()
+
+    def _clearance_margin(self):
+        return self.sigma_k * self.pose_sigma if self.sensor else 0.0
 
     # ---------------------------------------------------------- geofence
     def _wall_clearance(self):
@@ -499,32 +814,41 @@ class ControlCarNode(Node):
         固定門檻在這裡沒有用 —— 低 mu 的地面 coast 段還維持著 3.4 m/s, 等到
         「剩 1 m」才踩煞車已經來不及; 高 mu 的地面則會被過度保守的門檻白白
         中止掉還有效的資料。"""
-        if not self.odom_ok:
-            return None                      # 沒有 odom 就沒有 geofence (會另外警告)
+        # 舊版這裡是「沒有 odom 就回 None」= 不檢查、開迴路繼續衝。GT 不會斷所以
+        # 沒出過事; 感測器會 (自旋時 LiDAR 追丟、相機被擋), 必須當成違規處理。
+        if not self.pose_fresh:
+            return '定位中斷 (位姿過期)'
+        if self.sensor and not self.imu_ok:
+            return 'IMU 中斷'
+        if self.sensor and self.pose_sigma > self.pose_sigma_max:
+            return f'定位不可信 (sigma {self.pose_sigma:.2f} m > {self.pose_sigma_max:.2f})'
+        if self.sensor and self._loc_bad_since is not None:
+            return f'定位跟 gyro 不一致 ({self._loc_bad_why})'
 
         # 通用轉速防呆: 不管有沒有設 stop_at_wz, 轉速真的衝到危險區就中止。
-        # stop_at_wz 是主要防線 (在還沒到 SPIN_MAX_SAFE_W 就先放開), 這裡抓的
+        # stop_at_wz 是主要防線 (在還沒到 spin_max_w 就先放開), 這裡抓的
         # 是 overshoot 或其他 block 意外飄轉的情況。
-        if abs(self.wz) > 1.5 * SPIN_MAX_SAFE_W:
+        if abs(self.wz) > 1.5 * self.spin_max_w:
             return f'轉速過快 wz={self.wz:.1f} rad/s, 有失控飄移風險'
 
         mc = float(sc.get('min_clear') or 0.0)
         if mc > 0.0:
             # 這裡用的是**全向**速率, 不是前向: 自旋段車體是橫著滑出去的,
             # 只看車頭方向的分量會漏掉大部分的動能。
-            speed = float(math.hypot(self.vel_w[0], self.vel_w[1]))
-            need = mc + speed * speed / (2.0 * self.brake_decel)
+            speed = float(self._omni_speed())
+            loc = self._clearance_margin()
+            need = mc + loc + speed * speed / (2.0 * self.brake_decel)
             clear = self._wall_clearance()
             if clear < need:
                 return (f'離牆只剩 {clear:.2f} m (需要 {need:.2f} m '
-                        f'= 餘裕 {mc:.2f} + {speed:.2f} m/s 的煞停距離 '
-                        f'{need - mc:.2f})')
+                        f'= 餘裕 {mc:.2f} + 定位 {loc:.2f} + {speed:.2f} m/s 的煞停距離 '
+                        f'{need - mc - loc:.2f})')
 
         ma = sc.get('min_ahead')
         if ma is not None:
-            v = max(self._fwd_speed(), 0.0)
+            v = max(self._ahead_speed(), 0.0)
             stop_dist = v * v / (2.0 * self.brake_decel)
-            need = float(ma) + stop_dist
+            need = float(ma) + self._clearance_margin() + stop_dist
             ahead = self._ahead_clearance()
             if ahead < need:
                 return (f'前方只剩 {ahead:.2f} m (需要 {need:.2f} m '
@@ -538,6 +862,11 @@ class ControlCarNode(Node):
         self.scenario_start = self._now()
         self._repos_state = 'turn_to_bearing'
         self._i_v = self._i_w = 0.0
+        self._loc_wait_since = None
+        if idx < len(self.scenarios) and self.scenarios[idx].get('stop_at_speed') is not None:
+            # 加速段從靜止開始 (前面是歸位 settle, 已確認停住) -> IMU 速度積分歸零。
+            # 不等靜止偵測自己歸零: settle 剛結束時 0.3 s 的窗還沒安靜下來。
+            self.v_imu = 0.0
         name = (self.scenarios[idx]['name'] if idx < len(self.scenarios)
                 else 'Finished')
         self.get_logger().info(f'[{idx + 1}/{len(self.scenarios)}] -> {name}')
@@ -593,6 +922,8 @@ class ControlCarNode(Node):
     def control_callback(self):
         now = self._now()
         elapsed = now - self.scenario_start
+        if self.sensor:
+            self._check_loc_consistency()
 
         if self.idx >= len(self.scenarios):
             if elapsed > 2.0 and not self.finished:
@@ -608,15 +939,31 @@ class ControlCarNode(Node):
 
         sc = self.scenarios[self.idx]
 
+        if sc['type'] == 'calibrate':
+            self._run_calibrate(sc, now, elapsed)
+            return
+
         if sc['type'] == 'brake':
             # 主動煞停: 目標速度 0, 給反向扭矩。放開油門是停不下來的。
-            if not self.odom_ok:
+            # sensor 模式: 轉速永遠用 gyro (定位斷了也有); 前向速度用融合的,
+            # 融合過期就退回 IMU 積分。兩個都沒有才只能放開等。
+            have_w = self.imu_ok if self.sensor else self.pose_fresh
+            if not have_w:
                 stopped = elapsed > 1.0
                 dangerous = False
                 efforts = [0.0] * 4
             else:
-                v, w = self._fwd_speed(), self.wz
+                if self.sensor:
+                    v = self.v_fused if (self.pose_fresh and self.v_fused is not None) \
+                        else self.v_imu
+                else:
+                    v = self._fwd_speed()
+                w = self.wz
                 stopped = abs(v) < 0.05 and abs(w) < 0.08
+                if self.sensor:
+                    # 融合的速度吃輪速: 車子在滑、輪子被煞住時它會說 0。
+                    # 加上 IMU 靜止判定才算真的停了。
+                    stopped = stopped and self._imu_still()
                 dangerous = abs(v) > 0.3 or abs(w) > 1.0
                 efforts = self._mix(_clamp(-5.0 * v, -MAX_EFFORT, MAX_EFFORT),
                                     _clamp(-3.0 * w, -MAX_EFFORT, MAX_EFFORT))
@@ -656,10 +1003,6 @@ class ControlCarNode(Node):
             else:
                 self._abort(bad)
             return
-        if not self.odom_ok:
-            self.get_logger().warn(
-                '收不到 odom -> geofence 與 reposition 停用, 車子可能撞牆。'
-                '檢查 Isaac 有沒有按 Play。', throttle_duration_sec=10.0)
 
         if sc['type'] == 'ramp':
             frac = _clamp(elapsed / sc['duration'], 0.0, 1.0)
@@ -676,7 +1019,7 @@ class ControlCarNode(Node):
         # 速度觸發的結束條件 (加速段用)。到了目標速度就放開, coast 的進入速度
         # 因此是**指定的**, 不是被地面摩擦係數決定的。
         vt = sc.get('stop_at_speed')
-        if vt is not None and self.odom_ok and self._fwd_speed() >= float(vt):
+        if vt is not None and self.odom_ok and self._trigger_speed() >= float(vt):
             self._enter(self.idx + 1)
             return
 
@@ -695,6 +1038,42 @@ class ControlCarNode(Node):
         這一段是**唯一**的閉迴路, 而且標成 phase='reposition' —— 分析時要整段
         丟掉, 否則等於把「控制器補償摩擦力」的行為混進資料裡。
         """
+        if self.sensor and not (self.pose_fresh and self.imu_ok
+                                and self.pose_sigma <= self.repos_sigma_max):
+            # 自旋完 LiDAR 可能鎖到對稱解或還在重新收斂。拿不可信的位置去開車,
+            # 就是朝著牆以為是空地開過去。停著等它回來 (靜止時比較好重新鎖定)。
+            now = self._now()
+            if self._loc_wait_since is None:
+                self._loc_wait_since = (now, elapsed)
+            waited = now - self._loc_wait_since[0]
+            self.scenario_start = now - self._loc_wait_since[1]    # 等待不算進歸位逾時
+            self.get_logger().warn(
+                f'{sc["name"]}: 等定位恢復 (sigma {self.pose_sigma:.3f} m, '
+                f'位姿{"" if self.pose_fresh else "過期"}, 已等 {waited:.0f} s)',
+                throttle_duration_sec=2.0)
+            if waited > LOC_WAIT_MAX:
+                self.get_logger().error(f'定位 {LOC_WAIT_MAX:.0f} s 沒恢復, 跳過這次歸位')
+                return [0.0] * 4, True
+            return [0.0] * 4, False
+        self._loc_wait_since = None
+
+        if self.sensor and self._loc_bad_since is not None:
+            # 定位跟 gyro 對不上: 位置和朝向都不能信。原地轉是安全的 (位移 ~0),
+            # 而且只有在轉的時候才驗證得了它有沒有恢復 -> 只准轉, 不准直線開。
+            bad_for = self._now() - self._loc_bad_since
+            if bad_for > LOC_WAIT_MAX:
+                self.get_logger().error(
+                    f'定位失效 {bad_for:.0f} s 沒恢復 ({self._loc_bad_why}), 放棄整份測試腳本 —— '
+                    '在錯的位置繼續收只會得到錯的資料 (真車上就是撞牆)。'
+                    '檢查定位節點的 log (時鐘偏移、追丟)。')
+                del self.scenarios[self.idx + 1:]
+                return [0.0] * 4, True
+            self.get_logger().warn(f'{sc["name"]}: 定位跟 gyro 不一致, 只原地轉等它恢復 '
+                                   f'({bad_for:.0f}/{LOC_WAIT_MAX:.0f} s)',
+                                   throttle_duration_sec=2.0)
+            if self._repos_state in ('drive', 'settle'):
+                self._goto('turn_to_bearing')
+
         if not self.odom_ok:
             return [0.0] * 4, elapsed > 2.0      # 沒 odom 就只煞停一下帶過
 
@@ -755,6 +1134,83 @@ class ControlCarNode(Node):
         if abs(v) < 0.05 and abs(self.wz) < 0.08:
             return [0.0] * 4, True
         return self._mix(_clamp(-5.0 * v, -6.0, 6.0), self._steer_for(err)), False
+
+    # ------------------------------------------------------ 開跑前靜止校正
+    def _run_calibrate(self, sc, now, elapsed):
+        """等位姿 (+ IMU) 都到齊, 再靜止 duration 秒量 gyro 零偏與加速度基準。
+
+        融合 / IMU 定位節點自己也會做開機靜止校正, 但那是**它們的**零偏;
+        這裡的 wz 與 v_imu 直接吃 /imu, 要自己量。等不到資料就整份腳本放棄 ——
+        沒有定位還開迴路自旋, 在真車上就是撞牆。
+        """
+        self._publish('calibrate', sc['name'], [0.0] * 4, rate_limited=False)
+        ready = self.pose_fresh and (not self.sensor or (
+            self.imu_ok and self.pose_sigma <= self.repos_sigma_max))
+        if not ready:
+            self._collecting = False
+            self._calib_buf = []
+            self._calib_ready_t = None
+            if elapsed > sc['timeout']:
+                what = ('定位 ' + ('OK' if self.pose_fresh else '沒資料')
+                        + (f' (sigma {self.pose_sigma:.3f})' if self.sensor else '')
+                        + ('' if not self.sensor else
+                           ', IMU ' + ('OK' if self.imu_ok else '沒資料')))
+                self.get_logger().error(
+                    f'等了 {elapsed:.0f} s 狀態還是不齊 ({what}), 放棄整份測試腳本。'
+                    + ('檢查 localization 節點有沒有開、Isaac 有沒有按 Play。'))
+                del self.scenarios[self.idx + 1:]
+                self._enter(self.idx + 1)
+            else:
+                self.get_logger().info('等待定位 / IMU ...', throttle_duration_sec=5.0)
+            return
+
+        if self._calib_ready_t is None:
+            self._calib_ready_t = now
+            self._calib_buf = []
+            self._collecting = self.sensor
+            return
+        if now - self._calib_ready_t < sc['duration']:
+            return
+
+        if self.sensor:
+            buf = self._calib_buf
+            if len(buf) < 10:
+                self.get_logger().warn('靜止校正期間 IMU 樣本太少, 再等一輪')
+                self._calib_ready_t = None
+                return
+            n = len(buf)
+            mg = sum(b[0] for b in buf) / n
+            gstd = math.sqrt(sum((b[0] - mg) ** 2 for b in buf) / n)
+            if gstd > 3 * STILL_GYRO:
+                self.get_logger().warn(f'靜止校正時 gyro 在抖 (std {gstd:.3f} rad/s), '
+                                       '車子可能還在動, 重來')
+                self._calib_ready_t = None
+                return
+            self.gyro_bias = mg
+            self.acc_ref = (sum(b[1] for b in buf) / n, sum(b[2] for b in buf) / n)
+            self.v_imu = 0.0
+            self.calibrated = True
+            self._collecting = False
+            self.get_logger().info(
+                f'靜止校正完成: gyro 零偏 {mg * 1e3:+.2f} mrad/s (std {gstd * 1e3:.2f}), '
+                f'加速度基準 ({self.acc_ref[0]:+.3f}, {self.acc_ref[1]:+.3f}) m/s², '
+                f'{n} 筆 IMU')
+        self._enter(self.idx + 1)
+
+    def _gt_report(self):
+        """sensor 模式在模擬器裡跑時, 拿 GT 對答案 (只印, 不參與控制)。"""
+        if not self._gt_err:
+            return
+        pe = sorted(e[0] for e in self._gt_err)
+        we = sorted(e[1] for e in self._gt_err)
+        k = int(0.95 * (len(pe) - 1))
+        self.get_logger().info(
+            f'[GT 對照] 位置誤差 中位 {pe[len(pe) // 2] * 100:.1f} cm / p95 {pe[k] * 100:.1f} cm, '
+            f'轉速誤差 中位 {we[len(we) // 2]:.3f} / p95 {we[k]:.3f} rad/s '
+            f'(sigma {self.pose_sigma:.3f} m, gyro 零偏 {self.gyro_bias * 1e3:+.2f} mrad/s)')
+        if we[len(we) // 2] > 1.0:
+            self.get_logger().warn('gyro 跟 GT 轉速對不上 —— IMU 軸向 / 正負號可能不對')
+        self._gt_err = []
 
     def _goto(self, state):
         self._repos_state = state

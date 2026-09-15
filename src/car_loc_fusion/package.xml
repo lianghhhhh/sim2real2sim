@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>car_loc_fusion</name>
+  <version>1.0.0</version>
+  <description>方法五: 把四種感測器結合起來。IMU + 輪速做高頻遞推 (連續、不會斷), 相機與 LiDAR 的絕對位姿做低頻修正 (不漂、能自己找到自己)。絕對量測的時戳是過去的, 所以做倒帶重放; 來源自己回報的 sigma 拿來擋追丟; 濾波器自己錯掉時有逃生口。</description>
+  <maintainer email="selenahuang0218@gmail.com">liangh</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <depend>python3-numpy</depend>
+
+  <!-- 遞推核心直接用 car_loc_wheel 的 WheelIns —— 這個 package 是「把四條結合
+       起來」的那一個, 所以它是唯一可以 import 別條路線的。抄第二份的話兩邊的
+       參數與修正會慢慢分岔。 -->
+  <depend>car_loc_wheel</depend>
+
+  <!-- 絕對量測來自這兩條的輸出 (topic 層, 不 import) -->
+  <exec_depend>car_loc_camera</exec_depend>
+  <exec_depend>car_loc_lidar</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>car_teleop</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
