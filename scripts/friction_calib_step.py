@@ -22,7 +22,30 @@ STATUS:
 ────────────────────────────────────────────────────────────────────────
 每個係數各自用一個特徵 (量出來的 real 值是目標):
     dynamicFriction <- B1 自旋減速度 (spin_decel)
-    staticFriction  <- B2 慢速起轉 effort (creep_breakaway), 沒有就用 B1 spin_up 起轉
+    staticFriction  <- B2 慢速起轉 effort (creep_breakaway) —— 預設不單獨解, 見下面
+
+────────────────────────────────────────────────────────────────────────
+為什麼預設把 staticFriction 綁在 dynamicFriction 上 (--static-mode tied)
+────────────────────────────────────────────────────────────────────────
+2026-09-16 的對照實驗 (probe: 地面 static 1.2 / dynamic 0.5, 對照 real 0.5 / 0.5,
+**只有靜摩擦不一樣**) 量到各特徵對靜摩擦的敏感度 d ln f / d ln mu_static:
+
+    creep_breakaway    0.315   (9.4 sigma, 真的有反應)
+    spinup_breakaway   0.208   (4.6 sigma)
+    spinup_time       -0.019   (0.7 sigma = 沒反應)
+    spin_decel        -0.015   (0.7 sigma = 沒反應, 符合預期)
+
+也就是說 PhysX 這組設定下**靜摩擦只有 B2 量得到, 而且敏感度只有 0.3**
+(推測是起轉前的預滑移已經讓接觸點進入滑動狀態, 之後就由 dynamic 主導)。
+同一個特徵對動摩擦的敏感度是 ~0.65, 所以:
+
+  * 拿 creep 解靜摩擦, 必須先扣掉動摩擦的貢獻, 而動摩擦本身的誤差會被放大
+    0.65/0.315 ≈ 2 倍灌進靜摩擦 -> 靜摩擦的解析度大約只有 ±0.07。
+  * 硬要分開解, 兩邊的量測雜訊會被塞進「靜/動的差」這個自由度裡, 產生假的
+    靜動差 (2026-09-16 那一輪: 真值 0.5/0.5, 解出 0.537/0.486)。
+
+所以預設 `--static-mode tied`: 只解一個 mu (用 spin_decel), static = dynamic。
+real 的 USD 兩個值一樣時這就是正解; 真的需要分開解再用 `--static-mode free`。
 
 * 只有一輪 sim (第 0 輪):  用 estimate_friction 的物理換算 (有效摩擦取平均、特徵 ∝ 有效
   摩擦) 估 real 的地面值。
@@ -51,10 +74,20 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 係數 -> 依序嘗試的特徵
+# spinup_time 原本被當成靜摩擦特徵, 2026-09-16 的對照實驗證明它對靜摩擦沒反應
+# (敏感度 -0.019), 對動摩擦才有 (~0.47) —— 它是 spin_decel 的備援, 不是靜摩擦。
 TERM_FEATURES = {
-    'dynamic': ['spin_decel'],
+    'dynamic': ['spin_decel', 'spinup_time'],
     'static': ['creep_breakaway', 'spinup_breakaway'],
 }
+# spinup_time 依賴「兩個環境的馬達一樣」(它含馬達 ramp)。B3 對照組 (直線加速 /
+# 直線滑行) 就是在量這件事: 它們跟地面摩擦無關, 比值應該 ≈ 1。顯著不是 1 就不能用。
+MOTOR_DEPENDENT = {'spinup_time'}
+CONTROL_FEATURES = ('sprint_accel', 'coast_lin_decel')
+# tied 模式 (static = dynamic) 下這些特徵量的是**同一個 mu**, 可以各自估一次再
+# 反變異數合併。2026-09-16 (sim 0.5 -> real 2.0) 的收斂點四個特徵都說「sim 還低」,
+# 但只用 spin_decel 停在 1.925; 合併後是 1.969 (真值 2.0)。
+COMBINE_FEATURES = ('spin_decel', 'creep_breakaway', 'spinup_time', 'spinup_breakaway')
 
 
 def run_estimate(args, json_path):
@@ -94,12 +127,30 @@ def emit(status, static, dynamic, reason):
     print(f'STATUS={status} NEXT_STATIC={static:.4f} NEXT_DYNAMIC={dynamic:.4f}')
 
 
+def drivetrain_ok(res):
+    """B3 對照組有沒有顯著偏離 1 (= 兩邊不只地面不一樣, 驅動系統也不一樣)。
+
+    看的是 90% CI 含不含 1, 不是點估計: 對照組的 trial 少、CI 寬, 用點估計
+    會常常誤判成「不一樣」而把最準的特徵丟掉。"""
+    for k in CONTROL_FEATURES:
+        f = (res.get('features') or {}).get(k)
+        if not f:
+            continue
+        lo, hi = (f.get('ci90') or [float('nan')] * 2)[:2]
+        if all(map(math.isfinite, (lo, hi))) and not (lo <= 1.0 <= hi):
+            return False
+    return True
+
+
 def pick_features(res):
     """這一輪每個係數用的特徵: {term: {name, sim, real, log_sd}}。"""
     out = {}
     feats = res.get('features') or {}
+    motor_ok = drivetrain_ok(res)
     for term, names in TERM_FEATURES.items():
         for n in names:
+            if n in MOTOR_DEPENDENT and not motor_ok:
+                continue
             f = feats.get(n)
             if f and f.get('ref') and f.get('target'):
                 out[term] = {'name': n, 'sim': f['ref'], 'real': f['target'],
@@ -108,29 +159,52 @@ def pick_features(res):
     return out
 
 
+def hist_points(hist, name, term):
+    """歷史上這個特徵的 (sim 地面係數, sim 量到的特徵值)。同一個係數量多次取最後一次。"""
+    pts = {}
+    for it in hist['iterations']:
+        if it.get('status') == 'retry':
+            continue
+        f = (it.get('all_features') or {}).get(name)
+        if f is None:                                  # 舊版 history 只存了選中的那個
+            g = (it.get('features') or {}).get(term)
+            f = g if (g and g.get('name') == name) else None
+        if f:
+            pts[round(it[term], 6)] = f['sim']
+    return pts
+
+
 def secant_estimate(term, feat, cur_mu, hist):
     """用歷史上同一個特徵的 (sim 係數, sim 特徵) 點內插 real 的特徵值。
 
     回傳 (估計值, 1-sigma, 說明) 或 None (點不夠 / 斜率不合理)。"""
-    pts = {}
-    for it in hist['iterations']:
-        f = (it.get('features') or {}).get(term)
-        if f and f['name'] == feat['name'] and it.get('status') != 'retry':
-            pts[round(it[term], 6)] = f['sim']        # 同一個係數量多次就取最後一次
+    pts = hist_points(hist, feat['name'], term)
     pts[round(cur_mu, 6)] = feat['sim']
     if len(pts) < 2:
         return None
     real = feat['real']
     items = sorted(pts.items())
-    below = [p for p in items if p[1] <= real]
-    above = [p for p in items if p[1] > real]
-    if below and above:                      # real 被夾在中間 -> 內插, 取最靠近的一對
-        p1 = max(below, key=lambda p: p[1])
-        p2 = min(above, key=lambda p: p[1])
-        how = '內插'
-    else:                                    # 全在同一側 -> 用最靠近 real 的兩點外插
-        p1, p2 = sorted(items, key=lambda p: abs(p[1] - real))[:2]
-        how = '外插'
+    # 兩點的**特徵差**至少要有這麼多個 sigma, 斜率才不是在量雜訊。收斂到後期時
+    # 相鄰兩輪的 mu 只差 0.07, 特徵差 (0.01) 比雜訊 (0.03) 還小 —— 這時候用它們
+    # 算斜率會炸掉 (2026-09-15 的資料第 3 輪: 估計值從 1.96 跳到 2.38 ± 0.22)。
+    # 差不夠就退回更遠的那個點: 基線長, 斜率才可信。
+    noise = real * feat['log_se']
+    MIN_GAP = 3.0
+    p1 = min(items, key=lambda p: abs(p[1] - real))       # 特徵最接近 real 的點
+    rest = [p for p in items if p[0] != p1[0] and abs(p[0] - p1[0]) > 1e-6]
+    if not rest:
+        return None
+    far = [p for p in rest if abs(p[1] - p1[1]) >= MIN_GAP * noise]
+    if far:
+        brack = [p for p in far if (p[1] - real) * (p1[1] - real) < 0]
+        # real 被夾在中間 -> 內插 (最可信); 否則取基線最短的那個外插
+        p2 = min(brack or far, key=lambda p: abs(p[0] - p1[0]))
+        how = '內插' if brack else '外插'
+    else:
+        p2 = max(rest, key=lambda p: abs(p[1] - p1[1]))   # 全都太近 -> 用差最大的
+        if abs(p2[1] - p1[1]) < noise:
+            return None                                   # 整條曲線都埋在雜訊裡
+        how = '外插(點距接近雜訊)'
     (m1, f1), (m2, f2) = p1, p2
     if abs(m2 - m1) < 1e-6:
         return None
@@ -141,6 +215,42 @@ def secant_estimate(term, feat, cur_mu, hist):
     # 1-sigma: real 與 sim 特徵中位數的相對標準誤 (log_se 是比值的, 已經含兩邊)
     sigma = real * feat['log_se'] / slope
     return est, sigma, f'{how} ({m1:g}->{f1:.2f}, {m2:g}->{f2:.2f}; real {real:.2f})'
+
+
+def combine_estimate(res, cur_mu, hist, term='dynamic'):
+    """tied 模式: 每個特徵各自用割線法估一次 mu, 再反變異數合併。
+
+    合併後的 1-sigma 同時含兩部分:
+        組內  1/sqrt(sum 1/sigma_i^2)      每個特徵自己的量測雜訊
+        組間  各特徵估計值的加權離散         特徵之間的系統差 (實測比組內大)
+    只在 tied 模式用: static 跟 dynamic 綁在一起時, 這些特徵量的才是同一個量。
+    回傳 (估計值, 1-sigma, 說明, 每個特徵的明細) 或 None。"""
+    feats = res.get('features') or {}
+    motor_ok = drivetrain_ok(res)
+    parts = []
+    for name in COMBINE_FEATURES:
+        if name in MOTOR_DEPENDENT and not motor_ok:
+            continue
+        f = feats.get(name)
+        if not (f and f.get('ref') and f.get('target')):
+            continue
+        one = {'name': name, 'sim': f['ref'], 'real': f['target'],
+               'log_se': f.get('log_se', f.get('log_sd', 0.1))}
+        r = secant_estimate(term, one, cur_mu, hist)
+        if r and math.isfinite(r[1]) and r[1] > 0:
+            parts.append((name, r[0], r[1]))
+    if not parts:
+        return None
+    if len(parts) == 1:
+        name, e, sig = parts[0]
+        return e, sig, f'只有 {name} 可用', parts
+    w = [1.0 / sig ** 2 for _, _, sig in parts]
+    sw = sum(w)
+    mu = sum(wi * e for wi, (_, e, _) in zip(w, parts)) / sw
+    within = 1.0 / math.sqrt(sw)
+    between = math.sqrt(sum(wi * (e - mu) ** 2 for wi, (_, e, _) in zip(w, parts)) / sw)
+    how = '合併 ' + ', '.join(f'{n} {e:.3f}' for n, e, _ in parts)
+    return mu, math.sqrt(within ** 2 + between ** 2), how, parts
 
 
 def model_estimate(term, res):
@@ -184,6 +294,8 @@ def main():
     ap.add_argument('--mu-max', type=float, default=5.0)
     ap.add_argument('--wheel-mu', type=float, default=0.5, help='輪子材質 mu (PhysX 預設 0.5)')
     ap.add_argument('--combine', default='average', choices=['average', 'min', 'multiply', 'max'])
+    ap.add_argument('--static-mode', default='tied', choices=['tied', 'free'],
+                    help='tied = static 跟著 dynamic 走 (預設, 見檔頭); free = 用 B2 分開解')
     ap.add_argument('--source', default=None, help='傳給 estimate_friction 的 --source')
     ap.add_argument('--boot', type=int, default=1000)
     args = ap.parse_args()
@@ -220,7 +332,17 @@ def main():
             f'{"sim" if k == "ref" else "real"}: {lq[k]["message"]}' for k in bad) + ')')
 
     feats = pick_features(res)
+    if args.static_mode == 'tied':
+        feats.pop('static', None)             # 只解 dynamic, static 等比例跟著走
     entry['features'] = feats
+    # 每個特徵都存起來 (不只選中的那個): 之後的輪次才能各自畫出自己的
+    # 「mu -> 特徵」曲線來合併, 見 combine_estimate
+    allf = res.get('features') or {}
+    entry['all_features'] = {
+        n: {'sim': allf[n]['ref'], 'real': allf[n]['target'],
+            'log_se': allf[n].get('log_se', allf[n].get('log_sd', 0.1))}
+        for n in COMBINE_FEATURES
+        if allf.get(n) and allf[n].get('ref') and allf[n].get('target')}
     entry['ratio'] = (res.get('combined') or {}).get('ratio')
     if 'dynamic' not in feats:
         return retry_or_fail('B1 自旋減速度沒有資料')
@@ -230,14 +352,27 @@ def main():
     for term in ('dynamic', 'static'):
         if term not in feats:
             continue
-        r = secant_estimate(term, feats[term], cur[term], hist) or model_estimate(term, res)
+        r, parts, label = None, None, feats[term]['name']
+        if term == 'dynamic' and args.static_mode == 'tied':
+            # static 綁著 dynamic -> 所有特徵量的是同一個 mu, 可以合併
+            c = combine_estimate(res, cur[term], hist)
+            if c:
+                r, parts, label = c[:3], c[3], f'{len(c[3])} 個特徵'
+        if r is None:
+            r = secant_estimate(term, feats[term], cur[term], hist) or model_estimate(term, res)
         if r is None:
             return finish('failed', args.static, args.dynamic,
                           f'{term} 估不出來 (combine={args.combine} 下地面不是瓶頸? 特徵不隨 mu 增加?)')
         est[term] = r
         e, sig, how = r
-        lines.append(f'{term}: 目前 {cur[term]:.3f}, 估計 {e:.3f} ± {sig:.3f} '
-                     f'[{feats[term]["name"]}, {how}]')
+        lines.append(f'{term}: 目前 {cur[term]:.3f}, 估計 {e:.3f} ± {sig:.3f} [{label}, {how}]')
+        if parts and len(parts) > 1:
+            entry['combined_from'] = [{'name': n, 'value': v, 'sigma': g} for n, v, g in parts]
+            spread = max(v for _, v, _ in parts) - min(v for _, v, _ in parts)
+            if spread > 3 * min(g for _, _, g in parts):
+                lines.append(f'  ! 特徵之間差到 {spread:.3f} (最小的 1-sigma 只有 '
+                             f'{min(g for _, _, g in parts):.3f}) —— 已經算進上面的誤差裡, '
+                             '但代表特徵之間有系統差')
         if math.isfinite(sig) and sig > args.tol:
             lines.append(f'  ! {term} 的解析度 ±{sig:.3f} 比容許誤差 {args.tol:g} 差 —— '
                          '收斂判定會被雜訊左右, 要更準得加 trial')
@@ -247,7 +382,9 @@ def main():
     if all(abs(est[t][0] - cur[t]) <= args.tol for t in est):
         fin = {t: est[t][0] if t in est else cur[t] for t in cur}
         if 'static' not in est:
-            fin['static'] = cur['static'] * fin['dynamic'] / cur['dynamic']
+            # tied: 直接等於 dynamic; free 但 B2 沒資料: 維持原本的靜/動比例
+            fin['static'] = (fin['dynamic'] if args.static_mode == 'tied'
+                             else cur['static'] * fin['dynamic'] / cur['dynamic'])
         return finish('converged', fin['static'], fin['dynamic'],
                       '修正量都 <= %g: ' % args.tol + '; '.join(
                           f'{t} {cur[t]:.3f} -> {fin[t]:.3f}' for t in est))
@@ -257,9 +394,11 @@ def main():
         target = cur[t] + args.gain * (e - cur[t])
         new[t] = min(max(target, cur[t] / args.max_step, args.mu_min),
                      cur[t] * args.max_step, args.mu_max)
-    if 'static' not in est:                   # 靜摩擦沒資料 -> 跟著動摩擦等比例
-        new['static'] = min(max(cur['static'] * new['dynamic'] / cur['dynamic'],
-                                args.mu_min), args.mu_max)
+    if 'static' not in est:
+        # tied: static 就是 dynamic; free 但 B2 沒資料: 維持原本的靜/動比例
+        tgt = (new['dynamic'] if args.static_mode == 'tied'
+               else cur['static'] * new['dynamic'] / cur['dynamic'])
+        new['static'] = min(max(tgt, args.mu_min), args.mu_max)
     desc = ', '.join(f'{t} {cur[t]:.3f} -> {new[t]:.3f}' for t in cur)
 
     if args.iter + 1 >= args.max_iter:

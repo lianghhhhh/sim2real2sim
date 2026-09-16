@@ -90,8 +90,14 @@ IMU 全速率另存一個檔: `<csv 檔名>_imu.csv`
 高摩擦地面 0.15~0.3 秒就停住 —— 主 CSV 20 Hz 取樣只剩 3~6 個點, 而且是「最新
 一則」的取樣 (時間點不準)。所以 /imu 每一則訊息都在 callback 裡直接寫一列:
 
-    stamp, recv, scenario_name, phase, gyro_x/y/z, acc_x/y/z,
-    effort_command_* (最新), *_velocity (最新輪速)
+    stamp, recv, scenario_name, phase, scenario_recv, cmd_recv,
+    gyro_x/y/z, acc_x/y/z, effort_command_* (最新), *_velocity (最新輪速)
+
+`scenario_recv` / `cmd_recv` 是**收到目前這個段落標籤 / 這組 effort 指令的時刻**
+(跟 stamp 同一個時鐘)。分析端要量「從 spin_up 開始到轉速到 w_ref 的時間」這類
+特徵時, 起點只能靠「第一列帶著新標籤的 IMU 資料」去猜, 誤差就是一個 IMU 週期
+(60 Hz = 16.7 ms); 對一個 1.5 s 的量測來說是 0.5% 的雜訊, 跟特徵本身的散佈
+(0.7%) 同一個量級。有了 scenario_recv 就能直接拿到段落起點, 不用猜。
 
 檔案一直開著、定期 flush (200 Hz 每則 open/close 太貴)。沒有 IMU 就是空檔 (只有
 header)。`imu_csv:=false` 可以關掉。
@@ -189,6 +195,9 @@ class CollectDataNode(Node):
         p('fusion_odom_topic', '/fusion_loc/odom')
         p('camera_px_topic', '/camera_loc/detection_px')
         p('status_period', 10.0)
+        # 主 CSV 的取樣週期 (s)。0.02 = 50 Hz, 跟 control_car_node 的控制迴圈同步;
+        # 舊版是 0.05 (20 Hz), 位姿類特徵與定位一致性檢查的點數只有一半。
+        p('log_period', 0.02)
 
         def topic(n):
             return self.get_parameter(n).get_parameter_value().string_value
@@ -210,6 +219,8 @@ class CollectDataNode(Node):
             10
         )
         self.latest_scenario_name = "Unknown"
+        self.scenario_recv = float('nan')     # 收到目前這個段落標籤的時刻
+        self.cmd_recv = float('nan')          # 收到目前這組 effort 指令的時刻
 
         # control_car_node 廣播的階段標籤:
         #   measure / reposition / brake / aborted / idle
@@ -337,6 +348,7 @@ class CollectDataNode(Node):
             self._imu_writer = csv.writer(self._imu_file)
             self._imu_writer.writerow(
                 ['stamp', 'recv', 'scenario_name', 'phase',
+                 'scenario_recv', 'cmd_recv',
                  'gyro_x', 'gyro_y', 'gyro_z', 'acc_x', 'acc_y', 'acc_z']
                 + [f'effort_command_{w}' for w in WHEEL_KEYS]
                 + [f'{w}_velocity' for w in WHEEL_KEYS])
@@ -346,7 +358,8 @@ class CollectDataNode(Node):
             QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                        history=HistoryPolicy.KEEP_LAST, depth=50))
 
-        self.timer = self.create_timer(0.05, self.log_data)
+        self.timer = self.create_timer(
+            max(float(self.get_parameter('log_period').value), 0.005), self.log_data)
         self.create_timer(
             max(float(self.get_parameter('status_period').value), 1.0),
             self.status)
@@ -355,6 +368,11 @@ class CollectDataNode(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def joint_command_callback(self, msg):
+        # 指令**變了**才更新時刻: control_car_node 每個迴圈都發一次, 記「最後一次
+        # 收到」沒有意義; 要的是「這組 effort 是什麼時候開始生效的」。
+        prev = getattr(self, 'latest_joint_command', None)
+        if prev is None or list(prev.effort) != list(msg.effort):
+            self.cmd_recv = self._now()
         self.latest_joint_command = msg
 
     def joint_state_callback(self, msg):
@@ -380,6 +398,7 @@ class CollectDataNode(Node):
         self._imu_writer.writerow(
             [self._stamp_sec(msg.header), self._now(),
              self.latest_scenario_name, self.latest_phase,
+             self.scenario_recv, self.cmd_recv,
              g.x, g.y, g.z, a.x, a.y, a.z]
             + self._by_joint(getattr(self, 'latest_joint_command', None), 'effort')
             + self._by_joint(getattr(self, 'latest_joint_state', None), 'velocity'))
@@ -394,6 +413,8 @@ class CollectDataNode(Node):
         self.latest_odom = msg
 
     def scenario_callback(self, msg):
+        if msg.data != self.latest_scenario_name:
+            self.scenario_recv = self._now()      # 段落起點 (見檔頭說明)
         self.latest_scenario_name = msg.data
 
     def phase_callback(self, msg):

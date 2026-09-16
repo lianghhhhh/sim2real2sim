@@ -83,8 +83,9 @@ Block 3/4 量到的滾動阻力與 slip ratio 跟 Block 1/2 的滑動摩擦是�
     **不是**像舊版那樣「沒有 odom 就不檢查」繼續開迴路衝。
   * 牆邊餘裕再加 sigma_margin_k x 定位 sigma。
   * 歸位前先等定位回到可信 (repos_sigma_max) —— 自旋完 LiDAR 可能還沒重新鎖定。
-  * 自旋目標轉速上限 spin_max_w 預設 7.5 rad/s (低於 LiDAR 追蹤上限, 也要低於真車
-    IMU 的 gyro 量程: 常見的 ±250 dps 只有 4.4 rad/s, 買之前/設定時要確認)。
+  * 自旋目標轉速上限 spin_max_w 預設 10.0 rad/s (sensor 模式)。真車換算: LiDAR 在
+    高轉速會追丟 (靠 IMU 撐過去), 而且要低於 IMU 的 gyro 量程 —— 常見的 ±250 dps
+    只有 4.4 rad/s, 那種 IMU 要把 spin_max_w 調到 4 以下, 買之前/設定時就要確認。
 """
 import math
 from collections import deque
@@ -121,24 +122,39 @@ SPIN_MAX_SAFE_W = 12.0                   # rad/s   (gt 模式; sensor 模式見 
 # 了。改成直接指定目標轉速, 在任何 mu 下都是真正分開的初始條件；
 # 全部低於 SPIN_MAX_SAFE_W, 觸發不到安全上限。
 #
-# **只取高轉速的三檔 (75% ~ 100%), 每檔 4 次。** 舊版 [2, 5, 8, 11] 的最低檔在
+# **只取高轉速的三檔 (80% ~ 100%), 每檔 5 次。** 舊版 [2, 5, 8, 11] 的最低檔在
 # 高 mu 地面整段 coast 只有 ~50 ms (60 Hz IMU 3 個點), 幾乎全是放開後的過渡段,
 # 減速度系統性偏低 (2026-09-15 校正: mu 1.5 時 32 vs 其他檔 50), 分析端只好丟掉
 # —— 12 次裡能用的剩一半。總次數不變, 全部集中在量得準的區間。
-SPIN_TARGET_W = [8.25, 9.62, 11.0]       # rad/s (spin_max_w = 12 時)
+#
+# 2026-09-16: coast 段的角減速度是**用 5~6 個 IMU 點擬合一條直線**量出來的
+# (mu 2.0 時整段 coast 只有 0.14 s = 8 個點), 擬合本身的標準誤就有 2.4%,
+# 佔了 trial 間變異的 70~170% —— 也就是「雜訊極限」的真正來源。解法只有兩個:
+#   1) 讓 coast 更長 -> w0 更高 (擬合誤差 ~ 1/span^1.5, 所以最有效)
+#   2) 更多 trial (誤差 ~ 1/sqrt(n))
+# 所以 w0 往上推到安全上限, 每檔次數 4 -> 5 (共 15 次)。
+SPIN_TARGET_W = [9.12, 10.26, 11.4]      # rad/s (spin_max_w = 12 時)
 SPIN_UP_STEER = MAX_EFFORT               # 固定用最大 steer 衝, 只有目標轉速是變數
 # rate limiter 是 6 effort/s, 所以 1.67 s 就踩到底; 再給餘裕讓轉速長到目標值。
 # 高 mu 時可能衝不到某些高檔目標 (穩態轉速比目標低), 這裡當逾時保護, 跟
 # SPRINT_ACCEL_TIMEOUT 是同一個角色。
-SPIN_UP_TIMEOUT = 4.0
-SPIN_COAST_DURATION = 3.0                # ← 特徵取在這一段
-SPIN_REPEATS = 4
+SPIN_UP_TIMEOUT = 5.0
+# coast 只需要跑到轉速掉進尾段: mu 0.5 (最慢) 從 11 rad/s 掉到 0 也只要 0.45 s。
+# 舊版的 3.0 s 有 2.5 s 是空等, 15 次就浪費 40 s。
+SPIN_COAST_DURATION = 1.5                # ← 特徵取在這一段
+SPIN_REPEATS = 5
 
 # ── Block 2: 旋轉 creep (靜摩擦臨界) ─────────────────────────────────
 # 舊版的 creep 是直線的, 10 秒會走 57 m。改成原地轉, 一樣量靜摩擦但不會跑掉。
 CREEP_STEER_START, CREEP_STEER_END = 0.0, 10.0
 CREEP_DURATION = 10.0
-CREEP_REPEATS = 3                        # 靜摩擦只有這個 block 在量, 2 次太少
+# 靜摩擦的「每次起轉的臨界 effort」本身就有 ~8% 的物理散佈 (每次歸位後四輪的
+# 預載不同, 先打滑的輪子也不同), 不是量測雜訊, 只能靠次數平均掉:
+# 中位數的標準誤 ≈ 1.2533 x 8% / sqrt(n), n=3 -> 5.8% (mu ±0.14), n=6 -> 4.1%。
+# 另外 B1 spin_up 的「從靜止到 w_ref 的時間」也是靜摩擦特徵 (見 estimate_friction
+# 的 spinup_time), 那個每輪有 15 次、cv 只有 0.7%, 是靜摩擦的主力;
+# B2 留著當**不依賴馬達模型**的交叉檢查。
+CREEP_REPEATS = 6
 
 # ── Block 3: 直線短衝 + coast (滾動阻力) ─────────────────────────────
 # 加速段刻意只有 1 秒: effort 10 時 a=3.4 m/s^2, 1 秒走 1.7 m, 進入 coast
@@ -162,7 +178,9 @@ SPRINT_THROTTLE = 7.0                    # 加速用的固定油門
 SPRINT_TARGET_SPEEDS = [1.0, 1.8, 2.6]   # coast 進入速度 (m/s)
 SPRINT_ACCEL_TIMEOUT = 3.0               # 加不到目標速度就放棄 (低 mu 地面)
 SPRINT_COAST_DURATION = 3.0
-SPRINT_REPEATS = 2
+# B3 只是對照組 (應該 ≈ 1), 3 個 trial 就夠看出「不只摩擦不一樣」, 省下的
+# ~60 s 拿去給 B2 的靜摩擦次數。
+SPRINT_REPEATS = 1
 
 # ── Block 4: 起步打滑 (traction limit) ───────────────────────────────
 # 跟 Block 3 的 T=10 差在**跳過 rate limiter**: 瞬間給滿扭矩才會突破抓地力上限。
@@ -175,10 +193,18 @@ SLIP_THROTTLE = 10.0
 SLIP_LAUNCH_DURATION = 1.0               # 上限, 正常會被 SLIP_TARGET_SPEED 先結束
 SLIP_TARGET_SPEED = 2.0
 SLIP_COAST_DURATION = 1.5
-SLIP_REPEATS = 3
+SLIP_REPEATS = 2                         # 副特徵, 2 次即可 (省時間給 B1/B2)
 
 REST_DURATION = 1.0
 RATE_LIMIT = 6.0        # effort/s, 模擬人踩油門的急促程度 (instant 型會略過)
+
+# 「到了目標值就放開」的觸發延遲補償 (s)。2026-09-15 的資料: 目標 5.16 / 6.02 /
+# 6.88 rad/s 三檔, 放開時的實際轉速全都是 7~10 rad/s —— 因為從 wz 越過目標到
+# Isaac 真的斷油中間有 ~0.12 s (控制迴圈 20 Hz + topic 傳輸 + 指令生效),
+# 而自旋末段的角加速度有 25 rad/s^2, 0.12 s 就是 +3 rad/s。三檔被糊成一檔,
+# w0 還在 6.5~10.2 之間亂跳。解法: 用 gyro 算出當下的角加速度, 提前 LEAD 秒放開。
+# 控制迴圈拉到 50 Hz 之後實測延遲剩 ~0.05 s。
+TRIGGER_LEAD = 0.05
 
 # IMU 靜止判定 (sensor 模式)。門檻給的是真車 MEMS 的量級, Isaac 的 IMU 沒雜訊一定過。
 IMU_STILL_WINDOW = 0.3  # s
@@ -222,9 +248,13 @@ def _stamp(header):
 
 
 def spin_targets(spin_max_w):
-    """B1 的三檔目標轉速: 上限的 75% / 87.5% / 100%, 最高檔再留 8% 給 overshoot。"""
-    top = 11.0 / 12.0 * spin_max_w
-    return [round(top * f, 2) for f in (0.75, 0.875, 1.0)]
+    """B1 的三檔目標轉速: 上限的 80% / 90% / 100%, 最高檔再留 5% 給殘餘 overshoot。
+
+    三檔不是為了掃描, 是為了驗證 Coulomb 假設 (減速度跟 w 無關) 並讓分析端能
+    把「跟轉速有關的阻力」迴歸掉。範圍從舊版的 75~100% 收到 80~100%: 低檔的
+    coast 短、擬合點少, 是雜訊的主要來源。"""
+    top = 0.95 * spin_max_w
+    return [round(top * f, 2) for f in (0.8, 0.9, 1.0)]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -443,7 +473,7 @@ class ControlCarNode(Node):
         p('pose_sigma_max', 0.5)
         p('repos_sigma_max', 0.10)            # 歸位前要等 sigma 降到這裡
         p('sigma_margin_k', 3.0)              # 牆邊餘裕 += k * sigma
-        # 自旋目標轉速上限 (rad/s)。0 = 依 state_source: sensor 7.5, gt 12.0
+        # 自旋目標轉速上限 (rad/s)。0 = 依 state_source: sensor 10.0, gt 12.0
         p('spin_max_w', 0.0)
         p('calib_duration', 2.0)              # 開跑前靜止量零偏的秒數
         # 想只跑其中幾個 block:
@@ -477,7 +507,14 @@ class ControlCarNode(Node):
         self.pose_sigma_max = float(g('pose_sigma_max').value)
         self.repos_sigma_max = float(g('repos_sigma_max').value)
         self.sigma_k = float(g('sigma_margin_k').value)
-        self.spin_max_w = float(g('spin_max_w').value) or (7.5 if self.sensor else SPIN_MAX_SAFE_W)
+        # sensor 模式 7.5 -> 10.0。理由是實測而不是猜的: 舊版因為觸發延遲,
+        # 實際 w0 本來就已經衝到 8~10.2 rad/s (還差點碰到 1.5 x 7.5 = 11.25 的
+        # 失控中止門檻), 而那一整輪的定位一致性檢查是 0% 異常、對 GT 的位置誤差
+        # 中位 1.7 cm —— 也就是這個轉速區間實測是穩的, 只是以前是**失控地**穩。
+        # 現在觸發準了, 就明確把上限設在 10.0 (目標 7.6 / 8.55 / 9.5):
+        # coast 越長, 角減速度的擬合誤差越小 (~1/span^1.5), 這是動摩擦解析度的
+        # 主要來源。中止門檻跟著變成 15 rad/s。
+        self.spin_max_w = float(g('spin_max_w').value) or (10.0 if self.sensor else SPIN_MAX_SAFE_W)
 
         self.effort_pub = self.create_publisher(JointState, '/joint_command', 10)
         self.scenario_pub = self.create_publisher(String, '/test_scenario', 10)
@@ -490,7 +527,12 @@ class ControlCarNode(Node):
             if gt_topic and gt_topic != odom_topic:
                 self.create_subscription(Odometry, gt_topic, self.on_gt, ODOM_QOS)
 
-        self.hz = 20.0
+        # 50 Hz (舊版 20 Hz)。三個理由:
+        #   1) 觸發延遲 50 ms -> 20 ms, 配合 TRIGGER_LEAD 才能讓 w0 落在目標上
+        #   2) rate limiter 的 effort 階梯 6/20 = 0.3 -> 6/50 = 0.12, B1 spin_up
+        #      起轉 effort 的量化誤差跟著從 5.9% 掉到 2.4% (靜摩擦特徵)
+        #   3) 段落標籤的時間解析度 50 ms -> 20 ms (spinup_time 的起點)
+        self.hz = 50.0
         self.dt = 1.0 / self.hz
 
         # 位姿 (geofence 與 reposition 用)。世界速度用位置差分算, 避免去猜
@@ -513,6 +555,8 @@ class ControlCarNode(Node):
         self.gyro_bias = 0.0
         self.acc_ref = None          # 靜止時的 (ax, ay), 扣掉之後就是運動加速度
         self.v_imu = 0.0             # 前向加速度從最近一次靜止開始的積分
+        self.acc_fwd = 0.0           # 低通後的前向加速度 (m/s^2), 觸發提前量用
+        self.wz_rate = 0.0           # 低通後的角加速度 (rad/s^2), 同上
         self._imu_win = deque()      # (stamp, gz, ax, ay) 最近 IMU_WIN 秒
         self.calibrated = not self.sensor
         self._collecting = False
@@ -629,13 +673,21 @@ class ControlCarNode(Node):
         if self._collecting:
             self._calib_buf.append((gz, ax, ay))
 
+        prev_wz = self.wz
         self.wz = gz - self.gyro_bias
+        # 角加速度 (低通): 觸發提前量用。自旋末段 ~25 rad/s^2, 乘上 TRIGGER_LEAD
+        # 就是「現在放開的話, 實際會停在哪個轉速」的修正量。
+        if dt > 0.0:
+            a = (abs(self.wz) - abs(prev_wz)) / dt
+            self.wz_rate += 0.3 * (a - self.wz_rate)
         self._gyro_int += self.wz * dt
         self._gyro_hist.append((st, self._gyro_int))
         while self._gyro_hist and st - self._gyro_hist[0][0] > 3.0:
             self._gyro_hist.popleft()
         if self.acc_ref is not None and dt > 0.0:
-            self.v_imu += self._fwd_acc(ax, ay) * dt
+            acc = self._fwd_acc(ax, ay)
+            self.v_imu += acc * dt
+            self.acc_fwd += 0.3 * (acc - self.acc_fwd)
 
         if self.calibrated and self._imu_still():
             self.v_imu = 0.0
@@ -1018,15 +1070,24 @@ class ControlCarNode(Node):
 
         # 速度觸發的結束條件 (加速段用)。到了目標速度就放開, coast 的進入速度
         # 因此是**指定的**, 不是被地面摩擦係數決定的。
+        #
+        # 判斷用的是 **TRIGGER_LEAD 秒之後的預測值**, 不是當下值: 從這裡決定放開
+        # 到 Isaac 真的斷油有 ~0.05 s, 加速中的車在這段時間還會再往上衝
+        # (自旋末段 25 rad/s^2 -> +1.2 rad/s)。不補的話目標值形同虛設。
+        # 安全: 預測只在已經到目標 70% 之後才算數, 免得起步瞬間的大加速度誤觸發。
         vt = sc.get('stop_at_speed')
-        if vt is not None and self.odom_ok and self._trigger_speed() >= float(vt):
-            self._enter(self.idx + 1)
-            return
+        if vt is not None and self.odom_ok:
+            v = self._trigger_speed()
+            if v >= 0.7 * float(vt) and v + max(self.acc_fwd, 0.0) * TRIGGER_LEAD >= float(vt):
+                self._enter(self.idx + 1)
+                return
 
         wt = sc.get('stop_at_wz')
-        if wt is not None and self.odom_ok and abs(self.wz) >= float(wt):
-            self._enter(self.idx + 1)
-            return
+        if wt is not None and self.odom_ok:
+            w = abs(self.wz)
+            if w >= 0.7 * float(wt) and w + max(self.wz_rate, 0.0) * TRIGGER_LEAD >= float(wt):
+                self._enter(self.idx + 1)
+                return
 
         if elapsed > sc['duration']:
             self._enter(self.idx + 1)

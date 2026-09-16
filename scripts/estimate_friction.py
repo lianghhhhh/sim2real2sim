@@ -42,6 +42,21 @@
        所以拿 ∛θ 對 t 做直線, 外插回 0 的時刻 t_b 才是起轉點 (實測 2.32)。
 
   [副] B1 spin_up      同上, 但 ramp 快 (6 effort/s), 20 Hz 下解析度只有 0.3。
+
+  [副] B1 spinup_time  spin_up 從靜止到轉速第一次到 w_ref 的**時間**。
+       這是**靜摩擦**特徵: 把兩個環境的 w(t) 疊起來看, 起轉之後的那一段幾乎
+       重合 (Δt(2->5 rad/s) 對 mu 的敏感度只有 0.04~0.12, 因為那時是馬達扭矩
+       說了算), 差異全部集中在「推得動之前卡住多久」。
+       跟 creep_breakaway 比:
+         敏感度  d ln t / d ln mu ≈ 0.47   (creep 是 ~0.8, 時間特徵比較鈍)
+         精度    每個 trial 的 cv 0.6~0.9%, 一輪 15 個 trial -> 標準誤 0.2%
+                 (creep 每個 trial 的散佈是 8%, 一輪 6 個 -> 4%)
+       淨效果是解析度好 5~10 倍: 2026-09-15 的資料用它反推 real 的地面 mu 得到
+       2.01 (真值 2.0), 用 creep 只能給 1.7~2.6 的區間。
+       **代價: 它包含馬達 ramp, 所以兩個環境的驅動系統必須一樣。**
+       sim-to-sim 校正 (同一台車只改地面) 成立; 對真車要先看 B3 對照組是不是 ≈ 1。
+       比值**不正比於 mu** -> 不進綜合比值, 也不進 ★ 地面係數換算, 由校正迴圈
+       (friction_calib_step.py) 用割線法直接內插。
   [副] B4 slip_launch  瞬間滿油門起步的平均加速度。抓地力受限時 = mu*g, 但扭矩上限
        ~3.4~6 m/s², 高 mu 的環境會被馬達卡住 -> 只能當下界, 比值會被壓向 1。
        另外印 slip ratio 當參考。
@@ -110,6 +125,7 @@ FEATURES = {
     'spin_decel':      ('B1 自旋 coast 角減速度 [rad/s²]', 'primary'),
     'spin_decel_energy': ('B1 同上, 能量法 (含過渡段, 偏低)', 'secondary'),
     'creep_breakaway': ('B2 慢速 ramp 起轉 steer effort', 'primary'),
+    'spinup_time':     ('B1 spin_up 從靜止到 w_ref 的時間 [s] (靜摩擦, 需馬達一致)', 'secondary'),
     'spinup_breakaway': ('B1 spin_up 起轉 steer effort', 'secondary'),
     'launch_accel':    ('B4 滿油門起步加速度 [m/s²]', 'secondary'),
     'launch_slip':     ('B4 起步 slip ratio', 'secondary'),
@@ -230,6 +246,14 @@ def load_imu_track(path, forward_axis_deg, noise, rng):
         'yaw_u': yaw_u, 'w': w, 'vf': np.nan, 'fresh': True,
     })
     tr['seg'] = (tr['name'] != tr['name'].shift()).cumsum()
+    # 段落起點: 新版 collect_data_node 會記 scenario_recv (收到段落標籤的時刻,
+    # 節點時鐘)。同一列的 recv 也是節點時鐘 -> 用兩者的中位數差換算到 stamp 時鐘。
+    # 舊檔沒有這兩欄就是 NaN, 分析端退回「第一列帶著新標籤的資料」(誤差 1 個 IMU 週期)。
+    if 'scenario_recv' in d.columns and 'recv' in d.columns:
+        off = float(np.median(d['recv'].to_numpy(float) - t))
+        tr['t0'] = d['scenario_recv'].to_numpy(float) - off
+    else:
+        tr['t0'] = np.nan
 
     # 前向速度: 加速段起點歸零, 積分到它後面的 coast 段結束
     vf = np.full(n, np.nan)
@@ -333,6 +357,56 @@ def yaw_noise(segs):
     return float(vals.std()) if len(vals) > 5 else 0.0
 
 
+def breakaway_effort_w(g, w_lo=0.10, w_hi=1.0):
+    """慢速 ramp 的起轉 effort, 從**角速度**外插回去 (不看累積角度)。
+
+    起轉之後多出來的力矩 ∝ (t - tb) -> w ∝ (t - tb)², 所以 √w 對 t 是直線,
+    外插回 0 的時刻就是起轉點。
+
+    為什麼不用角度門檻 (breakaway_effort): 真正打滑之前有一段**預滑移** ——
+    輪胎與底盤被扭矩扭出彈性變形, 車體會非常慢地轉個 1~4 度然後停住。
+    2026-09-15 的資料裡 9 個 B2 trial 有 3 個是這樣, 角度在 effort≈2 就越過
+    0.02 rad 的門檻, 量到的起轉 effort 是 2.0 而不是真正的 5.6 (差 3 倍),
+    3 個 trial 的中位數因此完全不可靠 (散佈 69%)。預滑移的角速度只有
+    ~0.02 rad/s, 而真正起轉後 0.1 rad/s 是瞬間的事 -> 用角速度區間就避開了。
+
+    實測 (同一份資料, 中位數的散佈 / 真值 2.50 的比值):
+        角度門檻 + ∛θ   散佈 69%   比值 2.17 (偏向 1)
+        角速度 + √w     散佈 14%   比值 2.53
+    """
+    t = g['t'].to_numpy() - g['t'].iloc[0]
+    w = np.abs(g['w'].to_numpy())
+    st = g['steer'].abs().to_numpy()
+    m = (w >= w_lo) & (w <= w_hi)
+    if m.sum() >= 4:
+        i = np.flatnonzero(m)
+        p = np.polyfit(t[i], np.sqrt(w[i]), 1)
+        if p[0] > 0:
+            tb = -p[1] / p[0]
+            if t[0] <= tb <= t[i[0]]:          # 外插點要落在區間開始之前
+                return float(np.interp(tb, t, st))
+    return None
+
+
+def spinup_time(g, w_ref, t0=None):
+    """spin_up 段從**指令發出**到轉速第一次到 w_ref 的時間 [s]。
+
+    t0 = 段落真正的起點 (collect_data_node 記的 scenario_recv)。沒有的話只能用
+    第一列帶著這個標籤的 IMU 資料, 誤差是一個 IMU 週期 (60 Hz -> 16.7 ms,
+    對 1.5 s 的量測是 1.1% 的抖動, 跟特徵本身 0.7% 的散佈同一個量級)。
+    """
+    t = g['t'].to_numpy()
+    w = np.abs(g['w'].to_numpy())
+    if w.max() < w_ref:
+        return None
+    k = int(np.argmax(w >= w_ref))
+    if k == 0:                                  # 一開始就在轉 -> 沒有從靜止起步
+        return None
+    start = t0 if (t0 is not None and np.isfinite(t0) and
+                   t[0] - 0.1 <= t0 <= t[0]) else t[0]
+    return float(np.interp(w_ref, [w[k - 1], w[k]], [t[k - 1], t[k]]) - start)
+
+
 def breakaway_effort(g, th_yaw):
     """慢速 ramp 裡車子開始轉的 steer effort。∛θ 外插, 做不到就退回門檻穿越點。"""
     t = g['t'].to_numpy() - g['t'].iloc[0]
@@ -364,7 +438,9 @@ def extract(tr, th_yaw=None):
         th_yaw = max(0.02, 6.0 * yaw_noise(segs))
     F = {k: [] for k in FEATURES}
     F['_spin_rows'] = []           # 畫圖用: (w0, w_end, dθ)
+    F['_spinup_segs'] = []         # spinup_time 用: (spin_up 段, 段落起點)
     F['_spin_pts'] = []            # spin_decel 每個 trial 線性段用了幾個點
+    F['_spin_w0'] = []             # spin_decel 每個 trial 的起始轉速 (w0 校正用)
 
     # 輪半徑: 直線 coast 時輪子是自由滾動的 -> r ≈ v / w_wheel
     r_samples = []
@@ -419,9 +495,13 @@ def extract(tr, th_yaw=None):
             if len(idx) >= 3:
                 F['spin_decel'].append(-np.polyfit(t[idx], w[idx], 1)[0])
                 F['_spin_pts'].append(len(idx))    # run() 依點數挑 trial, 見 SPIN_MIN_PTS
+                F['_spin_w0'].append(float(w0))    # 見 match_spin_w0
 
         elif b == 'B2 creep_spin':
-            e = breakaway_effort(g, th_yaw)
+            # 先用角速度外插 (避開預滑移), 做不到才退回角度門檻
+            e = breakaway_effort_w(g)
+            if e is None:
+                e = breakaway_effort(g, th_yaw)
             if e is not None:
                 F['creep_breakaway'].append(e)
 
@@ -432,6 +512,10 @@ def extract(tr, th_yaw=None):
             e = breakaway_effort(g, th_yaw)
             if e is not None:
                 F['spinup_breakaway'].append(e)
+            # spinup_time 的 w_ref 要**所有檔案共用**, 所以只先把軌跡存起來,
+            # 由 run() 決定共同的 w_ref 之後再算 (見 fill_spinup_time)
+            t0 = g['t0'].iloc[0] if 't0' in g else np.nan
+            F['_spinup_segs'].append((g, t0))
 
         elif b == 'B4 slip_launch':
             if t[-1] > 0.1:
@@ -455,6 +539,63 @@ def extract(tr, th_yaw=None):
 
     F['_meta'] = {'yaw_threshold': th_yaw, 'wheel_radius': r_wheel, 'excluded': excluded}
     return F
+
+
+def match_spin_w0(Fs):
+    """把每個 trial 的自旋減速度校正到**共同的起始轉速**, 再比較。
+
+    純 Coulomb 的話減速度跟轉速無關, 但實測不是: 迴歸 decel = a + b*w0 得到的 b 是
+    +0.25 ~ +0.81 (rad/s² per rad/s), 也就是還有一個跟轉速有關的阻力 (輪子 joint
+    damping / 空氣)。它不隨地面摩擦等比例變化, 所以只要兩個檔案的實際 w0 不一樣,
+    比值就有系統性偏差。
+
+    w0 為什麼會不一樣: 「到目標轉速就放開」有殘餘的觸發延遲 (+1~9%), 而延遲期間的
+    角加速度本身就跟地面摩擦有關 —— 摩擦大的環境衝得慢、overshoot 小。也就是說
+    **這個偏差跟要量的東西相關**, 不會自己抵消。
+
+    做法: 每個檔案各自迴歸 (斜率跟 mu 有關, 不能共用), 每個 trial 減掉
+    b*(w0_i - w_ref), w_ref 取所有檔案所有 trial 的中位數。
+
+    2026-09-16 的那一輪 (sim 2.0 -> real 0.5, 真值 0.5): 校正前內插出 0.4865
+    (-2.7%), 校正後 0.4968 (-0.6%); 每個 trial 的 cv 也從 2.0~2.3% 掉到 1.1%。"""
+    ok = [F for F in Fs if len(F['spin_decel']) == len(F['_spin_w0']) >= 5]
+    if len(ok) < len(Fs) or not ok:
+        return None
+    allw = [w for F in ok for w in F['_spin_w0']]
+    w_ref = float(np.median(allw))
+    for F in ok:
+        w0 = np.asarray(F['_spin_w0'], float)
+        d = np.asarray(F['spin_decel'], float)
+        if w0.max() - w0.min() < 0.3:        # 轉速沒拉開, 斜率不可信 -> 不校正
+            F['_meta']['spin_w0_slope'] = None
+            continue
+        b = float(np.polyfit(w0, d, 1)[0])
+        F['spin_decel'] = (d - b * (w0 - w_ref)).tolist()
+        F['_meta']['spin_w0_slope'] = b
+        F['_meta']['spin_w0_shift'] = float(np.median(w0) - w_ref)
+    for F in ok:
+        F['_meta']['spin_w0_ref'] = w_ref
+    return w_ref
+
+
+def fill_spinup_time(Fs):
+    """所有檔案共用一個 w_ref, 算 B1 spin_up 的「從靜止到 w_ref」時間。
+
+    w_ref 必須是**每個檔案的每個 trial 都到得了**的轉速, 否則某一邊會少 trial
+    (而且少的一定是摩擦大的那邊 -> 系統性偏差)。取所有 trial 峰值最小的那個的
+    60%: 低一點比較接近純起轉 (敏感度略高), 又離噪聲夠遠。"""
+    peaks = [float(np.abs(g['w'].to_numpy()).max())
+             for F in Fs for g, _ in F['_spinup_segs']]
+    if not peaks:
+        return None
+    w_ref = round(0.6 * min(peaks), 2)
+    if w_ref < 1.0:
+        return None
+    for F in Fs:
+        F['spinup_time'] = [v for v in (spinup_time(g, w_ref, t0)
+                                        for g, t0 in F['_spinup_segs']) if v is not None]
+        F['_meta']['spinup_w_ref'] = w_ref
+    return w_ref
 
 
 def stat(F, key, idx=None):
@@ -938,6 +1079,7 @@ def main():
             keep = [p >= m for p in f['_spin_pts']]
             dropped = len(keep) - sum(keep)
             f['spin_decel'] = [v for v, k in zip(f['spin_decel'], keep) if k]
+            f['_spin_w0'] = [v for v, k in zip(f['_spin_w0'], keep) if k]
             f['_meta']['spin_min_pts'] = m
             f['_meta']['spin_dropped'] = dropped
         if m < SPIN_MIN_PTS:
@@ -945,6 +1087,12 @@ def main():
         # B1 線性擬合每個 coast 要 >= 3 個點。20 Hz 的位姿資料在高 mu 環境常常湊不滿
         # (coast 只有 0.15 s) -> **所有檔案一起**退回能量法。只有一邊退回的話兩邊
         # 偏差不同, 比值就不公平。
+        wr = match_spin_w0(list(F.values()))
+        if wr is None:
+            print(f'! [{source}] trial 數不夠, spin_decel 沒有做 w0 校正')
+        w_ref = fill_spinup_time(list(F.values()))
+        if w_ref is None:
+            print(f'! [{source}] B1 spin_up 沒有可用的軌跡, 沒有 spinup_time')
         if any(len(f['spin_decel']) < 3 for f in F.values()):
             print(f'! [{source}] B1 線性段點數不夠 (IMU 全速率檔才夠密), '
                   'B1 主特徵改用能量法 —— 會含放開後的過渡段, 比值偏向 1')

@@ -35,6 +35,10 @@ GAIN=1.0                # 更新步長, 1 = 直接跳到估計值; 震盪的話�
 TOL=0.05                # 收斂容許誤差: 預測的地面摩擦修正量 <= 這個值就停
 WHEEL_MU=0.5            # 輪子材質 mu (car_*.usd 的輪子沒綁物理材質 -> PhysX 預設 0.5)
 COMBINE="average"       # PhysX friction combine mode
+# tied = 只解一個 mu, staticFriction 跟著 dynamicFriction (預設; 見 friction_calib_step.py
+#        檔頭: 靜摩擦只有 B2 量得到, 敏感度只有 0.3, 分開解會生出假的靜動差)
+# free = 用 B2 起轉 effort 分開解靜摩擦
+STATIC_MODE="tied"
 GROUND_PRIM="/Environment/groundCollider/PhysicsMaterial"
 REUSE_REAL=""           # 已經量好的 real CSV; 給了就不重量 real
 SKIP_ISAAC_LAUNCH=0     # 1 = Isaac 已經用 load_isaac_usd.py 開著了, 不要再開一個
@@ -84,6 +88,7 @@ usage() {
 
 其他
   --state-source sensor|gt                            (預設 $STATE_SOURCE)
+  --static-mode tied|free 靜摩擦跟著動摩擦 / 分開解    (預設 $STATIC_MODE)
   -n, --container NAME    ROS 2 container             (預設 $CONTAINER_NAME)
   --skip-isaac-launch     Isaac 已經開著 (用 load_isaac_usd.py), 不要再開
 
@@ -109,6 +114,7 @@ while [[ $# -gt 0 ]]; do
         --wheel-mu)         WHEEL_MU="$2"; shift 2 ;;
         --combine)          COMBINE="$2"; shift 2 ;;
         --state-source)     STATE_SOURCE="$2"; shift 2 ;;
+        --static-mode)      STATIC_MODE="$2"; shift 2 ;;
         -n|--container)     CONTAINER_NAME="$2"; shift 2 ;;
         --skip-isaac-launch) SKIP_ISAAC_LAUNCH=1; shift ;;
         -h|--help)          usage ;;
@@ -337,7 +343,8 @@ while (( ROUND < MAX_ROUNDS )); do
         --static "$CUR_STATIC" --dynamic "$CUR_DYNAMIC" \
         --iter "$ITER" --max-iter "$MAX_ITER" --max-retry "$MAX_RETRY" \
         --history "$HISTORY" --gain "$GAIN" --tol "$TOL" \
-        --wheel-mu "$WHEEL_MU" --combine "$COMBINE" | tee /dev/stderr | grep '^STATUS=' | tail -1)
+        --wheel-mu "$WHEEL_MU" --combine "$COMBINE" --static-mode "$STATIC_MODE" \
+        | tee /dev/stderr | grep '^STATUS=' | tail -1)
     if [[ -z "$STEP_OUT" ]]; then
         echo "錯誤：friction_calib_step.py 沒有輸出結果，中止。"; STATUS="failed"; break
     fi
