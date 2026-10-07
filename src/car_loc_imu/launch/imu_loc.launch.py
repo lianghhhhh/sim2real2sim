@@ -13,6 +13,9 @@
     ros2 launch car_loc_imu imu_loc.launch.py evaluate:=true \
         enable_zupt:=false enable_nhc:=false
 
+    # 用擬合出來的零偏模型參數 (imu_fit_noise 的輸出)
+    ros2 launch car_loc_imu imu_loc.launch.py noise_fit:=$PWD/imu_noise_fit.yaml
+
 **開始之前先讓車子停著幾秒** —— 開機靜止校正要在那幾秒裡把零偏量掉。
 車子一開始就在動的話漂移會明顯大很多。
 """
@@ -34,6 +37,10 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('imu_topic', default_value='/imu'),
+        DeclareLaunchArgument('noise_fit',
+                              default_value=os.path.join(pkg, 'config',
+                                                         'imu_noise_fit.yaml'),
+                              description='零偏模型的參數檔 (imu_fit_noise 的輸出)'),
         DeclareLaunchArgument('gravity_mode', default_value='orientation',
                               description='orientation (Isaac/9軸) | complementary (真車6軸) | none'),
         DeclareLaunchArgument('yaw_source', default_value='imu_orientation',
@@ -60,7 +67,7 @@ def generate_launch_description():
     localizer = Node(
         package='car_loc_imu', executable='imu_localizer', name='imu_localizer',
         output='screen',
-        parameters=[params, {
+        parameters=[params, LaunchConfiguration('noise_fit'), {
             'use_sim_time': use_sim_time,
             'imu_topic': LaunchConfiguration('imu_topic'),
             'gravity_mode': LaunchConfiguration('gravity_mode'),

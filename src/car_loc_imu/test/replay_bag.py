@@ -16,73 +16,16 @@ import argparse
 import math
 import os
 import sqlite3
-import struct
 import sys
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
+from car_loc_imu.imu_io import Cdr, parse_imu               # noqa: E402
 from car_loc_imu.ins import (G, ImuIns, SpinDetector,      # noqa: E402
-                             StillDetector, TiltTracker, quat_to_matrix,
-                             quat_to_yaw)
-
-
-# ---------------------------------------------------------------- CDR 解析
-class Cdr:
-    """最小的 CDR reader。CDR 每個基本型別都要對齊到自己的大小,
-    而且對齊是相對於 **encapsulation header 之後**的位置算的。"""
-
-    def __init__(self, buf: bytes):
-        self.b = buf
-        self.little = buf[1] == 1        # encapsulation: 0x0001 = LE
-        self.o = 4                       # 跳過 4 bytes 的 encapsulation header
-
-    def _align(self, n):
-        pad = (self.o - 4) % n
-        if pad:
-            self.o += n - pad
-
-    def _get(self, fmt, n):
-        self._align(n)
-        v = struct.unpack_from(('<' if self.little else '>') + fmt, self.b, self.o)[0]
-        self.o += n
-        return v
-
-    def i32(self):
-        return self._get('i', 4)
-
-    def u32(self):
-        return self._get('I', 4)
-
-    def f64(self):
-        return self._get('d', 8)
-
-    def string(self):
-        n = self.u32()
-        s = self.b[self.o:self.o + n - 1].decode('utf-8', 'replace')
-        self.o += n
-        return s
-
-    def f64a(self, n):
-        return [self.f64() for _ in range(n)]
-
-    def header(self):
-        sec = self.i32()
-        nsec = self.u32()
-        self.string()                    # frame_id
-        return sec + nsec * 1e-9
-
-
-def parse_imu(buf):
-    c = Cdr(buf)
-    t = c.header()
-    q = c.f64a(4)                        # x, y, z, w
-    c.f64a(9)
-    w = c.f64a(3)
-    c.f64a(9)
-    a = c.f64a(3)
-    return t, np.array(q), np.array(w), np.array(a)
+                             StillConfirm, StillDetector, TiltTracker,
+                             quat_to_matrix, quat_to_yaw)
 
 
 def parse_odom(buf):
@@ -119,11 +62,15 @@ def read_bag(path):
 # ---------------------------------------------------------------- 重跑
 def replay(imu, odom, *, gravity='orientation', yaw_imu=True, zupt=True,
            zaru=True, nhc=True, anchor=True, spin=False,
-           still=(0.03, 0.25, 0.05, 0.30), calib_time=1.5, **ins_kw):
+           still=(0.03, 0.25, 0.05, 0.30), confirm=None, calib_time=1.5,
+           **ins_kw):
+    """`confirm`: StillConfirm 的參數 (dict); None = 預設值, {} 以外想整個關掉
+    就給 dict(acc_mean=0, gyro_mean=0, speed_gate=0)。"""
     ins = ImuIns(**ins_kw)
     det = StillDetector(gyro_th=still[0], acc_th=still[1], var_th=still[2],
                         window=still[3])
     spin_det = SpinDetector()
+    conf = StillConfirm(window=still[3], **(confirm or {}))
     tilt = TiltTracker()
 
     ot = np.array([o[0] for o in odom])
@@ -152,7 +99,6 @@ def replay(imu, odom, *, gravity='orientation', yaw_imu=True, zupt=True,
             if cstart is not None and t - cstart >= calib_time and len(cbuf) >= 20:
                 gm = np.mean([b[0] for b in cbuf], axis=0)
                 am = np.mean([b[1] for b in cbuf], axis=0)
-                ins.x[5] = float(gm[2])
                 if gravity == 'complementary':
                     tilt.roll = math.atan2(am[1], am[2])
                     tilt.pitch = math.atan2(-am[0], math.hypot(am[1], am[2]))
@@ -162,13 +108,15 @@ def replay(imu, odom, *, gravity='orientation', yaw_imu=True, zupt=True,
                 # 才量得到演算法本身的誤差。
                 k = int(np.searchsorted(ot, t))
                 k = min(k, len(ot) - 1)
-                ins.x[6:8] = _grav_free(gravity, q, gm, am, None, True, tilt)
+                ins.set_bias0(float(gm[2]),
+                              _grav_free(gravity, q, gm, am, None, True, tilt))
                 ins.set_pose(op[k, 0], op[k, 1],
                              quat_to_yaw(q) if yaw_imu else 0.0, t)
                 started = True
             continue
 
         acc_xy = _grav_free(gravity, q, w, a, dt, st, tilt)
+        st = conf.update(t, dt, st, acc_xy, float(w[2]), ins)
         ins.predict(t, acc_xy, float(w[2]))
         if yaw_imu:
             ins.update_yaw(quat_to_yaw(q), 0.02)
@@ -190,20 +138,23 @@ def replay(imu, odom, *, gravity='orientation', yaw_imu=True, zupt=True,
             ins.spin_zupt()
         if nhc:
             ins.nhc()
-        rows.append((t, ins.x[0], ins.x[1], ins.sigma_pos(), st))
+        rows.append((t, ins.x[0], ins.x[1], ins.sigma_pos(), st,
+                     ins.gyro_bias, *ins.acc_bias))
 
     if not rows:
         raise SystemExit('濾波器一次都沒跑起來 —— 開機靜止校正沒完成。'
                          '通常是 still_* 門檻太緊, 或 bag 開頭車子就在動。')
-    r = np.array([(a, b, c, d) for a, b, c, d, _ in rows])
-    stills = np.array([e for *_, e in rows])
+    r = np.array([row[:4] for row in rows])
+    stills = np.array([row[4] for row in rows])
+    bias = np.array([row[5:] for row in rows])
     gx = np.interp(r[:, 0], ot, op[:, 0])
     gy = np.interp(r[:, 0], ot, op[:, 1])
     gv = np.hypot(np.interp(r[:, 0], ot, ov[:, 0]), np.interp(r[:, 0], ot, ov[:, 1]))
     err = np.hypot(r[:, 1] - gx, r[:, 2] - gy)
     jump = np.hypot(np.diff(r[:, 1]), np.diff(r[:, 2]))
     return dict(t=r[:, 0], err=err, sigma=r[:, 3], jump=jump, still=stills,
-                gt_speed=gv, ins=ins)
+                gt_speed=gv, ins=ins, x=r[:, 1], y=r[:, 2], gt_x=gx, gt_y=gy,
+                gyro_bias=bias[:, 0], acc_bias=bias[:, 1:])
 
 
 def _grav_free(mode, q, gyro, acc, dt, still, tilt):
@@ -368,7 +319,11 @@ def main():
             ('只加位置修正限幅', dict(sigma_acc=0.35, sigma_acc_omega=0.0,
                                max_pos_correction=0.5)),
             ('只加 w 項', dict(max_pos_correction=0.0)),
-            ('現在的預設 (兩個都有)', dict()),
+            ('現在的預設 (兩個都有, 零偏 GM)', dict()),
+            ('零偏改回隨機遊走 (rw)', dict(bias_model='rw')),
+            ('靜止不做第二階段確認', dict(confirm=dict(acc_mean=0.0, gyro_mean=0.0,
+                                                speed_gate=0.0))),
+            ('NHC 用舊的份量 (sigma 0.15)', dict(nhc_sigma=0.15)),
             ('關掉 NHC', dict(nhc=False)),
             ('關掉 ZUPT/ZARU', dict(zupt=False, zaru=False)),
             ('開啟原地自旋 ZUPT (預設關)', dict(spin=True)),

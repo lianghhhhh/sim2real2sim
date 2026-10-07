@@ -1,0 +1,20 @@
+# IMU 零偏模型的參數。launch 會在 imu_loc.yaml 之後載入這個檔 (noise_fit:=...)。
+#
+#   零偏 = b0 (開機靜止校正量掉) + b_dyn (濾波器線上估計)
+#   gm : db_dyn/dt = -b_dyn/tau + n_b      (一階 Gauss-Markov)
+#   rw : db_dyn/dt = n_b                   (隨機遊走, sigma_bg / sigma_ba)
+#
+# **這裡是還沒擬合過的預設值** —— 從原本隨機遊走的 sigma_bg = 1e-4、
+# sigma_ba = 1e-3 換算來的 (sigma_gm = sigma_b * sqrt(tau/2), tau = 300 s),
+# 所以短時間內行為跟原本一樣。要換成量出來的值:
+#
+#   ros2 bag record -s sqlite3 -o imu_static /imu        # 車子靜止, 2 小時以上
+#   ros2 run car_loc_imu imu_fit_noise imu_static --plot allan.png
+#   ros2 launch car_loc_imu imu_loc.launch.py noise_fit:=$PWD/imu_noise_fit.yaml
+imu_localizer:
+  ros__parameters:
+    bias_model: gm
+    tau_bg: 300.0
+    sigma_gm_bg: 1.2e-3
+    tau_ba: 300.0
+    sigma_gm_ba: 1.2e-2

@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'imu_localizer = car_loc_imu.imu_loc_node:main',
             'imu_loc_eval = car_loc_imu.evaluate:main',
+            'imu_fit_noise = car_loc_imu.fit_noise:main',
         ],
     },
 )

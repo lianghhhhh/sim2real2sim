@@ -22,11 +22,11 @@
 | --- | --- |
 | 純積分 | 4.84 m |
 | + ZUPT / ZARU | 0.50 m |
-| + NHC (只有 NHC) | 0.05 m |
-| 全開 | **0.03 m** |
+| + NHC (只有 NHC) | 0.08 m |
+| 全開 | **0.13 m** |
 
 以上是「IMU 給精確姿態」(Isaac / 9 軸) 的情況。真車的 6 軸 IMU 要自己估傾角,
-同一條軌跡全開是 0.17 m; 而如果車身有 2 度的傾角沒估準, 會掉到 2.62 m ——
+同一條軌跡全開是 0.69 m; 而如果車身有 2 度的傾角沒估準, 會掉到 2.89 m ——
 **姿態誤差比零偏更致命**, 傾斜 1 度就是 0.17 m/s^2 的假加速度。
 
 還有一件不能忘的: 上面的數字之所以好看, 是因為那條軌跡**每 15 秒就停 3 秒**。
@@ -55,7 +55,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from std_srvs.srv import Trigger
 
-from .ins import (G, ImuIns, SpinDetector, StillDetector, TiltTracker,
+from .ins import (G, ImuIns, SpinDetector, StillConfirm, StillDetector, TiltTracker,
                   quat_to_matrix, quat_to_yaw)
 
 SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -75,6 +75,8 @@ class ImuLocalizer(Node):
         p('imu_topic', '/imu')
         p('odom_topic', '/imu_loc/odom')
         p('pose_topic', '/imu_loc/pose')
+        # 扣掉估計零偏之後的 IMU (陀螺儀 z、加速度 xy)。空字串 = 不發。
+        p('corrected_imu_topic', '/imu_loc/imu_corrected')
         p('map_frame', 'map')
         p('base_frame', 'base_link')
         p('publish_tf', True)
@@ -111,6 +113,15 @@ class ImuLocalizer(Node):
         p('still_acc', 0.25)          # |a| 跟 g 的差 (m/s^2)
         p('still_var', 0.05)          # 視窗內 a 的標準差 (m/s^2)
         p('still_window', 0.30)
+        # 靜止的第二階段確認 (見 ins.StillConfirm): 上面的條件只看原始讀數, 路面
+        # 平的時候「平順加減速 / 自旋後的慢轉 / 等速直線」三種都過得了。各設 0
+        # 就是關掉那一道。
+        p('still_acc_mean', 0.10)     # 平均水平加速度 (扣零偏) 要小於這個 (m/s^2)
+        p('still_gyro_mean', 0.002)   # 平均角速度 (扣零偏) 要小於這個 (rad/s)
+        p('still_speed_gate', 0.20)   # 估計速度還大於這個就不承認靜止 (m/s)
+        p('still_speed_frac', 0.15)   # 門檻再加上 這個比例 x 離開靜止後的速度變化量
+        p('still_speed_trust', 15.0)  # 離開靜止超過這麼久就不再用速度否決 (s)
+        p('still_speed_max_omega', 3.0)  # 離開靜止後轉速超過這個, 速度那一道就不算數
 
         # --- 濾波器 ---------------------------------------------------------------
         p('sigma_gyro', 0.02)
@@ -124,13 +135,26 @@ class ImuLocalizer(Node):
         # 被卡方閘門擋掉)。兩頭都錯而且方向相反。
         p('sigma_acc', 0.03)
         p('sigma_acc_omega', 0.15)
-        p('sigma_bg', 1e-4)
+        # 零偏模型: b = b0 (開機校正量掉) + b_dyn (濾波器線上估計)。
+        #   gm : 一階 Gauss-Markov, db/dt = -b/tau + n_b
+        #   rw : 隨機遊走 (GM 在 tau -> 無限大的極限)
+        # tau_* / sigma_gm_* 用 fit_noise.py 對靜止資料做 Allan variance 擬合
+        # 得到, 寫在 config/imu_noise_fit.yaml。
+        p('bias_model', 'gm')
+        p('tau_bg', 300.0)
+        p('sigma_gm_bg', 1.2e-3)
+        p('tau_ba', 300.0)
+        p('sigma_gm_ba', 1.2e-2)
+        p('sigma_bg', 1e-4)           # 只有 bias_model: rw 會用到
         p('sigma_ba', 1e-3)
         p('zupt_sigma', 0.02)
         p('zaru_sigma', 0.002)
-        p('nhc_sigma', 0.15)
+        p('nhc_sigma', 2.0)           # 不是側滑的大小 —— 見 ins.py 的 nhc
         p('nhc_min_speed', 0.20)
         p('nhc_max_omega', 1.5)
+        # NHC 單次更新最多能把位置搬多少 (m)。負數 = 不另外設限 (只受
+        # max_pos_correction 管)。見 ins.py 的 nhc。
+        p('nhc_pos_cap', -1.0)
         # base_link 的 +X 量到車頭的角度 (度)。REP-103 的車是 0, 但 car.usd 的
         # base_link 是 +X 朝左、車頭 -Y, 所以這台車是 -90。NHC 約束的是「垂直
         # 車頭」的那一軸 —— 給錯的話它會把前進速度當側滑歸零, 比不開還糟。
@@ -182,6 +206,14 @@ class ImuLocalizer(Node):
                                  acc_th=float(g('still_acc').value),
                                  var_th=float(g('still_var').value),
                                  window=float(g('still_window').value))
+        self.confirm = StillConfirm(
+            window=float(g('still_window').value),
+            acc_mean=float(g('still_acc_mean').value),
+            gyro_mean=float(g('still_gyro_mean').value),
+            speed_gate=float(g('still_speed_gate').value),
+            speed_frac=float(g('still_speed_frac').value),
+            trust=float(g('still_speed_trust').value),
+            speed_max_omega=float(g('still_speed_max_omega').value))
         self.tilt = TiltTracker(alpha=float(g('tilt_alpha').value))
         self.spin_det = SpinDetector(omega_th=float(g('spin_omega_min').value),
                                      omega_max=float(g('spin_omega_max').value),
@@ -203,6 +235,8 @@ class ImuLocalizer(Node):
         self.pub_odom = self.create_publisher(Odometry, g('odom_topic').value, 20)
         self.pub_pose = self.create_publisher(
             PoseWithCovarianceStamped, g('pose_topic').value, 20)
+        ct = g('corrected_imu_topic').value
+        self.pub_imu = self.create_publisher(Imu, ct, 20) if ct else None
         self.tf = tf2_ros.TransformBroadcaster(self) if self.do_tf else None
         self.create_subscription(Imu, g('imu_topic').value, self.on_imu, SENSOR_QOS)
         self.create_service(Trigger, '~/reset', self.on_reset)
@@ -210,6 +244,7 @@ class ImuLocalizer(Node):
         self.get_logger().info(
             f"等 {g('imu_topic').value} ... (只用 IMU, 不吃 LiDAR / 相機) | "
             f'重力: {self.gravity_mode}, yaw: {self.yaw_source} | '
+            f'零偏模型: {self._bias_model_text()} | '
             f'車頭 {self.ins.forward_deg:+.0f}° (從 base_link +X 量起) | '
             f"防線: {', '.join(k for k, v in self.en.items() if v) or '全關'}")
         if self.gravity_mode == 'complementary' and self.ins.sa < 0.2:
@@ -220,6 +255,13 @@ class ImuLocalizer(Node):
                 '卡方閘門擋掉。6 軸 IMU 請給 sigma_acc:=0.35。')
 
     # ------------------------------------------------------------------
+    def _bias_model_text(self) -> str:
+        i = self.ins
+        if i.bias_model == 'gm':
+            return (f'gm (陀螺 tau {i.tau_bg:.0f} s / sigma {i.sgm_bg:.2e}, '
+                    f'加速度 tau {i.tau_ba:.0f} s / sigma {i.sgm_ba:.2e})')
+        return f'rw (陀螺 {i.sbg:.1e}, 加速度 {i.sba:.1e})'
+
     def _make_ins(self) -> ImuIns:
         """照參數建一個濾波器。~/reset 也走這裡 —— 直接 ImuIns() 會把
         forward_deg 之類的設定悄悄變回預設值, 重設之後就換了一組行為。"""
@@ -229,6 +271,11 @@ class ImuLocalizer(Node):
             sigma_gyro_scale=float(g('sigma_gyro_scale').value),
             sigma_acc=float(g('sigma_acc').value),
             sigma_acc_omega=float(g('sigma_acc_omega').value),
+            bias_model=g('bias_model').value,
+            tau_bg=float(g('tau_bg').value),
+            sigma_gm_bg=float(g('sigma_gm_bg').value),
+            tau_ba=float(g('tau_ba').value),
+            sigma_gm_ba=float(g('sigma_gm_ba').value),
             sigma_bg=float(g('sigma_bg').value),
             sigma_ba=float(g('sigma_ba').value),
             zupt_sigma=float(g('zupt_sigma').value),
@@ -241,7 +288,9 @@ class ImuLocalizer(Node):
             anchor_sigma=float(g('anchor_sigma').value),
             anchor_after=float(g('anchor_after').value),
             v_max=float(g('v_max').value),
-            max_pos_correction=float(g('max_pos_correction').value))
+            max_pos_correction=float(g('max_pos_correction').value),
+            nhc_pos_cap=(None if float(g('nhc_pos_cap').value) < 0.0
+                         else float(g('nhc_pos_cap').value)))
 
     # ------------------------------------------------------------------
     def on_reset(self, req, res):
@@ -252,6 +301,7 @@ class ImuLocalizer(Node):
         self.calib_done = False
         self.calib_buf.clear()
         self.calib_start = None
+        self.confirm.reset()
         self.travelled = 0.0
         self._last_pos = None
         res.success = True
@@ -288,8 +338,6 @@ class ImuLocalizer(Node):
                         msg.linear_acceleration.z])
         self.det.add(t, gyro, acc)
         still = self.det.is_still()
-        self.last_still = still
-        self.n_still += int(still)
         dt = None if self.last_t is None else t - self.last_t
         self.last_t = t
 
@@ -298,6 +346,9 @@ class ImuLocalizer(Node):
                 return
 
         acc_xy = self._gravity_free(msg, gyro, acc, dt, still)
+        still = self.confirm.update(t, dt, still, acc_xy, float(gyro[2]), self.ins)
+        self.last_still = still
+        self.n_still += int(still)
 
         self.ins.predict(t, acc_xy, float(gyro[2]))
 
@@ -351,14 +402,13 @@ class ImuLocalizer(Node):
         if elapsed_still >= self.calib_time and len(self.calib_buf) >= 20:
             gm = np.mean([b[0] for b in self.calib_buf], axis=0)
             am = np.mean([b[1] for b in self.calib_buf], axis=0)
-            self.ins.x[5] = float(gm[2])          # b_g
             if self.gravity_mode == 'complementary':
                 # 靜止時加速度的方向就是重力反方向 —— 直接定出 roll/pitch
                 self.tilt.roll = math.atan2(am[1], am[2])
                 self.tilt.pitch = math.atan2(-am[0], math.hypot(am[1], am[2]))
                 self.tilt.inited = True
             res = self._gravity_free(msg, gm, am, None, True)
-            self.ins.x[6:8] = res                 # b_a
+            self.ins.set_bias0(float(gm[2]), res)  # b0: 之後濾波器只估動態部分
             self._start(t, msg)
             self.get_logger().info(
                 f'靜止校正完成 ({len(self.calib_buf)} 筆): '
@@ -374,6 +424,16 @@ class ImuLocalizer(Node):
                 f'等了 {self.calib_timeout:.0f} 秒都沒有連續靜止 {self.calib_time:.1f} 秒, '
                 '零偏當 0 開始推。**車子一開始就在動的話漂移會明顯大很多** —— '
                 '下次請讓車子先停著幾秒再開。')
+            if self.ins.bias_model == 'gm':
+                # GM 的衰減項假設「扣掉 b0 之後的零偏平均是 0」。b0 沒量到的話
+                # 它會把濾波器學到的零偏一直往 0 拉, 所以這一輪退回隨機遊走。
+                self.ins.bias_model = 'rw'
+                self.get_logger().warn(
+                    '開機零偏 b0 沒量到, 零偏模型這一輪退回 rw (隨機遊走)。')
+            # 靜止的加速度 / 角速度確認是拿估計的零偏當基準 —— b0 不知道的話
+            # 基準是錯的, 會把真的靜止全部否決掉, 零偏就永遠沒機會被修。
+            self.confirm.acc_mean = 0.0
+            self.confirm.gyro_mean = 0.0
             self._start(t, msg)
             return True
         if self.n_imu % 120 == 1:
@@ -426,6 +486,25 @@ class ImuLocalizer(Node):
         pc.pose.covariance = od.pose.covariance
         self.pub_pose.publish(pc)
 
+        if self.pub_imu is not None:
+            # 「去除零偏之後的 IMU」: 陀螺儀 z 與加速度 xy 扣掉目前估計的總零偏
+            # (b0 + 動態部分)。白雜訊還在 —— 那一部分原理上扣不掉。
+            # 加速度零偏定義在「車身水平」的座標, 傾角大的時候這裡是近似。
+            ci = Imu()
+            ci.header = msg.header
+            ci.orientation = msg.orientation
+            ci.orientation_covariance = msg.orientation_covariance
+            ci.angular_velocity.x = msg.angular_velocity.x
+            ci.angular_velocity.y = msg.angular_velocity.y
+            ci.angular_velocity.z = msg.angular_velocity.z - self.ins.gyro_bias
+            ba = self.ins.acc_bias
+            ci.linear_acceleration.x = msg.linear_acceleration.x - float(ba[0])
+            ci.linear_acceleration.y = msg.linear_acceleration.y - float(ba[1])
+            ci.linear_acceleration.z = msg.linear_acceleration.z
+            ci.angular_velocity_covariance = msg.angular_velocity_covariance
+            ci.linear_acceleration_covariance = msg.linear_acceleration_covariance
+            self.pub_imu.publish(ci)
+
         if self.tf is not None:
             tfm = TransformStamped()
             tfm.header.stamp = msg.header.stamp
@@ -454,6 +533,8 @@ class ImuLocalizer(Node):
             f'sigma {self.ins.sigma_pos() * 100:.1f} cm, 推算里程 {self.travelled:.1f} m | '
             f"ZUPT {c['zupt']} ZARU {c['zaru']} NHC {c['nhc']} 錨定 {c['anchor']} "
             f"限幅 {c['damped']} 自旋 {c['spin']} "
+            f"靜止否決 加速度 {self.confirm.rejected['acc']} / 角速度 "
+            f"{self.confirm.rejected['gyro']} / 速度 {self.confirm.rejected['speed']} "
             f"擋掉 {c['rejected']} | b_g {self.ins.gyro_bias * 1e3:+.2f} mrad/s, "
             f'b_a ({ba[0]:+.3f}, {ba[1]:+.3f})')
 

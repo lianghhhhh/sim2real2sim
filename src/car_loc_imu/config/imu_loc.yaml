@@ -34,6 +34,16 @@ imu_localizer:
     still_acc: 0.25
     still_var: 0.05
     still_window: 0.30
+    # 第二階段確認: 上面四個只看原始讀數, 路面平的時候下面三種「讀數很安靜但
+    # 車子其實在動」的情況全部過得了。這三道用濾波器自己估的零偏 / 速度來擋。
+    # 各設 0 就是關掉那一道。實測數字見 ins.py 的 StillConfirm。
+    still_acc_mean: 0.10       # 平順加減速: 平均水平加速度 (扣零偏) 要小於這個 (m/s^2)
+    still_gyro_mean: 0.002     # 自旋後的慢轉: 平均角速度 (扣零偏) 要小於這個 (rad/s)
+    still_speed_gate: 0.20     # 等速直線: 估計速度還大於這個就不承認靜止 (m/s)
+    still_speed_frac: 0.15     #   門檻再加上 這個比例 x 離開靜止後的速度變化量
+    still_speed_trust: 15.0    #   離開靜止超過這麼久就不再用速度否決 (s)
+    still_speed_max_omega: 3.0 #   離開靜止後轉速超過這個 (rad/s) 就不用速度否決:
+                               #   自旋完估計速度殘留 0.5 m/s 以上, 不能拿來否決停車
 
     sigma_gyro: 0.02
     sigma_gyro_scale: 0.01     # 陀螺儀比例因子誤差; 轉得越快這一項越大
@@ -43,14 +53,25 @@ imu_localizer:
     # |w|>12 時 14.7 m/s^2 (連續時間 1.9)。差 230 倍 —— 常數不可能同時對。
     sigma_acc: 0.03
     sigma_acc_omega: 0.15
+    # 零偏模型 (bias_model / tau_* / sigma_gm_*) 在 imu_noise_fit.yaml ——
+    # 那個檔是 imu_fit_noise 對靜止資料擬合出來的, launch 會接在這個檔後面載入。
+    # 下面兩個只有 bias_model: rw (隨機遊走) 才會用到。
     sigma_bg: 1.0e-4
     sigma_ba: 1.0e-3
 
     zupt_sigma: 0.02
     zaru_sigma: 0.002
-    nhc_sigma: 0.15            # skid-steer 打滑會違反 NHC, 所以給鬆一點
+    # NHC 每一筆的份量。**不是側滑的大小**: NHC 每筆 IMU 做一次, 而側滑是持續
+    # 好幾秒的同一個偏差, 當成獨立量測會重複計入 —— 所以是
+    # 側滑 (約 0.15 m/s) x sqrt(相關時間約 3 s x 60 Hz) = 2.0。
+    # 實測 10 趟的位置 RMS 平均: 0.15 -> 1.24 m, 2.0 -> 0.53 m。
+    # IMU 不是 60 Hz 的話照 sqrt(取樣率 / 60) 縮放。
+    nhc_sigma: 2.0
     nhc_min_speed: 0.20
     nhc_max_omega: 1.5         # 原地打滑轉彎時關掉 NHC
+    # NHC 單次更新最多把位置搬多少 (m); 負數 = 不另外設限。nhc_sigma 調對
+    # 之後不需要, 留著是給 nhc_sigma 設得很小的時候用。
+    nhc_pos_cap: -1.0
 
     # base_link 的 +X 量到「車頭」的角度 (度)。**這台車不是 0。**
     # car.usd 的 base_link 是 +X 朝左、車頭 -Y (car_teleop/cmd_vel_bridge.py

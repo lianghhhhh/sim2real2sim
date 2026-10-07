@@ -52,8 +52,30 @@ IMU 量到的是**比力** (specific force), 靜止水平時 az ≈ +9.81。車�
     x = [ p(2)    位置 (world)
           v(2)    速度 (world)
           yaw     朝向
-          b_g     陀螺儀 z 零偏
-          b_a(2)  加速度計 xy 零偏 (body) ]
+          b_g     陀螺儀 z 零偏     (動態部分, 見下)
+          b_a(2)  加速度計 xy 零偏 (動態部分, body) ]
+
+零偏模型
+--------
+    b(t) = b0 + b_dyn(t)
+
+    b0     開機常數零偏。由開機靜止校正量出來 (`set_bias0`), **放在狀態外面**,
+           之後不再變。
+    b_dyn  會慢慢變的那一部分, 就是狀態裡的 b_g / b_a。兩種模型 (`bias_model`):
+
+      gm (預設)  一階 Gauss-Markov:  db_dyn/dt = -b_dyn/tau + n_b
+                 離散化 (精確解):     b[k+1] = phi*b[k] + w,  phi = exp(-dt/tau)
+                                      Var(w) = sigma_gm^2 * (1 - phi^2)
+                 不確定度會飽和在 sigma_gm; 沒有量測的時候估計值往 0 衰減。
+      rw         隨機遊走:            db_dyn/dt = n_b,  Var(w) = sigma_b^2 * dt
+                 GM 在 tau -> 無限大的極限 (sigma_b^2 = 2*sigma_gm^2/tau)。
+
+**b0 一定要拆出來。** 衰減項如果作用在整個零偏上, 會把已經量到的常數零偏也
+往 0 拉 —— 60 秒沒有量測、tau = 300 s 的話就拉掉 18%。所以 GM 只描述扣掉 b0
+之後的殘差; 開機校正沒成功 (b0 不知道) 的時候不該用 GM, 節點會自動退回 rw。
+
+tau / sigma_gm 不是用猜的: 靜止錄一段資料, `fit_noise.py` 用 Allan variance
+擬合出來。
 """
 from __future__ import annotations
 
@@ -151,6 +173,108 @@ class StillDetector:
     def mean_gyro_acc(self):
         acc = np.stack([b[3] for b in self.buf])
         return acc.mean(axis=0)
+
+
+class StillConfirm:
+    """靜止的第二階段確認 —— StillDetector 說靜止之後, 再用濾波器自己知道的事
+    把三種「讀數很安靜但車子其實在動」的情況擋掉。
+
+    StillDetector 只看原始讀數的大小與變異數。路面平、感測器白雜訊又蓋過車體
+    震動的時候 (Isaac 就是這樣: 等速行駛的加速度抖動 0.008 m/s^2, 注入的白雜訊
+    0.031), 下面三種情況它全部會說靜止。實測 (Isaac bag, 行駛段):
+
+    1. **平順的直線加減速** (0.2~0.6 m/s^2)。零加速度更新把真實的加速度當成
+       零偏: 車頭軸的加速度零偏誤差 0.089 m/s^2, 是注入量的兩倍多。
+       -> 視窗平均的水平加速度扣掉零偏要夠小 (`acc_mean`)。之後 0.007。
+    2. **高速自旋後的慢轉** (約 0.01 rad/s, 低於 still_gyro)。ZARU 把真實的
+       轉速當成零偏: 陀螺零偏誤差 0.57 mrad/s。
+       -> 視窗平均的角速度扣掉零偏要夠小 (`gyro_mean`)。之後 0.15。
+    3. **等速直線行駛。** ZUPT 把速度歸零, 估計的位置停在原地: 一次 3 秒的
+       誤判就是 4 公尺。這一種的 IMU 讀數跟靜止**完全相同**, 只能靠「濾波器
+       記得自己剛剛加速過」來分辨:
+       -> 剛離開靜止不久 (`trust` 秒內), 而濾波器估的速度還明顯不是 0,
+          就不承認靜止 (`speed_gate`)。三道都開之後, 行駛中被判成靜止的比例
+          11.0% -> 0.3% (十二趟平均)。
+
+    速度那一道的門檻是 `speed_gate + speed_frac * (離開靜止後速度變化量的總和)`。
+    後面那一項是誤差預算: 加減速越劇烈, 積分出來的速度越不準 (衝刺到 2.5 m/s
+    再煞停, 實測估計速度會殘留 0.4 m/s), 那時就不該拿它來否決靜止。超過
+    `trust` 秒也不再否決 —— 寧可吃一次錯的 ZUPT, 也不要因為速度估錯而永遠
+    不承認真的停車。
+
+    **轉得快過之後速度那一道不算數** (`speed_max_omega`)。高速自旋時加速度的
+    雜訊跟著角速度長大 (|w| > 12 rad/s 時 14.7 m/s^2), 自旋完估計速度會殘留
+    0.5 m/s 以上的誤差 —— 那正是最需要 ZUPT 來救的時刻。實測一趟: 自旋後車子
+    真的停了, 速度那一道卻否決了 6 秒, 估計位置滑出去 3.5 公尺。
+
+    三道檢查都拿「目前估計的零偏 / 速度」當基準, 所以只能在開機靜止校正完成
+    之後用。設成 0 就是關掉那一道。
+    """
+
+    def __init__(self, window=0.30, acc_mean=0.10, gyro_mean=0.002,
+                 speed_gate=0.20, speed_frac=0.15, trust=15.0, speed_max_omega=3.0):
+        self.window = float(window)
+        self.acc_mean = float(acc_mean)
+        self.gyro_mean = float(gyro_mean)
+        self.speed_gate = float(speed_gate)
+        self.speed_frac = float(speed_frac)
+        self.trust = float(trust)
+        self.speed_max_omega = float(speed_max_omega)
+        self.buf = []               # (t, acc_xy, omega_z)
+        self.reset()
+
+    def reset(self):
+        self.buf.clear()
+        self.was_still = False
+        self.t_leave = None         # 最後一次確認靜止的時間
+        self.dv_sum = 0.0           # 離開靜止之後 |a|*dt 的總和 (m/s)
+        self.w_max = 0.0            # 離開靜止之後轉得最快有多快 (rad/s)
+        self.t_prev = None
+        self.rejected = {'acc': 0, 'gyro': 0, 'speed': 0}
+
+    def update(self, t, dt, raw_still: bool, acc_xy, omega_z: float, ins) -> bool:
+        """每一筆 IMU 呼叫一次 (在 ins.predict 之前)。回傳確認後的靜止。"""
+        acc_xy = np.asarray(acc_xy, dtype=np.float64)[:2].copy()
+        # 上一筆確認了靜止, 而且 ZUPT 真的把速度壓下來了 -> 這才算「從靜止重新
+        # 出發」, 速度那一道重新計數。只確認靜止但速度還沒歸零的話不能重來
+        # (ZUPT 的修正量超過 max_pos_correction 時整個增益會被縮小, 速度一次
+        # 修不完): 否則下一筆就會拿那個還沒歸零的速度去否決靜止 —— 實測自旋後
+        # 停車, 一筆 ZUPT 之後被否決了 4 秒, 位置滑出去 1.7 公尺。
+        if self.was_still and ins.speed < max(self.speed_gate, 1e-6):
+            self.t_leave = self.t_prev
+            self.dv_sum = 0.0
+            self.w_max = 0.0
+        self.t_prev = t
+        self.buf.append((t, acc_xy, float(omega_z)))
+        while self.buf and t - self.buf[0][0] > self.window:
+            self.buf.pop(0)
+
+        still = bool(raw_still)
+        if still and self.acc_mean > 0.0:
+            mean_a = np.mean([b[1] for b in self.buf], axis=0)
+            if not ins.accel_is_quiet(mean_a, self.acc_mean):
+                still = False
+                self.rejected['acc'] += 1
+        if still and self.gyro_mean > 0.0:
+            mean_w = float(np.mean([b[2] for b in self.buf]))
+            if not ins.gyro_is_quiet(mean_w, self.gyro_mean):
+                still = False
+                self.rejected['gyro'] += 1
+        # 速度那一道只在「要從行駛進入靜止」的那一刻問 —— 已經在靜止裡就不問,
+        # ZUPT 之後速度本來就是 0。
+        if (still and self.speed_gate > 0.0 and not self.was_still
+                and self.t_leave is not None and t - self.t_leave < self.trust
+                and self.w_max < self.speed_max_omega
+                and ins.speed > self.speed_gate + self.speed_frac * self.dv_sum):
+            still = False
+            self.rejected['speed'] += 1
+
+        if not still:
+            self.w_max = max(self.w_max, abs(float(omega_z) - ins.gyro_bias))
+            if dt:
+                self.dv_sum += float(np.linalg.norm(acc_xy - ins.acc_bias)) * dt
+        self.was_still = still
+        return still
 
 
 class SpinDetector:
@@ -277,11 +401,16 @@ class ImuIns:
                  sigma_gyro_scale: float = 0.01,  # 陀螺儀比例因子誤差 (無單位)
                  sigma_acc: float = 0.03,       # m/s^2/sqrt(Hz) (自旋以外的底線)
                  sigma_acc_omega: float = 0.15,  # 每 rad/s 要額外加多少 (見 predict)
-                 sigma_bg: float = 1e-4,        # 陀螺零偏隨機遊走
-                 sigma_ba: float = 1e-3,        # 加速度零偏隨機遊走
+                 bias_model: str = 'gm',        # gm (一階 Gauss-Markov) | rw (隨機遊走)
+                 tau_bg: float = 300.0,         # GM: 陀螺零偏相關時間 (s)
+                 sigma_gm_bg: float = 1.2e-3,   # GM: 陀螺零偏穩態標準差 (rad/s)
+                 tau_ba: float = 300.0,         # GM: 加速度零偏相關時間 (s)
+                 sigma_gm_ba: float = 1.2e-2,   # GM: 加速度零偏穩態標準差 (m/s^2)
+                 sigma_bg: float = 1e-4,        # rw: 陀螺零偏隨機遊走
+                 sigma_ba: float = 1e-3,        # rw: 加速度零偏隨機遊走
                  zupt_sigma: float = 0.02,      # ZUPT 宣告的速度雜訊 (m/s)
                  zaru_sigma: float = 0.002,     # ZARU 宣告的角速度雜訊 (rad/s)
-                 nhc_sigma: float = 0.15,       # NHC 宣告的側向速度雜訊 (m/s)
+                 nhc_sigma: float = 2.0,        # NHC 宣告的側向速度雜訊 (m/s), 見 nhc
                  spin_zupt_sigma: float = 0.15,  # 原地自旋時宣告的速度雜訊 (m/s)
                  nhc_min_speed: float = 0.20,   # 太慢就不做 NHC (方向沒意義)
                  nhc_max_omega: float = 1.5,    # 打滑轉彎時 NHC 假設會壞掉
@@ -290,7 +419,8 @@ class ImuIns:
                  anchor_after: float = 0.5,     # 靜止多久才開始錨定 (s)
                  v_max: float = 4.0,
                  chi2_scale: float = 1.0,
-                 max_pos_correction: float = 0.5):  # 單次更新最多能搬動位置多少 (m)
+                 max_pos_correction: float = 0.5,   # 單次更新最多能搬動位置多少 (m)
+                 nhc_pos_cap: float | None = None):  # NHC 單次最多動位置多少 (m); None = 不另外設限
         self.x = np.zeros(NX)
         # 初始不確定度: 位置/朝向由外部給 (set_pose), 速度給大一點
         self.P = np.diag([1e-4, 1e-4, 1.0, 1.0, 1e-4, 1e-4, 1e-2, 1e-2])
@@ -300,8 +430,20 @@ class ImuIns:
         self.sg_scale = float(sigma_gyro_scale)
         self.sa = float(sigma_acc)
         self.sa_omega = float(sigma_acc_omega)
+        if bias_model not in ('gm', 'rw'):
+            raise ValueError(f"bias_model 只能是 'gm' 或 'rw', 收到 {bias_model!r}")
+        self.bias_model = bias_model
+        # GM 的預設值是從 rw 的預設值換算來的 (sigma_gm = sigma_b*sqrt(tau/2),
+        # tau = 300 s), 所以短時間內兩個模型的行為一樣。實際的值用 fit_noise.py 量。
+        self.tau_bg = float(tau_bg)
+        self.tau_ba = float(tau_ba)
+        self.sgm_bg = float(sigma_gm_bg)
+        self.sgm_ba = float(sigma_gm_ba)
         self.sbg = float(sigma_bg)
         self.sba = float(sigma_ba)
+        # 開機常數零偏 b0 —— 狀態外面的常數, 狀態裡的 b_g / b_a 只是動態部分
+        self.b0_g = 0.0
+        self.b0_a = np.zeros(2)
         self.zupt_sigma = float(zupt_sigma)
         self.zaru_sigma = float(zaru_sigma)
         self.spin_zupt_sigma = float(spin_zupt_sigma)
@@ -320,6 +462,7 @@ class ImuIns:
         self.v_max = float(v_max)
         self.chi2_scale = float(chi2_scale)
         self.max_pos_correction = float(max_pos_correction)
+        self.nhc_pos_cap = None if nhc_pos_cap is None else float(nhc_pos_cap)
 
         self.still_since = None
         self.anchor = None
@@ -346,11 +489,41 @@ class ImuIns:
 
     @property
     def gyro_bias(self) -> float:
-        return float(self.x[IBG])
+        """陀螺儀 z 的總零偏 (b0 + 動態部分) —— 原始讀數要扣掉的就是這個。"""
+        return float(self.b0_g + self.x[IBG])
 
     @property
     def acc_bias(self):
-        return self.x[IBA].copy()
+        """加速度計 xy 的總零偏 (b0 + 動態部分)。"""
+        return self.b0_a + self.x[IBA]
+
+    def accel_is_quiet(self, mean_acc_xy, threshold: float) -> bool:
+        """視窗平均的水平加速度扣掉零偏之後夠不夠小 (見 StillConfirm)。
+
+        門檻是固定的, **不**隨零偏的不確定度放寬。放寬的話門檻會跟著零偏模型
+        的參數變: sigma_gm_ba = 0.019 時 3 sigma 就把 0.10 放寬到 0.18, 煞車
+        尾段 0.1~0.2 m/s^2 的減速度剛好全部漏進來。實測三趟 (Isaac bag):
+        放寬 -> 位置 RMS 1.71 / 2.30 / 1.16 m; 不放寬 -> 1.04 / 1.32 / 0.76 m,
+        車頭軸的加速度零偏誤差也從 0.011~0.017 降到 0.007~0.010 m/s^2。
+
+        代價: 零偏估計錯超過門檻就再也進不了靜止。開機靜止校正有完成的話
+        不會發生 (之後的漂移遠小於門檻); 沒完成的話節點會把這一道關掉。
+        """
+        m = np.asarray(mean_acc_xy, dtype=np.float64).reshape(2) - self.acc_bias
+        return bool(float(np.linalg.norm(m)) < float(threshold))
+
+    def gyro_is_quiet(self, mean_omega_z: float, threshold: float,
+                      k_sigma: float = 3.0) -> bool:
+        """視窗平均的角速度扣掉零偏之後夠不夠小 (見 StillConfirm)。"""
+        thr = float(threshold) + k_sigma * math.sqrt(max(self.P[IBG, IBG], 0.0))
+        return bool(abs(float(mean_omega_z) - self.gyro_bias) < thr)
+
+    def set_bias0(self, gyro_z: float, acc_xy):
+        """開機靜止校正量到的常數零偏 b0。動態部分從 0 開始。"""
+        self.b0_g = float(gyro_z)
+        self.b0_a = np.asarray(acc_xy, dtype=np.float64).reshape(2).copy()
+        self.x[IBG] = 0.0
+        self.x[IBA] = 0.0
 
     def set_pose(self, x, y, yaw, t=None, sigma_p=0.02, sigma_yaw=0.02):
         self.x[IP] = [float(x), float(y)]
@@ -378,8 +551,8 @@ class ImuIns:
             return
         self.t = float(t)
 
-        a_b = np.asarray(acc_xy, dtype=np.float64).reshape(2) - self.x[IBA]
-        w = float(omega_z) - self.x[IBG]
+        a_b = np.asarray(acc_xy, dtype=np.float64).reshape(2) - self.acc_bias
+        w = float(omega_z) - self.gyro_bias
         self.last_omega = w
         yaw = self.x[IYAW]
         R = rot2(yaw)
@@ -389,6 +562,12 @@ class ImuIns:
         self.x[IP] = self.x[IP] + self.x[IV] * dt + 0.5 * a_w * dt * dt
         self.x[IV] = self.x[IV] + a_w * dt
         self.x[IYAW] = wrap_pi(yaw + w * dt)
+        # 零偏的動態部分: GM 往 0 衰減, rw 不動
+        gm = self.bias_model == 'gm'
+        phi_g = math.exp(-dt / self.tau_bg) if gm else 1.0
+        phi_a = math.exp(-dt / self.tau_ba) if gm else 1.0
+        self.x[IBG] *= phi_g
+        self.x[IBA] *= phi_a
 
         # --- 雅可比 ---
         F = np.eye(NX)
@@ -399,6 +578,8 @@ class ImuIns:
         F[0:2, IBA] = -0.5 * dt * dt * R
         F[2:4, IBA] = -dt * R
         F[IYAW, IBG] = -dt
+        F[IBG, IBG] = phi_g
+        F[6, 6] = F[7, 7] = phi_a
 
         # --- 過程雜訊 ---
         # 速度的過程雜訊一定要是 sigma_a^2 * dt, 不是 sigma_a^2 * dt^2。
@@ -427,8 +608,12 @@ class ImuIns:
         Q[2, 2] = Q[3, 3] = qa * dt
         Q[0, 2] = Q[2, 0] = Q[1, 3] = Q[3, 1] = qa * dt * dt / 2.0
         Q[IYAW, IYAW] = qg * dt
-        Q[IBG, IBG] = self.sbg ** 2 * dt
-        Q[6, 6] = Q[7, 7] = self.sba ** 2 * dt
+        if gm:
+            Q[IBG, IBG] = self.sgm_bg ** 2 * (1.0 - phi_g ** 2)
+            Q[6, 6] = Q[7, 7] = self.sgm_ba ** 2 * (1.0 - phi_a ** 2)
+        else:
+            Q[IBG, IBG] = self.sbg ** 2 * dt
+            Q[6, 6] = Q[7, 7] = self.sba ** 2 * dt
 
         self.P = F @ self.P @ F.T + Q
         self.P = 0.5 * (self.P + self.P.T)          # 保持對稱
@@ -438,7 +623,8 @@ class ImuIns:
             self.x[IV] *= self.v_max / s
 
     # ------------------------------------------------------------------ 更新
-    def _update(self, H, r, R, name: str, gate: bool = True) -> bool:
+    def _update(self, H, r, R, name: str, gate: bool = True,
+                pos_cap: float | None = None) -> bool:
         """通用的 EKF 更新, 附卡方閘門。r 是 innovation (量測 - 預測)。
 
         兩個閘門, 缺一不可:
@@ -472,6 +658,14 @@ class ImuIns:
             return False
         K = self.P @ H.T @ Si
         dx = K @ r
+        if pos_cap is not None:
+            # 這個量測能動位置的量另外設上限: 只縮增益的**位置那兩列**, 速度 /
+            # 朝向 / 零偏的修正照常。Joseph form 對任意增益都成立, 共變異數
+            # 仍然一致。
+            dp = float(np.linalg.norm(dx[IP]))
+            if dp > pos_cap:
+                K[IP, :] *= (pos_cap / dp) if dp > 0.0 else 0.0
+                dx = K @ r
         dp = float(np.linalg.norm(dx[IP]))
         if self.max_pos_correction > 0.0 and dp > self.max_pos_correction:
             K = K * (self.max_pos_correction / dp)
@@ -520,14 +714,14 @@ class ImuIns:
     def zaru(self, omega_z: float):
         H = np.zeros((1, NX))
         H[0, IBG] = -1.0                 # 量測模型: 0 = omega_m - b_g
-        r = np.array([-(float(omega_z) - self.x[IBG])])
+        r = np.array([-(float(omega_z) - self.gyro_bias)])
         self._update(H, r, np.array([[self.zaru_sigma ** 2]]), 'zaru', gate=False)
 
     # --- 加速度計零偏: 靜止時扣掉重力後的水平加速度應該是 0 ---
     def zero_accel(self, acc_xy):
         H = np.zeros((2, NX))
         H[0, 6] = H[1, 7] = -1.0
-        r = -(np.asarray(acc_xy, dtype=np.float64).reshape(2) - self.x[IBA])
+        r = -(np.asarray(acc_xy, dtype=np.float64).reshape(2) - self.acc_bias)
         self._update(H, r, np.eye(2) * 0.05 ** 2, 'zaccel', gate=False)
 
     # --- 位置錨定: 停久了不要讓位置隨機遊走 ---
@@ -561,6 +755,24 @@ class ImuIns:
         self._update(H, r, np.array([[sd ** 2]]), 'yaw', gate=False)
 
     # --- NHC: 車體側向速度是 0 ---
+    #
+    # **nhc_sigma 不是「側滑有多大」, 而是「每一筆 NHC 該算多少份量」。**
+    # NHC 每一筆 IMU 都做一次 (60 Hz), 而 skid-steer 轉彎時的側滑是**持續好幾秒
+    # 的同一個偏差**, 不是每一筆獨立的雜訊。把它當成獨立量測的話, 一秒鐘就重複
+    # 算了 60 次: 實測車子以 0.6 m/s 等速行駛、剛開始緩轉 (0.1 rad/s, 真實側滑
+    # 0.013 m/s) 的 2 秒內, NHC 把估計的**前進速度**拉掉 0.28 m/s —— 連續行駛
+    # 時速度的不確定度主要在車頭方向, 車頭一轉, 那個不確定度就投影到側向,
+    # 被重複計入的側滑一路修掉。
+    #
+    # 所以 sigma 要乘上 sqrt(相關時間 x 取樣率)。0.15 m/s 的側滑、相關時間約
+    # 3 秒、60 Hz -> 2.0。實測 10 趟 (Isaac bag, 各約 35 m) 的位置 RMS 平均:
+    #   0.15 -> 1.24 m,  0.5 -> 0.95,  1.2 -> 0.66,  2.0 -> 0.53,  不開 NHC -> 1.25
+    # 代價: NHC 完全成立的情況 (合成資料、沒有側滑) 會慢一點收斂
+    # (test_ins.py 的「全開」0.03 -> 0.13 m)。IMU 取樣率不是 60 Hz 的話照
+    # sqrt(取樣率 / 60) 縮放。
+    #
+    # `nhc_pos_cap` 可以另外限制 NHC 單次動到位置的量 (只縮增益的位置那兩列)。
+    # sigma 還是 0.15 的時候它有幫助, sigma 調對之後就不需要了, 預設不設限。
     def nhc(self):
         if self.speed < self.nhc_min_speed:
             return
@@ -574,7 +786,8 @@ class ImuIns:
         # d(R u)/d(yaw) = J90 @ (R u)
         H[0, IYAW] = float((J90 @ lat) @ self.x[IV])
         r = np.array([-float(lat @ self.x[IV])])
-        self._update(H, r, np.array([[self.nhc_sigma ** 2]]), 'nhc')
+        self._update(H, r, np.array([[self.nhc_sigma ** 2]]), 'nhc',
+                     pos_cap=self.nhc_pos_cap)
 
     # --- 車頭方向的速度 (只給 log / odom twist 看, 不參與濾波) ---
     @property
