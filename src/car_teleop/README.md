@@ -1,5 +1,11 @@
 # car_teleop
 
+> **2026-10-12: 改成輪速控制了。** `cmd_vel_bridge` 現在送的是 `/joint_command` 的
+> `velocity` (四輪 rad/s), 只做運動學換算加一個 gyro 的轉速修正, 預設參數是
+> `kros_car.usd` 的 (輪半徑 0.05035、等效輪距 0.95、輪速上限 10 rad/s = 0.50 m/s)。
+> 下面講 effort / PI 控制器 / 「這台車沒有阻力」的段落是舊的 `car.usd` 那台車,
+> 留著當紀錄; 目前的行為以 [cmd_vel_bridge.py](car_teleop/cmd_vel_bridge.py) 的檔頭為準。
+
 手動開 `car.usd` 的車子。**建圖的時候需要它** —— 要人開著車把房間每個角落都掃到,
 地圖才會完整。
 
@@ -12,7 +18,7 @@ ros2 run car_teleop teleop_key
 ```
 
 ```
-  w/s 前進後退   a/d 左右轉   空白 停
+  w/s 直線前進後退   a/d 原地左右轉   空白 停
   +/- 速度上限   [/] 轉向上限   t 切換按住/持續   q 離開
 ```
 

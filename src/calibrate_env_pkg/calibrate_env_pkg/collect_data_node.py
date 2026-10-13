@@ -86,18 +86,23 @@ lid_ 那套讀。看它們要看**誤差 / 已走距離**。
 
 IMU 全速率另存一個檔: `<csv 檔名>_imu.csv`
 -----------------------------------------
-摩擦力分析 (scripts/estimate_friction.py) 最敏感的特徵是**自旋斷油後的角減速度**,
-高摩擦地面 0.15~0.3 秒就停住 —— 主 CSV 20 Hz 取樣只剩 3~6 個點, 而且是「最新
-一則」的取樣 (時間點不準)。所以 /imu 每一則訊息都在 callback 裡直接寫一列:
+摩擦力分析 (scripts/estimate_friction.py) 的急煞 / 起步特徵只有 0.1~0.3 秒 ——
+主 CSV 的取樣是「最新一則」(時間點不準)。所以 /imu 每一則訊息都在 callback 裡
+直接寫一列:
 
     stamp, recv, scenario_name, phase, scenario_recv, cmd_recv,
-    gyro_x/y/z, acc_x/y/z, effort_command_* (最新), *_velocity (最新輪速)
+    gyro_x/y/z, acc_x/y/z,
+    velocity_command_* (最新輪速指令), *_velocity (最新輪速), *_effort (最新輪子扭矩)
 
-`scenario_recv` / `cmd_recv` 是**收到目前這個段落標籤 / 這組 effort 指令的時刻**
-(跟 stamp 同一個時鐘)。分析端要量「從 spin_up 開始到轉速到 w_ref 的時間」這類
-特徵時, 起點只能靠「第一列帶著新標籤的 IMU 資料」去猜, 誤差就是一個 IMU 週期
-(60 Hz = 16.7 ms); 對一個 1.5 s 的量測來說是 0.5% 的雜訊, 跟特徵本身的散佈
-(0.7%) 同一個量級。有了 scenario_recv 就能直接拿到段落起點, 不用猜。
+`*_effort` 是**量到的**輪子扭矩 (N·m), 摩擦力分析的主特徵就是它 —— 等速原地轉時
+的扭矩正比於 mu。來源是 `wheel_feedback_topic`: 模擬用 /joint_states (Isaac 的
+ROS2PublishJointState), 實體車要改成 /wheel_feedback (馬達電流 x 扭矩常數, 50 Hz,
+時戳比 /joint_states 準)。
+
+`scenario_recv` / `cmd_recv` 是**收到目前這個段落標籤 / 這組輪速指令的時刻**
+(跟 stamp 同一個時鐘)。分析端要量「指令跳變之後多久車子有反應」這類特徵時,
+起點只能靠「第一列帶著新標籤的 IMU 資料」去猜, 誤差就是一個 IMU 週期
+(60 Hz = 16.7 ms)。有了 scenario_recv 就能直接拿到段落起點, 不用猜。
 
 檔案一直開著、定期 flush (200 Hz 每則 open/close 太貴)。沒有 IMU 就是空檔 (只有
 header)。`imu_csv:=false` 可以關掉。
@@ -171,22 +176,27 @@ class CollectDataNode(Node):
         super().__init__('collect_data_node')
         self.get_logger().info("CollectDataNode has been started.")
 
+        # --- topic 名稱全部可以改, 換 namespace / 同時比兩份設定時用得到 ---
+        p = self.declare_parameter
+        p('joint_command_topic', 'joint_command')
+        # 輪子的位置 / 輪速 / **扭矩**回授。實體車請給 /wheel_feedback
+        # (/joint_states 也有同樣的值, 但時戳被控制迴圈量化成 20 ms)。
+        p('wheel_feedback_topic', 'joint_states')
+
         self.command_subscriber = self.create_subscription(
             JointState,
-            'joint_command',
+            self.get_parameter('joint_command_topic').value,
             self.joint_command_callback,
             10
         )
 
         self.joint_subscriber = self.create_subscription(
             JointState,
-            'joint_states',
+            self.get_parameter('wheel_feedback_topic').value,
             self.joint_state_callback,
             10
         )
 
-        # --- topic 名稱全部可以改, 換 namespace / 同時比兩份設定時用得到 ---
-        p = self.declare_parameter
         p('gt_odom_topic', '/odom')
         p('camera_odom_topic', '/camera_loc/odom')
         p('lidar_odom_topic', '/lidar_loc/odom')
@@ -220,7 +230,7 @@ class CollectDataNode(Node):
         )
         self.latest_scenario_name = "Unknown"
         self.scenario_recv = float('nan')     # 收到目前這個段落標籤的時刻
-        self.cmd_recv = float('nan')          # 收到目前這組 effort 指令的時刻
+        self.cmd_recv = float('nan')          # 收到目前這組輪速指令的時刻
 
         # control_car_node 廣播的階段標籤:
         #   measure / reposition / brake / aborted / idle
@@ -296,10 +306,11 @@ class CollectDataNode(Node):
                 'timestamp',
                 'scenario_name',
                 'phase',
-                'effort_command_front_left',
-                'effort_command_front_right',
-                'effort_command_rear_left',
-                'effort_command_rear_right',
+                # 輪速指令 (rad/s)。舊的 effort 控制版這四欄叫 effort_command_*
+                'velocity_command_front_left',
+                'velocity_command_front_right',
+                'velocity_command_rear_left',
+                'velocity_command_rear_right',
                 'front_left_angle',
                 'front_right_angle',
                 'rear_left_angle',
@@ -333,6 +344,9 @@ class CollectDataNode(Node):
                 header += [f'{pre}_{c}' for c in Source.COLUMNS]
             # /imu 原始值的最新一則 (全速率的在 _imu.csv)
             header += ['gyro_z', 'acc_x', 'acc_y', 'imu_msg_stamp']
+            # 量到的輪子扭矩 (N·m) 與那一則回授的時戳。放在最後面: 分析腳本都是
+            # 照欄名取的, 不影響舊腳本。
+            header += [f'{w}_effort' for w in WHEEL_KEYS] + ['wheel_stamp']
             writer.writerow(header)
 
         # ---- IMU 全速率檔 ----
@@ -350,8 +364,9 @@ class CollectDataNode(Node):
                 ['stamp', 'recv', 'scenario_name', 'phase',
                  'scenario_recv', 'cmd_recv',
                  'gyro_x', 'gyro_y', 'gyro_z', 'acc_x', 'acc_y', 'acc_z']
-                + [f'effort_command_{w}' for w in WHEEL_KEYS]
-                + [f'{w}_velocity' for w in WHEEL_KEYS])
+                + [f'velocity_command_{w}' for w in WHEEL_KEYS]
+                + [f'{w}_velocity' for w in WHEEL_KEYS]
+                + [f'{w}_effort' for w in WHEEL_KEYS])
             self.get_logger().info(f'IMU 全速率記到: {self.imu_filepath}')
         self.create_subscription(
             Imu, topic('imu_topic'), self.imu_callback,
@@ -369,9 +384,9 @@ class CollectDataNode(Node):
 
     def joint_command_callback(self, msg):
         # 指令**變了**才更新時刻: control_car_node 每個迴圈都發一次, 記「最後一次
-        # 收到」沒有意義; 要的是「這組 effort 是什麼時候開始生效的」。
+        # 收到」沒有意義; 要的是「這組輪速指令是什麼時候開始生效的」。
         prev = getattr(self, 'latest_joint_command', None)
-        if prev is None or list(prev.effort) != list(msg.effort):
+        if prev is None or list(prev.velocity) != list(msg.velocity):
             self.cmd_recv = self._now()
         self.latest_joint_command = msg
 
@@ -400,8 +415,9 @@ class CollectDataNode(Node):
              self.latest_scenario_name, self.latest_phase,
              self.scenario_recv, self.cmd_recv,
              g.x, g.y, g.z, a.x, a.y, a.z]
-            + self._by_joint(getattr(self, 'latest_joint_command', None), 'effort')
-            + self._by_joint(getattr(self, 'latest_joint_state', None), 'velocity'))
+            + self._by_joint(getattr(self, 'latest_joint_command', None), 'velocity')
+            + self._by_joint(getattr(self, 'latest_joint_state', None), 'velocity')
+            + self._by_joint(getattr(self, 'latest_joint_state', None), 'effort'))
 
     def destroy_node(self):
         if self._imu_file is not None:
@@ -477,9 +493,11 @@ class CollectDataNode(Node):
                 and not any(s.count for s in srcs):
             return
 
-        eff = self._by_joint(jc, 'effort')
+        cmd = self._by_joint(jc, 'velocity')
         pos = self._by_joint(js, 'position')
         vel = self._by_joint(js, 'velocity')
+        eff = self._by_joint(js, 'effort')
+        wheel_stamp = self._stamp_sec(js.header) if js is not None else NAN
 
         now = self._now()
         if gt is not None:
@@ -498,10 +516,11 @@ class CollectDataNode(Node):
         with open(self.filepath, 'a') as f:
             writer = csv.writer(f)
             row = ([now, self.latest_scenario_name, self.latest_phase]
-                   + eff + pos + vel + gt_cols + list(self.latest_yolo_px) + gt_rest)
+                   + cmd + pos + vel + gt_cols + list(self.latest_yolo_px) + gt_rest)
             for s in srcs:
                 row += s.row(now)
             row += imu_cols
+            row += eff + [wheel_stamp]
             writer.writerow(row)
             self.count += 1
 

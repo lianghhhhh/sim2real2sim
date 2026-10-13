@@ -93,11 +93,10 @@ class LidarLocalizer(Node):
         # 'map_to_odom' : 只發 map -> odom, 假設別人在發 odom -> base_link (nav2 慣例)
         p('tf_mode', 'direct')
 
-        # --- 外參 (從 car.usd 量出來的, 不要憑感覺改) -------------------------
-        # /World/small_car/Cube/oradar_ms200 的世界高度 = 0.200 m, 旋轉是單位矩陣。
-        # scripts/setup_oradar_lidar.py 每次都會把實際量到的值印出來, 兩邊要一致。
-        # 放低於 0.15 會被輪子擋掉下半視野 (上一顆雷射踩過這個坑)。
-        p('lidar_translation', [0.0, 0.0, 0.20])
+        # --- 外參 (從 kros_car.usd 量出來的, 不要憑感覺改) --------------------
+        # /kros_car/base_link/laser_frame 相對 base_link 是 (+0.045, 0, +0.236),
+        # 旋轉是單位矩陣。舊的 car.usd 是 (0, 0, 0.20)。
+        p('lidar_translation', [0.045, 0.0, 0.236])
         p('lidar_rpy_deg', [0.0, 0.0, 0.0])
 
         # --- 地圖 -------------------------------------------------------------
@@ -168,6 +167,25 @@ class LidarLocalizer(Node):
         # 而 MS200 是 CW 旋轉 -> 索引跟發射順序相反, 所以預設 'reverse'。
         # 見 scan.py 的說明。
         p('time_order', 'reverse')  # 'forward' | 'reverse'
+        # 一圈裡每個點是什麼時候打的: 'linear' (真的旋轉雷射, 時間跟方位角連續走)
+        # 或 'frames' (Isaac: 一圈是 scan_frames 個算繪幀拼的, 時間是階梯, 最新一幀
+        # 從 scan_seam_deg 開始)。'auto' = use_sim_time 開著就是 frames, 否則 linear ——
+        # 實體車照舊只要 use_sim_time:=false。實測數字見 frontend.py 與 lidar_loc.yaml。
+        p('scan_time_model', 'auto')  # 'auto' | 'linear' | 'frames'
+        p('scan_frames', 6)           # 一圈幾個算繪幀 = 算繪頻率 / 掃描頻率 (60 / 10)
+        p('scan_seam_deg', 0.0)       # 最新那一幀從哪個方位角開始 (laser_frame, 度)
+        p('scan_lead_frames', 0.5)    # 最新那一幀比訊息時戳晚幾幀 (0 或 1, 不知道就 0.5)
+        # frames 模型的接縫**每次按 Play 都可能不一樣** (見 frontend.py), 所以開機後
+        # 在車子轉彎的那幾幀上把每個候選接縫都配準一次, 用殘差投票決定。
+        # 這跟上面那個投錯過的 auto_scan_stamp 不一樣的地方: 那六種線性組合**沒有
+        # 一種是對的**, 所以贏的那個只是碰巧; 這裡的候選包含真正的答案 (對牆面的
+        # 殘差 0.6 cm vs 差一格 2 cm), 而且轉速有上限、贏家要明顯比其他人好才採用,
+        # 不然就維持 scan_seam_deg。
+        p('auto_scan_seam', True)
+        p('seam_calib_scans', 40)         # 累積這麼多幀轉彎的掃描才決定
+        p('seam_calib_step_deg', 20.0)    # 候選接縫的間距
+        p('seam_calib_omega_min', 0.5)    # rad/s, 轉得比這慢分不出來 (補償量太小)
+        p('seam_calib_omega_max', 4.0)    # rad/s, 轉得比這快配準本身就不穩
         # 時戳對應到一圈的頭/中/尾, 再乘上索引方向, 一共 6 種組合, 規格書通常
         # 都沒寫。開這個就在車子轉得夠快的那幾幀上把 6 種都試一遍用殘差投票 ——
         # 猜錯的症狀很賊: 直線走完全正常, 一轉彎殘差就變兩倍。
@@ -249,7 +267,26 @@ class LidarLocalizer(Node):
             scan_period=float(g('scan_period').value),
             scan_stamp=g('scan_stamp').value,
             do_deskew=bool(g('deskew').value),
-            time_order=g('time_order').value)
+            time_order=g('time_order').value,
+            time_model=self._time_model(),
+            scan_frames=int(g('scan_frames').value),
+            seam_deg=float(g('scan_seam_deg').value),
+            lead_frames=float(g('scan_lead_frames').value))
+        self.auto_seam = (bool(g('auto_scan_seam').value)
+                          and self.front.time_model == 'frames')
+        self.seam_need = int(g('seam_calib_scans').value)
+        self.seam_w = (float(g('seam_calib_omega_min').value),
+                       float(g('seam_calib_omega_max').value))
+        step = max(float(g('seam_calib_step_deg').value), 1.0)
+        self.seam_cands = [float(a) for a in np.arange(0.0, 360.0, step)]
+        self._last_scan_t = None
+        self._seam_reset()
+        if self.front.time_model == 'frames':
+            self.get_logger().info(
+                f'掃描時間模型: frames (Isaac, {self.front.scan_frames} 幀/圈, '
+                f'最新一幀比時戳晚 {self.front.lead_frames:g} 幀); 接縫先用 '
+                f'{self.front.seam_deg:+.0f}°'
+                + (', 車子轉彎時會自己校正' if self.auto_seam else ' (不自動校正)'))
 
         self.motion = ConstVelMotion(alpha=float(g('twist_alpha').value),
                                      v_max=self.v_max,
@@ -314,6 +351,18 @@ class LidarLocalizer(Node):
         self.get_logger().info(f'等 {src} ... (只用 LiDAR, 不吃 IMU / 相機)')
 
     # ------------------------------------------------------------------
+    def _time_model(self) -> str:
+        m = str(self.get_parameter('scan_time_model').value)
+        if m == 'auto':
+            m = 'frames' if self.get_parameter('use_sim_time').value else 'linear'
+        return m
+
+    def _seam_reset(self):
+        self.seam_votes = {s: 0.0 for s in self.seam_cands}
+        self.seam_n = 0
+        self.seam_done = not self.auto_seam
+        self.seam_note = ''
+
     def _publish_map_once(self):
         seed = self.motion.pose[:2] if self.located else None
         m = OccupancyGrid()
@@ -339,6 +388,11 @@ class LidarLocalizer(Node):
     def on_scan(self, msg):
         t = stamp_sec(msg.header.stamp)
         self.n_scan += 1
+        # 模擬時間倒退 = Isaac 重新 Play 了。接縫每次 Play 都可能不一樣, 要重新校正。
+        if self.auto_seam and self._last_scan_t is not None and t < self._last_scan_t - 1.0:
+            self.get_logger().warn('掃描時戳倒退 (Isaac 重新 Play?), 接縫重新校正')
+            self._seam_reset()
+        self._last_scan_t = t
 
         f = self.front.process(msg, t, self.motion.vx, self.motion.vy,
                                self.motion.omega)
@@ -406,6 +460,8 @@ class LidarLocalizer(Node):
             r = self._calibrate_stamp(f, msg, px, py, pth)
         else:
             r = self.matcher.refine(f.xy, [px, py], pth)
+            if not self.seam_done:
+                r = self._calibrate_seam(f, msg, px, py, pth, r)
 
         if not self._good(r) and self.sweep_on_fail:
             # 掃一圈角度再試一次才算真的失敗。需要掃多大 = 上一段角速度 x
@@ -474,9 +530,54 @@ class LidarLocalizer(Node):
             self.full_search = True
             self.lock_count = 0
 
+    # ------------------------------------------------------------------ 接縫校正
+    def _calibrate_seam(self, f, msg, px, py, pth, r_cur):
+        """frames 模型: 每個候選接縫各做一次運動補償 + 配準, 累計殘差, 夠多幀之後
+        選最小的。回傳這一幀要用的配準結果 (還沒決定之前就是目前接縫的那一個)。
+
+        只在轉速落在 [omega_min, omega_max] 的幀上做 —— 轉得慢的時候所有候選幾乎
+        一樣 (補償量本來就小), 那種幀只會稀釋差距。
+        """
+        w = abs(self.motion.omega)
+        if not (self.seam_w[0] <= w <= self.seam_w[1]) or not self._good(r_cur):
+            return r_cur
+        for s in self.seam_cands:
+            g = self.front.process(msg, f.t, self.motion.vx, self.motion.vy,
+                                   self.motion.omega, seam_deg=s)
+            r = self.matcher.refine(g.xy, [px, py], pth)
+            self.seam_votes[s] += r.residual if np.isfinite(r.residual) else 1.0
+        self.seam_n += 1
+        if self.seam_n < self.seam_need:
+            return r_cur
+
+        mean = {s: v / self.seam_n * 100.0 for s, v in self.seam_votes.items()}
+        win = min(mean, key=mean.get)
+        med = float(np.median(list(mean.values())))
+        top = ', '.join(f'{s:.0f}° {v:.2f}' for s, v in sorted(mean.items(), key=lambda kv: kv[1])[:4])
+        # 贏家要**明顯**比一般的候選好才採用。分不出來 (全部差不多) 通常是這幾幀
+        # 的幾何剛好對接縫不敏感 —— 再收一輪; 收了三輪還分不出來就維持設定值。
+        if mean[win] <= 0.7 * med:
+            old = self.front.seam_deg
+            self.front.seam_deg = float(win)
+            self.seam_done = True
+            self.seam_note = f'接縫 {win:.0f}° (校正)'
+            self.get_logger().info(
+                f'掃描接縫校正完成 ({self.seam_n} 幀轉彎的掃描, 平均殘差 cm, 由小到大): '
+                f'{top} ... 中位 {med:.2f} -> 用 {win:.0f}° (原本 {old:.0f}°)')
+        elif self.seam_n >= 3 * self.seam_need:
+            self.seam_done = True
+            self.seam_note = f'接縫 {self.front.seam_deg:.0f}° (校正分不出來, 用設定值)'
+            self.get_logger().warn(
+                f'掃描接縫校正: {self.seam_n} 幀之後各候選還是分不出來 ({top} ... 中位 '
+                f'{med:.2f} cm), 維持 scan_seam_deg = {self.front.seam_deg:.0f}°。'
+                '用 scripts/check_scan_timing.py --spin 對 ground truth 量一次。')
+        return r_cur
+
     # ------------------------------------------------------------------ 時戳校正
     def _calibrating(self) -> bool:
-        return (self.auto_stamp and self.stamp_n < self.stamp_need
+        # frames 模型的時序是量出來的, 沒有頭/中/尾 x 順/逆 可以投票
+        return (self.auto_stamp and self.front.time_model != 'frames'
+                and self.stamp_n < self.stamp_need
                 and self.n_scan < self.stamp_giveup)
 
     def _calibrate_stamp(self, f, msg, px, py, pth):
@@ -604,7 +705,9 @@ class LidarLocalizer(Node):
             f'掃角度重試 {self.n_sweep}), '
             f'配準 {self.match_ms:.1f} ms | x={x:+.3f} y={y:+.3f} '
             f'yaw={math.degrees(th):+.1f}° v={math.hypot(self.motion.vx, self.motion.vy):.2f} '
-            f'w={self.motion.omega:+.2f} | 殘差 {res}, inlier {inl} | {state}')
+            f'w={self.motion.omega:+.2f} | 殘差 {res}, inlier {inl} | {state}'
+            + (f' | {self.seam_note}' if self.seam_note else
+               (f' | 接縫校正中 {self.seam_n}/{self.seam_need}' if not self.seam_done else '')))
 
 
 def main(args=None):

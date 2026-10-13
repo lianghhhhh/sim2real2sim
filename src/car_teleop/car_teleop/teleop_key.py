@@ -31,7 +31,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
 HELP = """
-  w/s 前進後退   a/d 左右轉   空白 停
+  w/s 直線前進後退   a/d 原地左右轉   空白 停
   +/- 速度上限   [/] 轉向上限   t 切換按住/持續   q 離開
 """
 
@@ -108,14 +108,24 @@ class TeleopKey(Node):
                 print(f'\n  -> 轉向上限 {self.w_step:.2f} rad/s')
                 continue
             if k in 'wsad':
+                # 四個鍵互斥: 直走就不轉, 轉就不走。不歸零的話前一個鍵留下的值還在
+                # (按住模式要等 hold_time, latched 模式是一直留著), 先按 a 再按 w
+                # 會邊走邊轉。
                 if k == 'w':
                     self.v = self.v_step
+                    self.w = 0.0
                 elif k == 's':
                     self.v = -self.v_step
+                    self.w = 0.0
                 elif k == 'a':
+                    # a/d 是**原地轉**: 把線速度歸零。不歸零的話前一個 w/s 留下的
+                    # 速度還在 (按住模式要等 hold_time, latched 模式是一直留著),
+                    # 車子會邊走邊轉畫弧線。
                     self.w = self.w_step
+                    self.v = 0.0
                 elif k == 'd':
                     self.w = -self.w_step
+                    self.v = 0.0
                 self.t_key = now
 
         if not self.latched and now - self.t_key > self.hold:

@@ -35,18 +35,22 @@ from car_loc_wheel.wheel_loc_node import WheelLocalizer   # noqa: E402
 from sensor_msgs.msg import Imu, JointState               # noqa: E402
 
 DT = 1.0 / 60.0
-RADIUS = 0.075
-# **輪速用節點自己設定的 scale 反推, 不要寫死一個數字。** 這支測的是「節點有沒有
-# 把參數接對、有沒有照自己的模型積分」, 不是「0.93 這個值對不對」(那是
-# replay_csv.py / replay_bag.py 拿真資料在量的)。寫死的話預設一改測試就假 fail。
+# **車體參數 (輪半徑、scale、車頭軸) 都從節點自己的設定反推, 不要寫死。** 這支測的是
+# 「節點有沒有把參數接對、有沒有照自己的模型積分」, 不是「某個值對不對」(那是
+# replay_csv.py / replay_bag.py 拿真資料在量的)。寫死的話預設一改測試就假 fail ——
+# 2026-10 從 car.usd (半徑 0.075、車頭 -Y) 換成 kros_car.usd 時就發生過。
 
 
-def imu_msg(t, a_fwd=0.0, wz=0.0):
+def radius(node):
+    return float(node.get_parameter('wheel_radius').value)
+
+
+def imu_msg(t, a_fwd=0.0, wz=0.0, phi=0.0):
     m = Imu()
     m.header.stamp.sec, m.header.stamp.nanosec = int(t), int((t % 1) * 1e9)
-    # 車頭是 -Y (forward_deg = -90), 所以前進加速度落在 body 的 -y
-    m.linear_acceleration.x = 0.0
-    m.linear_acceleration.y = -float(a_fwd)
+    # 前進加速度落在 body 的「車頭軸」上 (phi = forward_deg)
+    m.linear_acceleration.x = float(a_fwd) * math.cos(phi)
+    m.linear_acceleration.y = float(a_fwd) * math.sin(phi)
     m.linear_acceleration.z = 9.80665
     m.angular_velocity.z = float(wz)
     return m
@@ -67,14 +71,14 @@ def drive(node, v, a=None, wz=None, omega=None):
     t = np.arange(n) * DT
     a = np.gradient(v) / DT if a is None else a
     wz = np.zeros(n) if wz is None else wz
-    omega = v / (node.ins.scale * RADIUS) if omega is None else omega
+    omega = v / (node.ins.scale * radius(node)) if omega is None else omega
     yaw = np.cumsum(wz) * DT
-    heading = yaw - math.pi / 2                       # forward_deg = -90
+    heading = yaw + node.ins.phi                      # 車頭 = yaw + forward_deg
     gx = float(np.sum(v * np.cos(heading)) * DT)
     gy = float(np.sum(v * np.sin(heading)) * DT)
     for i in range(n):
         node.on_joint(joint_msg(t[i], omega[i]))
-        node.on_imu(imu_msg(t[i], a[i], wz[i]))
+        node.on_imu(imu_msg(t[i], a[i], wz[i], node.ins.phi))
     return gx, gy
 
 
@@ -94,7 +98,7 @@ def case(name, fn):
 
 # ----------------------------------------------------------------------------
 def t1_straight():
-    """[1] 直線: 位置要往 -Y 走 (車頭軸), 誤差要在幾公分內。"""
+    """[1] 直線: 位置要沿著車頭軸走, 誤差要在幾公分內。"""
     n = WheelLocalizer()
     v = profile(10.0)
     gx, gy = drive(n, v)
@@ -104,8 +108,8 @@ def t1_straight():
     print(f'  估計 ({ex:+.3f}, {ey:+.3f})  真值 ({gx:+.3f}, {gy:+.3f})  '
           f'誤差 {err:.3f} m  |  輪速 {c["wheel"]} 擋掉 {c["rejected"]} '
           f'強制 {c["forced"]}')
-    if abs(gy) < 1.0 or abs(gx) > 0.01:
-        return False, '真值本身就不對 —— 車頭應該是 -Y'
+    if math.hypot(gx, gy) < 1.0:
+        return False, '真值本身就不對 —— 車子應該沿車頭軸走了超過 1 m'
     return err < 0.1 and c['rejected'] == 0, f'誤差 {err:.3f} m, 沒有輪速被擋掉'
 
 
@@ -144,7 +148,7 @@ def t3_slip():
     """[3] 一顆輪子空轉 3 秒 —— 位置不可以被拖走。"""
     n = WheelLocalizer()
     v = profile(12.0)
-    om = v / (n.ins.scale * RADIUS)
+    om = v / (n.ins.scale * radius(n))
     W = np.tile(om, (4, 1))
     t = np.arange(len(v)) * DT
     m = (t >= 5.0) & (t < 8.0)

@@ -44,15 +44,15 @@ def generate_launch_description():
                               description='加速度過程雜訊底線; '
                                           'orientation 模式 0.05, '
                                           'complementary (6 軸) 要 0.35'),
-        DeclareLaunchArgument('wheel_scale', default_value='0.93',
-                              description='有效輪半徑 / 幾何輪半徑。跟牽引狀態有關: '
-                                          '有扭矩時 0.93, 滑行時 1.008 (幾何值)。'
+        DeclareLaunchArgument('wheel_scale', default_value='1.0',
+                              description='有效輪半徑 / 幾何輪半徑。kros_car 還沒量過 '
+                                          '(1.0 = 幾何值); 舊的 car.usd 是 0.93。'
                                           '要自己校就錄一段正常開的直線再用 '
                                           'replay_bag.py --measure'),
-        DeclareLaunchArgument('forward_deg', default_value='-90.0',
+        DeclareLaunchArgument('forward_deg', default_value='0.0',
                               description='base_link +X 量到車頭的角度; '
-                                          'car.usd 車頭是 -Y 所以 -90, '
-                                          'REP-103 的車給 0'),
+                                          'kros_car 照 REP-103 是 0, '
+                                          '舊的 car.usd 車頭是 -Y 要給 -90'),
         DeclareLaunchArgument('enable_wheel', default_value='true',
                               description='false = 退化成純 IMU (A/B 用)'),
         DeclareLaunchArgument('enable_slip_gate', default_value='true'),

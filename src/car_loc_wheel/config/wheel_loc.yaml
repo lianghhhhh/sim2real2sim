@@ -14,30 +14,32 @@ wheel_localizer:
                   rear_left_joint, rear_right_joint]
     # 順序必須是 [FL, FR, RL, RR] —— 打滑偵測靠「同側前後輪」配對, 配錯對就失效。
 
-    wheel_radius: 0.075        # car.usd: cylinder radius 0.5 * scale 0.15
-    # v_true = wheel_scale * wheel_radius * omega。
-    # 尺度誤差是**系統性**的 (走 100 m 就是幾公尺, 停車不會讓它消失)。
-    # **它跟牽引狀態有關, 不是一個幾何常數。** 同一台車量出來:
-    #   sim_data Reposition (控制器驅動)  n= 923  0.932  殘差 std 0.060
-    #   sim_data 嚴格直線   (控制器驅動)  n= 863  0.929  殘差 std 0.086
-    #   sim_data.backup     (控制器驅動)  n=1966  0.927  殘差 std 0.095
-    #   spin12 (自旋後的**滑行**, 沒扭矩)  n= 312  1.008  殘差 std 0.0097
-    # 四份有扭矩的都是 0.93, 只有滑行那份是 1.008 (= 幾何值)。這就是物理:
-    # 有驅動力 -> 輪胎一定有縱向滑移 -> 輪子比車快 -> 有效半徑比幾何值小。
-    # 定位時車子是被開著的, 所以用有扭矩的那個工作點。
-    # 端到端 (214 秒那一輪): 1.0 -> RMS 0.74, 0.976 -> 0.72, 0.93 -> 0.68。
-    # 要自己校就錄一段**正常開的直線** (不是滑行、不是自旋) 再量
-    # (replay_bag.py --measure), 而且要 n > 200 且殘差 std < 0.03 才算數。
-    wheel_scale: 0.93
+    wheel_radius: 0.05035      # kros_car.usd: 輪子碰撞圓柱的半徑
+    # v_true = wheel_scale * wheel_radius * omega。尺度誤差是**系統性**的
+    # (走 100 m 就是幾公尺, 停車不會讓它消失), 而且跟牽引狀態有關, 不是幾何常數。
+    # **這台車 (kros_car, 輪速控制) 還沒量過, 1.0 是幾何值。** 舊的 car.usd 在
+    # effort 控制下量到 0.93 (有驅動扭矩 -> 輪胎縱向滑移 -> 有效半徑變小)。
+    # 要校就錄一段**正常開的直線** (不是自旋) 再量 (replay_bag.py --measure),
+    # 而且要 n > 200 且殘差 std < 0.03 才算數。
+    wheel_scale: 1.0
 
-    # base_link 的 +X 量到「車頭」的角度 (度)。**這台車不是 0。**
-    # car.usd 的 base_link 是 +X 朝左、車頭 -Y (car_teleop/cmd_vel_bridge.py
-    # 裡也寫著同一件事), 所以是 -90。
-    # sim_data.csv 的佐證: 車子在動的時候 atan2(dy, dx) - gt_yaw 的中位數
-    # = -90.0° (n=1718)。REP-103 的車給 0。
+    # base_link 的 +X 量到「車頭」的角度 (度)。kros_car.usd 照 REP-103 (+X 是車頭),
+    # 所以是 0。舊的 car.usd 是 +X 朝左、車頭 -Y, 那台要給 -90。
     # 給錯的話車子會往垂直於實際行進的方向跑 —— 這個 package 裡「側向速度 = 0」
     # 是寫進狀態的結構性假設, 軸給錯等於整台車的運動學都錯了。
-    forward_deg: -90.0
+    forward_deg: 0.0
+
+    # IMU 在 base_link 裡的位置 [x, y] (m)。不在旋轉中心時, 車子一轉 IMU 就會量到
+    # 向心加速度 w^2*r 與切線加速度 (角加速度 x r); 節點會把量到的加速度換算回
+    # base_link 原點。kros_car.usd 的 imu_link 在 (+0.125, -0.0286), 離中心 12.8 cm
+    # (1.7 rad/s 的自旋就是 0.39 m/s^2)。IMU 在中心的車給 [0.0, 0.0]。
+    imu_lever_arm: [0.125, -0.0286]
+    # !! **Isaac 的 IMU 不模擬安裝位置** (它回報的是車體原點的加速度; 2026-10-13 對
+    #    ground truth 擬合出來的等效位置是 (+0.007, -0.001) m)。所以 use_sim_time 開著
+    #    時節點**不會**做這個補償, 上面那個值只在實體車 (use_sim_time:=false) 生效。
+    #    模擬裡照樣扣的話是憑空加進假加速度 (1.5 rad/s 自旋 0.28 m/s^2): 同一套摩擦力
+    #    測試, 純 IMU 那條的誤差中位 4.1 m -> 0.5 m, IMU+輪速 45 -> 37 cm。
+    imu_lever_arm_in_sim: false
 
     # --- 重力 / yaw 的來源 ----------------------------------------------------
     # 傾斜 1 度 = 0.17 m/s^2 的假加速度。加了輪速之後這件事沒有純 IMU 那麼致命

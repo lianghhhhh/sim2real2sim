@@ -18,51 +18,43 @@ STATUS:
   max_iter   次數用完還沒收斂 -> NEXT_* = 歷史上量起來最接近 real 的那一輪
 
 ────────────────────────────────────────────────────────────────────────
-更新規則
+更新規則 (輪速控制版; 特徵的定義見 estimate_friction.py 檔頭)
 ────────────────────────────────────────────────────────────────────────
 每個係數各自用一個特徵 (量出來的 real 值是目標):
-    dynamicFriction <- B1 自旋減速度 (spin_decel)
-    staticFriction  <- B2 慢速起轉 effort (creep_breakaway) —— 預設不單獨解, 見下面
+    dynamicFriction <- B1 等速自旋的輪子扭矩 (spin_torque), 備援 B2 ramp_torque
+    staticFriction  <- B2 起轉峰值扭矩 (breakaway_torque) —— 預設不單獨解, 見下面
+
+**馬達飽和就直接 failed, 不重試。** 自旋需要的扭矩超過馬達上限時, 量到的是
+馬達上限而不是摩擦力, 特徵不再隨 mu 變化 —— 重量一次也是一樣的結果, 割線法會
+拿雜訊當斜率。這不是資料壞掉, 是這台車 (質量 / 馬達) 在這個 mu 與這個輪速下量不到。
+馬達出得了的扭矩隨轉速下降, 所以 estimate_friction 會先把飽和的那幾檔輪速拿掉、
+只用剩下的 (兩邊拿掉同樣的檔位); 這裡看到的 sat_frac 是**拿掉之後**的。還是飽和
+就把 friction_test.launch.py 的 spin_wheel_speed 調低重收 (sim 與 real 都要)。
 
 ────────────────────────────────────────────────────────────────────────
 為什麼預設把 staticFriction 綁在 dynamicFriction 上 (--static-mode tied)
 ────────────────────────────────────────────────────────────────────────
-2026-09-16 的對照實驗 (probe: 地面 static 1.2 / dynamic 0.5, 對照 real 0.5 / 0.5,
-**只有靜摩擦不一樣**) 量到各特徵對靜摩擦的敏感度 d ln f / d ln mu_static:
+靜摩擦只有 B2 的起轉峰值量得到, 而那個峰值在速度環很硬的時候只有一兩個取樣
+(60 Hz 的回授), 解析度比動摩擦差一個量級。硬要分開解, 兩邊的量測雜訊會被塞進
+「靜/動的差」這個自由度裡, 產生假的靜動差。(舊的 effort 控制版 2026-09-16 的
+對照實驗也是同樣的結論: 真值 0.5/0.5, 分開解出 0.537/0.486。)
 
-    creep_breakaway    0.315   (9.4 sigma, 真的有反應)
-    spinup_breakaway   0.208   (4.6 sigma)
-    spinup_time       -0.019   (0.7 sigma = 沒反應)
-    spin_decel        -0.015   (0.7 sigma = 沒反應, 符合預期)
-
-也就是說 PhysX 這組設定下**靜摩擦只有 B2 量得到, 而且敏感度只有 0.3**
-(推測是起轉前的預滑移已經讓接觸點進入滑動狀態, 之後就由 dynamic 主導)。
-同一個特徵對動摩擦的敏感度是 ~0.65, 所以:
-
-  * 拿 creep 解靜摩擦, 必須先扣掉動摩擦的貢獻, 而動摩擦本身的誤差會被放大
-    0.65/0.315 ≈ 2 倍灌進靜摩擦 -> 靜摩擦的解析度大約只有 ±0.07。
-  * 硬要分開解, 兩邊的量測雜訊會被塞進「靜/動的差」這個自由度裡, 產生假的
-    靜動差 (2026-09-16 那一輪: 真值 0.5/0.5, 解出 0.537/0.486)。
-
-所以預設 `--static-mode tied`: 只解一個 mu (用 spin_decel), static = dynamic。
+所以預設 `--static-mode tied`: 只解一個 mu (用 spin_torque), static = dynamic。
 real 的 USD 兩個值一樣時這就是正解; 真的需要分開解再用 `--static-mode free`。
 
 * 只有一輪 sim (第 0 輪):  用 estimate_friction 的物理換算 (有效摩擦取平均、特徵 ∝ 有效
   摩擦) 估 real 的地面值。
 * 兩輪以上:  **割線法**, 直接在「sim 地面係數 -> 量到的特徵」上內插 / 外插 real 的特徵值,
-  取最靠近 real 的兩個點 (real 被夾在中間的那一對優先)。不需要任何物理模型。
-
-  為什麼不一直用物理換算: 特徵對 mu 不是線性的。2026-09-15 那一輪:
-      地面 0.5 -> B1 25.4    1.5 -> 49.5    real (2.0) -> 58.6
-  每單位有效 mu 從 51 掉到 47, 按比例換算會把 real 估成 ~1.7, 然後在 1.5 附近就
-  「量不出差別」停下來。割線法用的是實際量到的曲線, 越接近 real 越準。
+  取最靠近 real 的兩個點 (real 被夾在中間的那一對優先)。不需要任何物理模型 ——
+  特徵對 mu 不是完全線性的 (接觸模型、輪胎變形), 割線法用的是實際量到的曲線,
+  越接近 real 越準。
 
 新值 = 目前 + gain x (估計 - 目前), 單步最多 max_step 倍, 夾在 [mu_min, mu_max]。
 下一組值跟之前量過的某一組幾乎一樣 (在兩點之間來回跳) 時步長減半。
 
 **收斂 = |估計 - 目前| <= tol**, 不是「統計上分不出差別」—— 後者在雜訊大的時候
-會提早停 (上一版在 1.5 vs 2.0 就停了)。解析度 (估計值的 1-sigma) 比 tol 差時會警告:
-那表示 trial 數不夠, 收斂判定會被雜訊左右。
+會提早停。解析度 (估計值的 1-sigma) 比 tol 差時會警告: 那表示 trial 數不夠,
+收斂判定會被雜訊左右。
 """
 import argparse
 import json
@@ -74,20 +66,21 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 係數 -> 依序嘗試的特徵
-# spinup_time 原本被當成靜摩擦特徵, 2026-09-16 的對照實驗證明它對靜摩擦沒反應
-# (敏感度 -0.019), 對動摩擦才有 (~0.47) —— 它是 spin_decel 的備援, 不是靜摩擦。
 TERM_FEATURES = {
-    'dynamic': ['spin_decel', 'spinup_time'],
-    'static': ['creep_breakaway', 'spinup_breakaway'],
+    'dynamic': ['spin_torque', 'ramp_torque'],
+    'static': ['breakaway_torque'],
 }
-# spinup_time 依賴「兩個環境的馬達一樣」(它含馬達 ramp)。B3 對照組 (直線加速 /
-# 直線滑行) 就是在量這件事: 它們跟地面摩擦無關, 比值應該 ≈ 1。顯著不是 1 就不能用。
-MOTOR_DEPENDENT = {'spinup_time'}
-CONTROL_FEATURES = ('sprint_accel', 'coast_lin_decel')
+# 依賴「兩個環境的驅動系統一樣」的特徵 (含馬達暫態的那種)。輪速控制版的特徵都是
+# 穩態扭矩, 沒有這種; 留著這個機制給之後加的特徵用。
+MOTOR_DEPENDENT = set()
+# 對照組: 跟地面摩擦無關、比值應該 ≈ 1 的特徵。輪速控制版目前沒有可靠的對照組
+# (車體轉速/輪速在 PhysX 裡會隨 mu 變, 見 estimate_friction.py), 所以是空的。
+CONTROL_FEATURES = ()
 # tied 模式 (static = dynamic) 下這些特徵量的是**同一個 mu**, 可以各自估一次再
-# 反變異數合併。2026-09-16 (sim 0.5 -> real 2.0) 的收斂點四個特徵都說「sim 還低」,
-# 但只用 spin_decel 停在 1.925; 合併後是 1.969 (真值 2.0)。
-COMBINE_FEATURES = ('spin_decel', 'creep_breakaway', 'spinup_time', 'spinup_breakaway')
+# 反變異數合併。
+COMBINE_FEATURES = ('spin_torque', 'ramp_torque')
+# 自旋 trial 有超過這個比例馬達飽和, 這一輪的資料就不能用 (見檔頭)
+MAX_SAT_FRAC = 0.3
 
 
 def run_estimate(args, json_path):
@@ -128,7 +121,7 @@ def emit(status, static, dynamic, reason):
 
 
 def drivetrain_ok(res):
-    """B3 對照組有沒有顯著偏離 1 (= 兩邊不只地面不一樣, 驅動系統也不一樣)。
+    """對照組有沒有顯著偏離 1 (= 兩邊不只地面不一樣, 驅動系統也不一樣)。
 
     看的是 90% CI 含不含 1, 不是點估計: 對照組的 trial 少、CI 寬, 用點估計
     會常常誤判成「不一樣」而把最準的特徵丟掉。"""
@@ -331,6 +324,33 @@ def main():
         return retry_or_fail('收資料時定位壞掉 (' + ', '.join(
             f'{"sim" if k == "ref" else "real"}: {lq[k]["message"]}' for k in bad) + ')')
 
+    # 馬達的狀況: 沒有扭矩回授 / 飽和都不是重量一次能解決的 -> 直接 failed
+    motor = res.get('motor') or {}
+    for side, tag in (('ref', 'sim'), ('target', 'real')):
+        m = motor.get(side) or {}
+        if m.get('spin_trials') and m.get('no_effort') == m.get('spin_trials'):
+            return finish('failed', args.static, args.dynamic,
+                          f'{tag} 沒有輪子扭矩回授 (*_effort 全是 NaN) —— 主特徵量不到。'
+                          '模擬看 /joint_states 有沒有 effort; 實體車給 collect_data_node '
+                          'wheel_feedback_topic:=/wheel_feedback')
+        if m.get('effort_zero'):
+            return finish('failed', args.static, args.dynamic,
+                          f'{tag} 的輪子扭矩回授全是 0 (發布端沒填 effort)')
+        if m.get('sat_frac', 0.0) > MAX_SAT_FRAC and m.get('out_of_range'):
+            return finish('failed', args.static, args.dynamic,
+                          f'{tag} 連輪速最低的那一檔自旋都馬達飽和 (四輪平均 '
+                          f'{m.get("spin_torque_raw", float("nan")):.2f} N·m, 堵轉扭矩 '
+                          f'{m.get("stall_torque", float("nan")):g} N·m): 再調低 spin_wheel_speed 也沒用, '
+                          '這個地面的摩擦力超出這台車量得到的範圍。整車 12.5 kg 時量得到的上限'
+                          '大約是地面 mu 1.5 (無頭 PhysX 實測 1.0 / 1.2 / 1.5 可以, 2.0 不行); '
+                          '車愈重上限愈低。把 real 那一份的地面摩擦設在範圍內, 或確認車重')
+        if m.get('sat_frac', 0.0) > MAX_SAT_FRAC:
+            return finish('failed', args.static, args.dynamic,
+                          f'{tag} 有 {m.get("saturated")} 趟自旋馬達飽和 (扭矩貼著上限或輪速追不上): '
+                          '量到的是馬達上限不是摩擦力, 這台車在這個 mu 與輪速下量不到。'
+                          '把 spin_wheel_speed 調低重收 (sim 與 real 都要); 再不行檢查車重 '
+                          '(USD 的 base_link 質量)')
+
     feats = pick_features(res)
     if args.static_mode == 'tied':
         feats.pop('static', None)             # 只解 dynamic, static 等比例跟著走
@@ -345,7 +365,7 @@ def main():
         if allf.get(n) and allf[n].get('ref') and allf[n].get('target')}
     entry['ratio'] = (res.get('combined') or {}).get('ratio')
     if 'dynamic' not in feats:
-        return retry_or_fail('B1 自旋減速度沒有資料')
+        return retry_or_fail('B1 自旋扭矩沒有資料')
 
     cur = {'static': args.static, 'dynamic': args.dynamic}
     est, lines = {}, []

@@ -1,91 +1,89 @@
 #!/usr/bin/env python3
-"""跨環境地面摩擦力識別用的開迴路測試腳本。
+"""跨環境地面摩擦力識別用的開迴路測試腳本 (輪速控制版)。
 
-目標: 在不同 groundCollider 摩擦係數的場景裡送出**完全相同**的 effort 指令,
-      讓 collect_data_node 記下車子的反應, 之後回歸出 mu。
+目標: 在不同 groundCollider 摩擦係數的場景裡送出**完全相同**的輪速指令,
+      讓 collect_data_node 記下車子的反應 (輪子扭矩、gyro、加速度), 之後回歸出 mu。
 
-為什麼是開迴路: 系統識別要看的是「同樣輸入 -> 不同輸出」。如果量測段用
-cmd_vel 那種 PI 閉迴路, 控制器會主動補償掉摩擦力差異, 就什麼都量不到了。
-所以**量測段一律開迴路**, 只有「把車開回起點」那一段才用閉迴路 (phase 標成
+為什麼是開迴路: 系統識別要看的是「同樣輸入 -> 不同輸出」。量測段的指令**只由
+時間決定**, 不看任何回授; 只有「把車開回起點」那一段才用閉迴路 (phase 標成
 reposition, 分析時整段丟掉)。
 
 ────────────────────────────────────────────────────────────────────────
-為什麼是這四個 block (而不是原本的 throttle x steer 矩陣掃描)
+輪速控制下摩擦力藏在哪裡 (跟舊的 effort 控制版完全不同)
 ────────────────────────────────────────────────────────────────────────
+這台車 (kros_car.usd / 實體 KROS car) 的 /joint_command 收的是四輪的**輪速**
+(rad/s), 馬達自己的速度環會出到最大 2.0 N·m 去追。後果:
 
-1) 直線加速在高摩擦區間對 mu 完全不敏感。
-   抓地力上限是 a_max = mu*g (mu=0.8 -> 7.85 m/s^2), 但這台車的扭矩上限只
-   給得出 a = 0.34 * effort = 3.4 m/s^2 (見 car_teleop/README.md 的實測回歸)。
-   只要 mu > 0.35, 車子就是**扭矩受限**而不是抓地力受限 —— 換地面, 加速度
-   一模一樣。量到的是馬達, 不是地面。
+1) 沒有「斷油滑行」。指令 0 是主動煞車, 不是放開 —— 舊版拿來當主特徵的
+   coast-down (斷油後的減速度) 在這裡不存在。
 
-2) 穩態量不出摩擦力。
-   穩態時「驅動力 = 阻力」, 但驅動力你只知道 effort 指令, 中間隔著馬達模型、
-   joint drive damping 與打滑, 解不出阻力。**斷油後驅動力 = 0, 減速度完全由
-   摩擦決定** —— 所以每個量測段後面都接一個 instant cutoff 的 coast 段, 特徵
-   取在 coast 段而不是 hold 段。
+2) 車體的**運動**不是好的摩擦特徵。速度環把輪速釘在指令上, 原地轉的穩態車體
+   轉速在理想 Coulomb 摩擦下由幾何決定:
+       Omega = r * w_wheel * b / (a^2 + b^2)     (a = 半軸距, b = 半輪距)
+   跟 mu 無關。(PhysX 實測會隨 mu 稍微變, 但那是接觸模型的細節, 不是能拿來
+   反推 mu 的東西。)
 
-3) 原地旋轉是這台車對 mu 最敏感的操作。
-   skid-steer 原地轉時四個輪子全部在橫向滑動, 阻力矩
-       M_r = mu * m * g * (半軸距)
-   正比於 mu, 而且跟轉速無關 (Coulomb)。斷油後
-       dw/dt = -M_r / I_z = 常數   ->   w(t) 是直線, 斜率正比於 mu
-   擬合那條直線的斜率就是 mu 特徵。而且原地轉位移 ~0, 在 10x6 的房間裡跑得完。
+3) 摩擦跑到**馬達出多少扭矩**上。skid-steer 原地轉時四輪都在滑, 每一輪的
+   摩擦力大小是 mu*N, 方向由滑移方向決定, 穩態時
+       tau_wheel = r * mu * N * a / sqrt(a^2 + b^2)
+   正比於 mu, 跟轉速無關 (Coulomb)。而且這是**穩態量**, 可以平均好幾秒 ——
+   比舊版擬合 0.15 s 的減速度好量得多。
+   回授來源: 模擬是 /joint_states 的 effort, 實體車是 /wheel_feedback 的 effort
+   (馬達電流 x 扭矩常數)。
 
-   (原本的腳本在這個房間裡第一個情境就撞牆: creep ramp 10 秒會走 57 m,
-    pre-brake 的 effort 10 持續 4 秒會走 27 m, 房間只有 10 m 長。)
+   **前提是馬達扭矩沒有飽和。** 馬達出得了的扭矩隨轉速下降 (DDSM115: 堵轉
+   2.0 N·m, 115 rpm 剩 0.96), 需要的扭矩超過它時輪速追不上指令, 量到的就是馬達的
+   上限, 跟 mu 無關 (車太重 / mu 太大 / 轉太快時會發生)。所以自旋用比較低的輪速
+   (spin_wheel_speed), 分析端 (estimate_friction.py) 會檢查「扭矩貼著那個轉速下的
+   上限」與「輪速追不上」, 飽和的那一檔不用。
 
-Block 1  旋轉 coast-down    量橫向滑動摩擦 = mu 主特徵      位移 ~0
-Block 2  旋轉 creep ramp    量靜摩擦臨界                    位移 ~0
-Block 3  直線短衝 + coast   量滾動阻力 (跟 mu 不同的物理量)  每趟 ~4 m
-Block 4  起步打滑           量 slip ratio, 低 mu 才有訊號    每趟 ~2 m
+   **回授的扭矩裡還有馬達自己的損耗** (實體車: 電流 x 扭矩常數, 含軸承 / 鐵損),
+   Block 3 的等速直行就是用來量它的, 分析時從自旋扭矩裡扣掉。
 
-Block 3/4 量到的滾動阻力與 slip ratio 跟 Block 1/2 的滑動摩擦是不同的物理量,
-不同地面材質對它們的影響不會同比例 —— 兩組特徵都留著, 讓下游模型自己挑。
+Block 1  等速原地轉         輪子扭矩 ∝ mu_dynamic = 主特徵     位移 ~0
+Block 2  慢速 ramp 原地轉   起轉瞬間的峰值扭矩 (靜摩擦, 副)   位移 ~0
+Block 3  等速直行 + 急煞    馬達損耗 (扣掉用) + 煞停減速度     每趟 < 1.5 m
+Block 4  起步 (輪速階躍)    起步加速度與 slip ratio (副)       每趟 < 1.5 m
+
+Block 3/4 只有在抓地力先到上限 (輪子打滑 / 鎖死) 時才帶摩擦資訊; 扭矩先到
+上限的話它們跟地面無關。分析端用 slip ratio 分辨這兩種情況。
 
 ────────────────────────────────────────────────────────────────────────
-跟舊版的介面差異
+指令介面
 ────────────────────────────────────────────────────────────────────────
-* THROTTLE/STEER 直接寫 **effort 實值 (0~10)**, 不再有 _SCALE 這層換算。
-  舊版 STEER_LEVELS 的 +-8 乘上 _SCALE=2 就是 +-16, 遠超過 MAX_EFFORT=10,
-  被 _mix 各自 clamp 之後 (T=1,S=8)/(T=2,S=8)/(T=3,S=8) 塌成同一個指令
-  (-10,+10) —— 25 格裡有 6 格完全重複, 另外 10 格有一側全飽和。
-* _mix 超出上限時改成**等比縮放**而不是各自 clamp, 保住 throttle:steer 比例。
-* 新增 /test_phase, collect_data_node 會把它記成 CSV 的 phase 欄位:
+* /joint_command: sensor_msgs/JointState, `name` 四個輪子、`velocity` 是 rad/s。
+  正值 = 往前。跟實體車的 wheel_velocity_controller 同一種訊息。
+* **要持續送。** 實體車 0.3 秒沒收到指令輪子就停; 模擬則相反, 會一直維持最後
+  一筆 —— 所以腳本跑完 / 被 Ctrl-C 時要補送 0 (見 stop_car)。
+* THROTTLE / STEER 現在的單位是**輪速 rad/s**: 左輪 = throttle - steer,
+  右輪 = throttle + steer。超過 max_wheel_speed 時等比縮放。
+* /test_phase 給 collect_data_node 標 CSV:
       measure     開迴路量測段 <- **分析時只取這個**
-      reposition  閉迴路開回起跑點 (控制器會補償摩擦力, 不能用)
-      brake       量測段之間的主動煞停 (讓下一段從靜止開始)
+      reposition  閉迴路開回起跑點
+      brake       量測段之間的煞停 (讓下一段從靜止開始)
       aborted     撞牆保護中止的殘缺資料
       idle        腳本跑完
-* 新增 geofence: 訂 /odom, 離牆太近就中止當前情境、標成 aborted、開回起點重試。
+* geofence: 離牆太近就中止當前情境、標成 aborted、開回起點重試。
 
 ────────────────────────────────────────────────────────────────────────
 狀態從哪裡來: state_source = sensor (預設) | gt
 ────────────────────────────────────────────────────────────────────────
 真車沒有 ground truth, 所以預設就用感測器跑, 模擬器裡的 /odom 只拿來**對答案**
-(gt_check_topic, 定期印誤差, 不參與控制)。每一個量用的來源刻意不一樣:
+(gt_check_topic, 定期印誤差, 不參與控制)。
 
   量                  sensor 模式                      為什麼
   ─────────────────── ──────────────────────────────── ─────────────────────────
   位置 / 朝向         /fusion_loc/odom 的 pose         geofence 與歸位要絕對位置
-  轉速 wz             /imu gyro z (扣開機零偏)          LiDAR 自旋 >8 rad/s 會追丟;
-                                                       gyro 不受打滑、不會斷
-  stop_at_speed       IMU 前向加速度從靜止積分          融合的速度吃輪速, 打滑時是
-                                                       錯的, 而打滑就是摩擦造成的
-                                                       -> coast 進入速度會跟著 mu
-                                                       跑 (循環論證)。量測段只有
-                                                       1~3 秒, 積分漂移可忽略。
+  轉速 wz             /imu gyro z (扣開機零偏)          不受打滑影響、不會斷
+  geofence 的車速     位姿差分與 IMU 積分取大的         融合的速度吃輪速, 打滑時
+                                                       會錯
   煞車 / 歸位的速度   /fusion_loc/odom twist.linear.x   閉迴路段, 準不準只影響收斂
   靜止判定            gyro + 加速度抖動 + 融合速度
 
 安全上的差別: GT 不會斷, 感測器會。所以 sensor 模式下
-  * 定位過期 (pose_timeout) 或 sigma 太大 (pose_sigma_max) -> 量測段直接中止、煞停,
-    **不是**像舊版那樣「沒有 odom 就不檢查」繼續開迴路衝。
+  * 定位過期 (pose_timeout) 或 sigma 太大 (pose_sigma_max) -> 量測段直接中止、煞停。
   * 牆邊餘裕再加 sigma_margin_k x 定位 sigma。
-  * 歸位前先等定位回到可信 (repos_sigma_max) —— 自旋完 LiDAR 可能還沒重新鎖定。
-  * 自旋目標轉速上限 spin_max_w 預設 10.0 rad/s (sensor 模式)。真車換算: LiDAR 在
-    高轉速會追丟 (靠 IMU 撐過去), 而且要低於 IMU 的 gyro 量程 —— 常見的 ±250 dps
-    只有 4.4 rad/s, 那種 IMU 要把 spin_max_w 調到 4 以下, 買之前/設定時就要確認。
+  * 歸位前先等定位回到可信 (repos_sigma_max)。
 """
 import math
 from collections import deque
@@ -104,107 +102,74 @@ JOINT_NAMES = ['front_left_joint', 'front_right_joint',
 ODOM_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST, depth=10)
 
-MAX_EFFORT = 10.0
+# ── 車體幾何 (kros_car.usd 量出來的; 都有對應的參數可以蓋掉) ───────────
+WHEEL_RADIUS = 0.05035       # m
+HALF_TRACK = 0.135           # m, 輪胎接地中心到車體中線 (輪距 0.27)
+HALF_WHEELBASE = 0.144       # m (軸距 0.288)
+# skid-steer 原地轉的「等效輪距」: Omega = r*(w_R - w_L) / T_eff。四輪都在橫向滑,
+# 所以比幾何輪距 (0.27) 大。理想 Coulomb 摩擦是 2*(a^2 + b^2)/b = 0.577; 無頭 PhysX
+# 實測 0.68~1.04 (mu 大、轉得慢時比較大)。歸位的積分項會補剩下的落差。
+# estimate_friction.py 的 B1 會印實際量到的值: 2026-10-13 kros_car.usd (12.5 kg,
+# 地面 0.5) 兩輪實跑是 0.945 / 1.055。
+EFFECTIVE_TRACK = 0.95
 
-# ── Block 1: 旋轉 coast-down ──────────────────────────────────────────
-# 安全轉速上限。實測 (car_run_data/sim_data.csv) 低 mu 時舊版 (效果直接用
-# steer effort 3/5/7/10) 在 4 秒內就衝到 wz≈20~30 rad/s, 遠超過高 mu 下的
-# 穩態假設 (mu=0.8, S=10 只到 16.4)。位移在自轉時 ~0, 幾何圍籬完全看不到
-# 這個危險, 車子會一路轉到失控飄移、甚至撞牆。
-SPIN_MAX_SAFE_W = 12.0                   # rad/s   (gt 模式; sensor 模式見 spin_max_w 參數)
+# 實體車的馬達驅動 (DDSM115) 只收**整數 rpm**: rad/s 換成 rpm 之後四捨五入。模擬的
+# 關節沒有這個限制, 所以這裡自己先量化 —— 兩邊實際執行的輪速才會是同一個數字
+# (4.2 rad/s = 40.1 rpm, 實體車跑的是 40 rpm = 4.189 rad/s)。
+RPM = 2.0 * math.pi / 60.0               # 1 rpm = 0.1047 rad/s
 
-# 四個目標初始角速度 (不是 effort!)。實際值由 spin_targets() 依 spin_max_w 縮放,
-# spin_max_w = 12 時就是下面這組。用跟 B3/B4 的 stop_at_speed 同一招:
-# 轉速觸發取代時間觸發, 用固定的 SPIN_UP_STEER 衝上去, 到了目標值就放開。
-# 舊版是固定 4 個 steer effort, 在低 mu 下沒有阻力矩制衡, S=5/7/10 全部會
-# 衝破安全上限被同一個 SPIN_MAX_SAFE_W 拍平成幾乎一樣的 w0 (實測只剩
-# ~1.5 跟 ~13 兩檔), 驗證「衰減斜率跟初始 w 無關」的 Coulomb 假設就沒意義
-# 了。改成直接指定目標轉速, 在任何 mu 下都是真正分開的初始條件；
-# 全部低於 SPIN_MAX_SAFE_W, 觸發不到安全上限。
-#
-# **只取高轉速的三檔 (80% ~ 100%), 每檔 5 次。** 舊版 [2, 5, 8, 11] 的最低檔在
-# 高 mu 地面整段 coast 只有 ~50 ms (60 Hz IMU 3 個點), 幾乎全是放開後的過渡段,
-# 減速度系統性偏低 (2026-09-15 校正: mu 1.5 時 32 vs 其他檔 50), 分析端只好丟掉
-# —— 12 次裡能用的剩一半。總次數不變, 全部集中在量得準的區間。
-#
-# 2026-09-16: coast 段的角減速度是**用 5~6 個 IMU 點擬合一條直線**量出來的
-# (mu 2.0 時整段 coast 只有 0.14 s = 8 個點), 擬合本身的標準誤就有 2.4%,
-# 佔了 trial 間變異的 70~170% —— 也就是「雜訊極限」的真正來源。解法只有兩個:
-#   1) 讓 coast 更長 -> w0 更高 (擬合誤差 ~ 1/span^1.5, 所以最有效)
-#   2) 更多 trial (誤差 ~ 1/sqrt(n))
-# 所以 w0 往上推到安全上限, 每檔次數 4 -> 5 (共 15 次)。
-SPIN_TARGET_W = [9.12, 10.26, 11.4]      # rad/s (spin_max_w = 12 時)
-SPIN_UP_STEER = MAX_EFFORT               # 固定用最大 steer 衝, 只有目標轉速是變數
-# rate limiter 是 6 effort/s, 所以 1.67 s 就踩到底; 再給餘裕讓轉速長到目標值。
-# 高 mu 時可能衝不到某些高檔目標 (穩態轉速比目標低), 這裡當逾時保護, 跟
-# SPRINT_ACCEL_TIMEOUT 是同一個角色。
-SPIN_UP_TIMEOUT = 5.0
-# coast 只需要跑到轉速掉進尾段: mu 0.5 (最慢) 從 11 rad/s 掉到 0 也只要 0.45 s。
-# 舊版的 3.0 s 有 2.5 s 是空等, 15 次就浪費 40 s。
-SPIN_COAST_DURATION = 1.5                # ← 特徵取在這一段
-SPIN_REPEATS = 5
 
-# ── Block 2: 旋轉 creep (靜摩擦臨界) ─────────────────────────────────
-# 舊版的 creep 是直線的, 10 秒會走 57 m。改成原地轉, 一樣量靜摩擦但不會跑掉。
-CREEP_STEER_START, CREEP_STEER_END = 0.0, 10.0
-CREEP_DURATION = 10.0
-# 靜摩擦的「每次起轉的臨界 effort」本身就有 ~8% 的物理散佈 (每次歸位後四輪的
-# 預載不同, 先打滑的輪子也不同), 不是量測雜訊, 只能靠次數平均掉:
-# 中位數的標準誤 ≈ 1.2533 x 8% / sqrt(n), n=3 -> 5.8% (mu ±0.14), n=6 -> 4.1%。
-# 另外 B1 spin_up 的「從靜止到 w_ref 的時間」也是靜摩擦特徵 (見 estimate_friction
-# 的 spinup_time), 那個每輪有 15 次、cv 只有 0.7%, 是靜摩擦的主力;
-# B2 留著當**不依賴馬達模型**的交叉檢查。
-CREEP_REPEATS = 6
+def snap_rpm(w, step=1.0):
+    """輪速 (rad/s) -> 最接近的 step rpm 的整數倍。step <= 0 = 不量化。"""
+    if step <= 0.0:
+        return float(w)
+    q = step * RPM
+    return round(float(w) / q) * q
 
-# ── Block 3: 直線短衝 + coast (滾動阻力) ─────────────────────────────
-# 加速段刻意只有 1 秒: effort 10 時 a=3.4 m/s^2, 1 秒走 1.7 m, 進入 coast
-# 時 3.4 m/s。coast 距離在低 mu 時會拉很長, 所以靠 geofence 保護而不是算剛好。
-#
-# **加速段改成速度觸發, 不是時間觸發。** 舊版是「effort T 固定踩 2.0 秒」,
-# 而實測 (run1+run2, 12 個 trial) 是:
-#     T=4  -> 2.0 s 後 3.85 m/s     T=7 -> 1.6 s 後 4.8 m/s
-#     T=10 -> 1.6 s 後 4.9 m/s      (T=7 與 T=10 幾乎一樣, 扭矩已經飽和)
-# 房間長 9.16 m, 起跑點離對面牆 8.4 m; 4 m/s 的煞停距離就 2.7 m, 再加上
-# min_ahead 2.5 m 的餘裕 = 5.2 m, 所以車子跑到 3.2 m 就一定違規。
-# 結果是 **12 個 sprint trial 全部中止, 一次 coast 資料都沒收到** ——
-# run1/run2 的 `B3 sprint_coast` 是 0 筆。
-#
-# 用「加到指定車速就放開」取代「踩固定時間」有三個好處:
-#   1) coast 進入速度是**指定的**, 不是被地面摩擦係數決定的 -> 跨環境可比。
-#   2) 房間放得下: 2.6 m/s 的煞停距離只有 1.1 m。
-#   3) 油門值不再是自變數 (T=7 和 T=10 本來就給不出不同的答案), 真正的自變數
-#      是 coast 進入速度, 而那正是擬合滾動阻力要掃的東西。
-SPRINT_THROTTLE = 7.0                    # 加速用的固定油門
-SPRINT_TARGET_SPEEDS = [1.0, 1.8, 2.6]   # coast 進入速度 (m/s)
-SPRINT_ACCEL_TIMEOUT = 3.0               # 加不到目標速度就放棄 (低 mu 地面)
-SPRINT_COAST_DURATION = 3.0
-# B3 只是對照組 (應該 ≈ 1), 3 個 trial 就夠看出「不只摩擦不一樣」, 省下的
-# ~60 s 拿去給 B2 的靜摩擦次數。
-SPRINT_REPEATS = 1
 
-# ── Block 4: 起步打滑 (traction limit) ───────────────────────────────
-# 跟 Block 3 的 T=10 差在**跳過 rate limiter**: 瞬間給滿扭矩才會突破抓地力上限。
-# slip ratio = (r*w_wheel - v_true) / (r*w_wheel), 兩邊 collect_data_node 都有記。
-# mu < 0.35 時訊號很強, mu 高時會趨近 0 —— 趨近 0 本身就是有用的資訊。
-SLIP_THROTTLE = 10.0
-# 打滑訊號集中在放開煞車後的前 0.2~0.3 秒 (輪子轉起來、車還沒動)。1.0 秒會
-# 衝到 4.5 m/s, 煞停距離 3.4 m, 房間放不下 —— 實測 6 個 trial 的 slip_coast
-# 全部中止。改成速度觸發, 2.0 m/s 就放開, 打滑段一樣完整。
-SLIP_LAUNCH_DURATION = 1.0               # 上限, 正常會被 SLIP_TARGET_SPEED 先結束
-SLIP_TARGET_SPEED = 2.0
-SLIP_COAST_DURATION = 1.5
-SLIP_REPEATS = 2                         # 副特徵, 2 次即可 (省時間給 B1/B2)
+# ── Block 1: 等速原地轉 (主特徵: 輪子扭矩) ───────────────────────────
+# 三檔輪速不是為了掃描, 是為了驗證 Coulomb 假設 (扭矩跟轉速無關): 如果扭矩隨
+# 輪速明顯上升, 代表有黏滯項 (軸承 / 馬達反電動勢), 分析時要看的是截距。
+# 兩個方向都跑: 左右馬達 / 載重不對稱會讓單一方向有偏差, 正反平均掉。
+# 自旋的輪速另外給 (spin_wheel_speed), 不跟直線段共用 max_wheel_speed: 馬達出得了的
+# 扭矩隨轉速下降 (DDSM115: 堵轉 2.0 N·m, 6 rad/s 剩 1.61, 10 rad/s 剩 1.18), 而自旋
+# 要的扭矩跟轉速無關 —— 轉得愈快愈容易飽和, 飽和的那一檔量到的是馬達不是地面。
+# 2026-10-13 無頭 PhysX (12.5 kg): 地面 1.0 時 10 rad/s 三檔有兩檔飽和, 6 rad/s 只有
+# 最高那一檔; 地面 0.5 兩種都不飽和。所以預設 6。
+SPIN_WHEEL_SPEED = 6.0                   # rad/s
+SPIN_LEVELS = (0.4, 0.7, 1.0)            # x spin_wheel_speed
+# 前 ~1 秒是起轉過渡 (輪子先到速、車體還在加速), 分析端會丟掉, 剩下的取平均。
+SPIN_HOLD_DURATION = 4.0                 # ← 特徵取在這一段的後 3 秒
+SPIN_REPEATS = 3                         # x 3 檔 x 2 方向 = 18 次
+
+# ── Block 2: 慢速 ramp 原地轉 (副特徵: 起轉峰值扭矩 = 靜摩擦) ────────
+# 輪速從 0 慢慢拉高。車體還沒轉之前輪子被靜摩擦咬住, 速度環的扭矩會一路升到
+# 咬不住為止 —— 那個峰值是靜摩擦, 之後掉回動摩擦的水準。速度環很硬的話峰值
+# 只有一兩個取樣, 所以這只是副特徵 (校正迴圈預設 static 跟著 dynamic 走)。
+RAMP_END_FRAC = 0.5                      # x spin_wheel_speed
+RAMP_DURATION = 6.0
+RAMP_REPEATS = 2                         # x 2 方向 = 4 次
+
+# ── Block 3: 等速直行 + 急煞 ─────────────────────────────────────────
+# 直行段量的是**馬達自己的損耗** (等速直行時輪胎不滑, 扭矩 = 損耗 + 滾動阻力, 跟地面
+# 摩擦係數無關)。實體車的扭矩回授是「電流 x 扭矩常數」, 裡面含這一塊; 分析時要從
+# 自旋扭矩裡扣掉, 而且要扣**同一個輪速**下的值 —— 所以直行的兩檔輪速就取自旋的
+# 最低檔與最高檔, 中間那一檔用內插 (estimate_friction.py 的 fit_loss)。
+# 急煞 = 輪速指令瞬間歸零。馬達煞得住輪子 (扭矩夠) 的話輪子鎖死、車體在地上滑,
+# 減速度 = mu*g; 煞不住就是扭矩受限, 減速度跟地面無關。
+CRUISE_LEVELS = (SPIN_LEVELS[0], SPIN_LEVELS[-1])    # x spin_wheel_speed
+CRUISE_HOLD = 1.5                        # 到速之後再維持這麼久
+CRUISE_REPEATS = 2
+BRAKE_DURATION = 1.0
+
+# ── Block 4: 起步 (輪速階躍) ─────────────────────────────────────────
+# 跳過斜率限制, 輪速指令直接跳到上限。抓地力不夠時輪子空轉, 車體加速度 = mu*g。
+LAUNCH_DURATION = 1.0
+LAUNCH_REPEATS = 3
 
 REST_DURATION = 1.0
-RATE_LIMIT = 6.0        # effort/s, 模擬人踩油門的急促程度 (instant 型會略過)
-
-# 「到了目標值就放開」的觸發延遲補償 (s)。2026-09-15 的資料: 目標 5.16 / 6.02 /
-# 6.88 rad/s 三檔, 放開時的實際轉速全都是 7~10 rad/s —— 因為從 wz 越過目標到
-# Isaac 真的斷油中間有 ~0.12 s (控制迴圈 20 Hz + topic 傳輸 + 指令生效),
-# 而自旋末段的角加速度有 25 rad/s^2, 0.12 s 就是 +3 rad/s。三檔被糊成一檔,
-# w0 還在 6.5~10.2 之間亂跳。解法: 用 gyro 算出當下的角加速度, 提前 LEAD 秒放開。
-# 控制迴圈拉到 50 Hz 之後實測延遲剩 ~0.05 s。
-TRIGGER_LEAD = 0.05
+# 輪速指令的斜率上限 (rad/s^2), instant 型會略過。20 rad/s^2 = 車體約 1 m/s^2。
+WHEEL_ACCEL_LIMIT = 20.0
 
 # IMU 靜止判定 (sensor 模式)。門檻給的是真車 MEMS 的量級, Isaac 的 IMU 沒雜訊一定過。
 IMU_STILL_WINDOW = 0.3  # s
@@ -247,75 +212,54 @@ def _stamp(header):
     return header.stamp.sec + header.stamp.nanosec * 1e-9
 
 
-def spin_targets(spin_max_w):
-    """B1 的三檔目標轉速: 上限的 80% / 90% / 100%, 最高檔再留 5% 給殘餘 overshoot。
-
-    三檔不是為了掃描, 是為了驗證 Coulomb 假設 (減速度跟 w 無關) 並讓分析端能
-    把「跟轉速有關的阻力」迴歸掉。範圍從舊版的 75~100% 收到 80~100%: 低檔的
-    coast 短、擬合點少, 是雜訊的主要來源。"""
-    top = 0.95 * spin_max_w
-    return [round(top * f, 2) for f in (0.8, 0.9, 1.0)]
-
-
 # ═══════════════════════════════════════════════════════════════════════
 #  測試腳本
 # ═══════════════════════════════════════════════════════════════════════
 def _const(name, block, throttle, steer, duration, min_clear,
-           min_ahead=None, group=None, stop_at_speed=None, min_useful=0.5,
-           stop_at_wz=None):
-    """group = 這一段屬於哪個 trial。中止重試時整個 trial 一起重跑 —— 只重跑
-    coast 段是沒有意義的, 因為它的初始速度是前面那個加速段給的。
+           min_ahead=None, group=None, min_useful=0.5, from_rest=False):
+    """throttle / steer 是**輪速** (rad/s): 左輪 = throttle - steer, 右輪 = throttle + steer。
 
-    stop_at_speed : 前向車速到這個值就提早結束 (m/s)。用來讓 coast 的進入速度
-                    由**我們**決定, 而不是由地面摩擦係數決定。
-    stop_at_wz : 跟 stop_at_speed 同一招, 但用在轉速上 —— 原地旋轉時位移 ~0,
-                 幾何圍籬看不到失控加速, 低 mu 時 wz 會一路長到失控飄移甚至
-                 撞牆 (見 SPIN_MAX_SAFE_W 的說明)。到了這個轉速就提早放開。
+    group = 這一段屬於哪個 trial。中止重試時整個 trial 一起重跑 —— 只重跑煞車段
+    是沒有意義的, 因為它的初始速度是前面那個直行段給的。
+
     min_useful : 幾何圍籬踩線時, 已經收滿這麼多秒就當作「提早收工」而不是
-                 「中止」—— 資料留著, 不重試。截斷的 coast-down 仍然是完全
-                 合法的資料 (少幾個點而已); 把它丟掉再重跑一次才是浪費。
-                 實測 run2: 105 個情境裡 70% 的時間花在 abort -> reposition
-                 -> retry 的迴圈上, 而重試通常在同一個地方再撞一次。
+                 「中止」—— 資料留著, 不重試。
+    from_rest : 這一段從靜止起步 -> 進來時把 IMU 的速度積分歸零 (geofence 用)。
     """
     return {'name': name, 'block': block, 'type': 'const', 'phase': 'measure',
             'throttle': throttle, 'steer': steer, 'duration': duration,
             'min_clear': min_clear, 'min_ahead': min_ahead, 'group': group,
-            'stop_at_speed': stop_at_speed, 'min_useful': min_useful,
-            'stop_at_wz': stop_at_wz}
+            'min_useful': min_useful, 'from_rest': from_rest}
 
 
 def _instant(name, block, throttle, steer, duration, min_clear,
-             min_ahead=None, group=None, stop_at_speed=None, min_useful=0.5,
-             stop_at_wz=None):
-    """跳過 rate limiter 直接跳到目標值。coast 段 (throttle=0) 與打滑起步都用它。"""
+             min_ahead=None, group=None, min_useful=0.5, from_rest=False):
+    """跳過斜率限制直接跳到目標輪速。急煞 (throttle=0) 與起步階躍都用它。"""
     d = _const(name, block, throttle, steer, duration, min_clear, min_ahead,
-               group, stop_at_speed, min_useful, stop_at_wz)
+               group, min_useful, from_rest)
     d['type'] = 'instant'
     return d
 
 
 def _ramp(name, block, var, start, end, duration, min_clear,
-          min_ahead=None, group=None, stop_at_wz=None):
+          min_ahead=None, group=None):
     return {'name': name, 'block': block, 'type': 'ramp', 'phase': 'measure',
             'ramp_var': var, 'ramp_start': start, 'ramp_end': end,
             'throttle': 0.0, 'steer': 0.0, 'duration': duration,
             'min_clear': min_clear, 'min_ahead': min_ahead, 'group': group,
-            'stop_at_speed': None, 'min_useful': 0.5, 'stop_at_wz': stop_at_wz}
+            'min_useful': 0.5, 'from_rest': False}
 
 
 def _rest(duration=REST_DURATION):
-    """組間的煞停。標成 measure 是刻意的 —— 靜止段可以拿來估感測器零偏。"""
+    """組間的靜止。標成 measure 是刻意的 —— 靜止段可以拿來估感測器零偏。"""
     return _const('Rest', '-', 0.0, 0.0, duration, min_clear=0.0)
 
 
 def _brake(name, phase='brake', duration=3.0):
-    """主動煞停。**零 effort 不等於煞車** —— 這台車幾乎沒有滾動阻力, 低 mu 的
-    地面放開油門還會滑好幾公尺, 所以要閉迴路給反向扭矩。
+    """煞停並等車子真的靜止。輪速指令 0 就是煞車 (馬達的速度環會出反向扭矩)。
 
-    每個 coast 量測段後面都接一個, 理由有二:
-      1) 安全: coast 結束時車子還在動, 開迴路的 Rest 擋不住它滑進牆裡。
-      2) 一致性: 下一個量測段要從**靜止**開始, 否則初始條件跟著上一段的殘餘
-         速度走, 跨環境就不可比了 (低 mu 的環境殘餘速度大得多)。
+    每個量測段後面都接一個: 下一個量測段要從**靜止**開始, 否則初始條件跟著上
+    一段的殘餘速度走, 跨環境就不可比了。
     phase 用 'brake' (中止時才用 'aborted'), 兩者都不是 measure, 分析時都丟掉。
     """
     return {'name': name, 'block': '-', 'type': 'brake', 'phase': phase,
@@ -337,7 +281,8 @@ def _calibrate(duration, timeout):
 
 
 def build_scenarios(room, repos_timeout, wall_margin, blocks=(1, 2, 3, 4),
-                    spin_max_w=SPIN_MAX_SAFE_W, calib_duration=2.0):
+                    max_wheel_speed=10.0, calib_duration=2.0,
+                    spin_wheel_speed=SPIN_WHEEL_SPEED, rpm_step=1.0):
     """room = (x_min, x_max, y_min, y_max) 的內牆範圍。
 
     min_clear = 離最近的牆至少要有幾公尺 (0 = 不檢查)
@@ -346,80 +291,76 @@ def build_scenarios(room, repos_timeout, wall_margin, blocks=(1, 2, 3, 4),
     """
     x_min, x_max, y_min, y_max = room
     cx, cy = 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
+    wmax = snap_rpm(max_wheel_speed, rpm_step)
+    wspin = min(float(spin_wheel_speed), float(max_wheel_speed))
     # 沿長軸兩端的起跑點, 留 1.5 m 讓車子擺得下並且有反應空間
     launch = [(x_min + 1.5, cy, 0.0),        # 面向 +X
               (x_max - 1.5, cy, 180.0)]      # 面向 -X
 
     S = [_calibrate(calib_duration, timeout=60.0)]
 
-    # ── Block 1: 旋轉 coast-down ─────────────────────────────────────
+    # ── Block 1: 等速原地轉 ─────────────────────────────────────────
     if 1 in blocks:
         S.append(_repos('Reposition -> center (B1)', cx, cy, 0.0, repos_timeout))
         for rep in range(SPIN_REPEATS):
-            for w0 in spin_targets(spin_max_w):
-                tag = f'w0={w0:g} rep{rep + 1}'
-                gid = f'B1_{rep}_{w0:g}'
-                S.append(_const(f'B1 spin_up {tag}', 'B1_spin_up',
-                                0.0, SPIN_UP_STEER, SPIN_UP_TIMEOUT,
-                                min_clear=wall_margin, group=gid,
-                                stop_at_wz=w0))
-                S.append(_instant(f'B1 spin_coast {tag}', 'B1_spin_coast',
-                                  0.0, 0.0, SPIN_COAST_DURATION,
-                                  min_clear=wall_margin, group=gid))
-                S.append(_brake(f'Brake after {tag}'))
-                S.append(_rest())
+            for frac in SPIN_LEVELS:
+                for sgn, way in ((1.0, 'ccw'), (-1.0, 'cw')):
+                    w = round(snap_rpm(frac * wspin, rpm_step), 3)
+                    tag = f'w={w:g} {way} rep{rep + 1}'
+                    S.append(_const(f'B1 spin_hold {tag}', 'B1_spin_hold',
+                                    0.0, sgn * w, SPIN_HOLD_DURATION,
+                                    min_clear=wall_margin,
+                                    group=f'B1_{rep}_{w:g}_{way}', min_useful=2.5))
+                    S.append(_brake(f'Brake after B1 {tag}'))
+                    S.append(_rest(0.5))
 
-    # ── Block 2: 旋轉 creep (靜摩擦臨界) ────────────────────────────
+    # ── Block 2: 慢速 ramp 原地轉 ───────────────────────────────────
     if 2 in blocks:
         S.append(_repos('Reposition -> center (B2)', cx, cy, 0.0, repos_timeout))
-        for rep in range(CREEP_REPEATS):
-            S.append(_ramp(f'B2 creep_spin rep{rep + 1}', 'B2_creep_spin', 'steer',
-                           CREEP_STEER_START, CREEP_STEER_END,
-                           CREEP_DURATION, min_clear=wall_margin,
-                           group=f'B2_{rep}', stop_at_wz=spin_max_w))
-            S.append(_brake(f'Brake after B2 rep{rep + 1}'))
-            S.append(_rest(1.5))
+        for rep in range(RAMP_REPEATS):
+            for sgn, way in ((1.0, 'ccw'), (-1.0, 'cw')):
+                tag = f'{way} rep{rep + 1}'
+                S.append(_ramp(f'B2 spin_ramp {tag}', 'B2_spin_ramp', 'steer',
+                               0.0, sgn * snap_rpm(RAMP_END_FRAC * wspin, rpm_step),
+                               RAMP_DURATION,
+                               min_clear=wall_margin, group=f'B2_{rep}_{way}'))
+                S.append(_brake(f'Brake after B2 {tag}'))
+                S.append(_rest(1.0))
 
-    # ── Block 3: 直線短衝 + coast ───────────────────────────────────
+    # ── Block 3: 等速直行 + 急煞 ────────────────────────────────────
     if 3 in blocks:
         k = 0
-        for rep in range(SPRINT_REPEATS):
-            for vt in SPRINT_TARGET_SPEEDS:
+        for rep in range(CRUISE_REPEATS):
+            for frac in CRUISE_LEVELS:
                 lx, ly, lh = launch[k % 2]      # 兩端交替, 兩個方向都取樣
                 k += 1
-                tag = f'v={vt:g} rep{rep + 1}'
+                w = round(snap_rpm(frac * wspin, rpm_step), 3)
+                tag = f'w={w:g} rep{rep + 1}'
+                gid = f'B3_{rep}_{w:g}'
                 S.append(_repos(f'Reposition -> launch (B3 {tag})',
                                 lx, ly, lh, repos_timeout))
-                gid = f'B3_{rep}_{vt:g}'
-                # 加速段: 到達目標車速就結束 (min_useful 給 0.2 是因為在高 mu
-                # 的地面 1.0 m/s 只要 0.35 秒, 那樣短也是完整的資料)
-                S.append(_const(f'B3 sprint_accel {tag}', 'B3_sprint_accel',
-                                SPRINT_THROTTLE, 0.0, SPRINT_ACCEL_TIMEOUT,
-                                min_clear=0.4, min_ahead=1.5, group=gid,
-                                stop_at_speed=vt, min_useful=0.2))
-                S.append(_instant(f'B3 sprint_coast {tag}', 'B3_sprint_coast',
-                                  0.0, 0.0, SPRINT_COAST_DURATION,
-                                  min_clear=0.4, min_ahead=0.8, group=gid,
-                                  min_useful=0.4))
+                S.append(_const(f'B3 cruise {tag}', 'B3_cruise', w, 0.0,
+                                w / WHEEL_ACCEL_LIMIT + CRUISE_HOLD,
+                                min_clear=0.4, min_ahead=1.0, group=gid,
+                                min_useful=1.0, from_rest=True))
+                S.append(_instant(f'B3 brake {tag}', 'B3_brake', 0.0, 0.0,
+                                  BRAKE_DURATION, min_clear=0.0, group=gid))
                 S.append(_brake(f'Brake after B3 {tag}'))
                 S.append(_rest(0.5))
 
-    # ── Block 4: 起步打滑 ───────────────────────────────────────────
+    # ── Block 4: 起步 (輪速階躍) ────────────────────────────────────
     if 4 in blocks:
-        for rep in range(SLIP_REPEATS):
+        for rep in range(LAUNCH_REPEATS):
             lx, ly, lh = launch[rep % 2]
             tag = f'rep{rep + 1}'
+            gid = f'B4_{rep}'
             S.append(_repos(f'Reposition -> launch (B4 {tag})',
                             lx, ly, lh, repos_timeout))
-            gid = f'B4_{rep}'
-            S.append(_instant(f'B4 slip_launch {tag}', 'B4_slip_launch',
-                              SLIP_THROTTLE, 0.0, SLIP_LAUNCH_DURATION,
-                              min_clear=0.4, min_ahead=1.5, group=gid,
-                              stop_at_speed=SLIP_TARGET_SPEED, min_useful=0.2))
-            S.append(_instant(f'B4 slip_coast {tag}', 'B4_slip_coast',
-                              0.0, 0.0, SLIP_COAST_DURATION,
-                              min_clear=0.4, min_ahead=0.8, group=gid,
-                              min_useful=0.4))
+            S.append(_instant(f'B4 launch {tag}', 'B4_launch', wmax, 0.0,
+                              LAUNCH_DURATION, min_clear=0.4, min_ahead=1.0,
+                              group=gid, min_useful=0.3, from_rest=True))
+            S.append(_instant(f'B4 brake {tag}', 'B4_brake', 0.0, 0.0,
+                              BRAKE_DURATION, min_clear=0.0, group=gid))
             S.append(_brake(f'Brake after B4 {tag}'))
             S.append(_rest(0.5))
 
@@ -473,19 +414,47 @@ class ControlCarNode(Node):
         p('pose_sigma_max', 0.5)
         p('repos_sigma_max', 0.10)            # 歸位前要等 sigma 降到這裡
         p('sigma_margin_k', 3.0)              # 牆邊餘裕 += k * sigma
-        # 自旋目標轉速上限 (rad/s)。0 = 依 state_source: sensor 10.0, gt 12.0
+        # ---- 車體 / 馬達 ----
+        p('joint_command_topic', '/joint_command')
+        # 輪速指令上限 (rad/s)。B4 起步的輪速階躍就是跳到這個值, 歸位的車速也由它
+        # 決定。預設 10 = 實體車目前的 max_rpm 100 (10.47); USD 的上限是 200 rpm。
+        # **要比較的兩個環境, 這個值與 spin_wheel_speed 都必須一樣。**
+        p('max_wheel_speed', 10.0)
+        # B1 / B2 自旋與 B3 直行用的輪速 (rad/s), 見檔頭 SPIN_WHEEL_SPEED。分析報
+        # 「馬達飽和」就把它調低。
+        p('spin_wheel_speed', SPIN_WHEEL_SPEED)
+        # 發出去的輪速指令量化成幾 rpm 的整數倍 (實體車的馬達只收整數 rpm)。0 = 不量化。
+        p('command_rpm_step', 1.0)
+        p('wheel_accel_limit', WHEEL_ACCEL_LIMIT)     # rad/s^2
+        p('wheel_radius', WHEEL_RADIUS)
+        # 歸位時把「要轉多快」換成左右輪速差用的等效輪距 (見檔頭 EFFECTIVE_TRACK)。
+        # 只影響閉迴路歸位的收斂速度, 量測段不用它。
+        p('effective_track', EFFECTIVE_TRACK)
+        # IMU 在 base_link 裡的位置 [x, y] (m)。不在旋轉中心的話自旋時會量到向心
+        # 加速度 w^2 * r, 這裡把它從前向加速度裡扣掉 (geofence 的速度積分用)。
+        p('imu_lever_arm', [0.125, -0.0286])
+        # **Isaac 的 IMU 不模擬安裝位置**: 它回報的是車體原點的加速度, 不是 imu_link
+        # 那一點的。2026-10-13 用三輪資料對 ground truth 擬合「IMU 等效位置」都是
+        # (+0.006~0.008, -0.001) m, 不是 USD 裡的 (0.125, -0.0286) —— 模擬裡照實際
+        # 位置去扣, 等於憑空加進 w^2 * 0.125 的假加速度 (1.5 rad/s 自旋 0.28 m/s^2)。
+        # 所以 use_sim_time 開著時預設不補償; 實體車 (use_sim_time:=false) 照常補。
+        # Isaac 哪天改成有模擬了, 把這一項設成 true。
+        p('imu_lever_arm_in_sim', False)
+        # 車體轉速的安全上限 (rad/s), 超過 1.5 倍就中止。0 = 自動: 輪子完全不滑時
+        # 的運動學上限 r * max_wheel_speed / 半輪距 (實際只會到它的一半左右)。
         p('spin_max_w', 0.0)
         p('calib_duration', 2.0)              # 開跑前靜止量零偏的秒數
         # 想只跑其中幾個 block:
         #   ros2 run calibrate_env_pkg calibrate_env_node --ros-args -p blocks:="[1,2]"
         p('blocks', [1, 2, 3, 4])
         p('retry_limit', 1)           # 每個情境被 abort 之後最多重試幾次
-        p('reposition_timeout', 25.0)
-        # 車頭方向相對 base_link 的角度。car.usd 的車頭是車體 -Y (不是 ROS 慣例
-        # 的 +X), 所以是 -90 度。換車或把 USD 裡的車轉正之後要改這裡。
-        p('forward_axis_deg', -90.0)
-        # 中止時估得出來的減速度 (m/s^2)。扭矩上限 a=0.34*10=3.4, 抓地力上限是
-        # mu*g —— 取 3.0 是兩者的保守下界, 用來算 geofence 的煞停距離。
+        # 橫越房間 (5.8 m) + 轉半圈實測 17~22 s, 25 s 只剩不到 4 s 的餘裕
+        p('reposition_timeout', 35.0)
+        # 車頭方向相對 base_link 的角度。kros_car.usd 照 REP-103 (+X 是車頭) 所以是 0;
+        # 舊的 car.usd 車頭是 -Y, 要給 -90。
+        p('forward_axis_deg', 0.0)
+        # 中止時估得出來的減速度 (m/s^2), 用來算 geofence 的煞停距離。輪速指令歸零時
+        # 是 min(扭矩上限 4*2.0/(r*m), 抓地力上限 mu*g) —— 3.0 是兩者的保守下界。
         p('brake_decel', 3.0)
 
         g = self.get_parameter
@@ -507,16 +476,22 @@ class ControlCarNode(Node):
         self.pose_sigma_max = float(g('pose_sigma_max').value)
         self.repos_sigma_max = float(g('repos_sigma_max').value)
         self.sigma_k = float(g('sigma_margin_k').value)
-        # sensor 模式 7.5 -> 10.0。理由是實測而不是猜的: 舊版因為觸發延遲,
-        # 實際 w0 本來就已經衝到 8~10.2 rad/s (還差點碰到 1.5 x 7.5 = 11.25 的
-        # 失控中止門檻), 而那一整輪的定位一致性檢查是 0% 異常、對 GT 的位置誤差
-        # 中位 1.7 cm —— 也就是這個轉速區間實測是穩的, 只是以前是**失控地**穩。
-        # 現在觸發準了, 就明確把上限設在 10.0 (目標 7.6 / 8.55 / 9.5):
-        # coast 越長, 角減速度的擬合誤差越小 (~1/span^1.5), 這是動摩擦解析度的
-        # 主要來源。中止門檻跟著變成 15 rad/s。
-        self.spin_max_w = float(g('spin_max_w').value) or (10.0 if self.sensor else SPIN_MAX_SAFE_W)
+        self.wmax = max(float(g('max_wheel_speed').value), 0.1)
+        self.wspin = min(max(float(g('spin_wheel_speed').value), 0.1), self.wmax)
+        self.rpm_step = max(float(g('command_rpm_step').value), 0.0)
+        self.wheel_acc = max(float(g('wheel_accel_limit').value), 0.1)
+        self.wheel_r = float(g('wheel_radius').value)
+        self.eff_track = float(g('effective_track').value)
+        la = [float(v) for v in g('imu_lever_arm').value] + [0.0, 0.0]
+        if g('use_sim_time').value and not g('imu_lever_arm_in_sim').value:
+            la = [0.0, 0.0]          # Isaac 的 IMU 不模擬安裝位置, 見上面的參數說明
+        # IMU 位置在「車頭方向」上的分量: 自旋時前向加速度會多出 -w^2 * 這個值
+        self.lever_fwd = la[0] * math.cos(self.fwd_off) + la[1] * math.sin(self.fwd_off)
+        self.spin_max_w = float(g('spin_max_w').value) or (
+            self.wheel_r * self.wmax / HALF_TRACK)
 
-        self.effort_pub = self.create_publisher(JointState, '/joint_command', 10)
+        self.cmd_pub = self.create_publisher(
+            JointState, g('joint_command_topic').value, 10)
         self.scenario_pub = self.create_publisher(String, '/test_scenario', 10)
         # phase 是給 collect_data_node 標 CSV 用的: 分析時只取 'measure'。
         self.phase_pub = self.create_publisher(String, '/test_phase', 10)
@@ -527,11 +502,8 @@ class ControlCarNode(Node):
             if gt_topic and gt_topic != odom_topic:
                 self.create_subscription(Odometry, gt_topic, self.on_gt, ODOM_QOS)
 
-        # 50 Hz (舊版 20 Hz)。三個理由:
-        #   1) 觸發延遲 50 ms -> 20 ms, 配合 TRIGGER_LEAD 才能讓 w0 落在目標上
-        #   2) rate limiter 的 effort 階梯 6/20 = 0.3 -> 6/50 = 0.12, B1 spin_up
-        #      起轉 effort 的量化誤差跟著從 5.9% 掉到 2.4% (靜摩擦特徵)
-        #   3) 段落標籤的時間解析度 50 ms -> 20 ms (spinup_time 的起點)
+        # 50 Hz: 段落標籤的時間解析度 20 ms; 實體車 0.3 秒沒收到指令就停,
+        # 這個頻率下掉幾包也不會觸發。
         self.hz = 50.0
         self.dt = 1.0 / self.hz
 
@@ -555,8 +527,6 @@ class ControlCarNode(Node):
         self.gyro_bias = 0.0
         self.acc_ref = None          # 靜止時的 (ax, ay), 扣掉之後就是運動加速度
         self.v_imu = 0.0             # 前向加速度從最近一次靜止開始的積分
-        self.acc_fwd = 0.0           # 低通後的前向加速度 (m/s^2), 觸發提前量用
-        self.wz_rate = 0.0           # 低通後的角加速度 (rad/s^2), 同上
         self._imu_win = deque()      # (stamp, gz, ax, ay) 最近 IMU_WIN 秒
         self.calibrated = not self.sensor
         self._collecting = False
@@ -574,15 +544,16 @@ class ControlCarNode(Node):
         self.gt = None               # (x, y, wz) 只拿來印誤差
         self._gt_err = []
 
-        self.current_efforts = [0.0, 0.0, 0.0, 0.0]
+        self.current_cmd = [0.0, 0.0, 0.0, 0.0]      # 四輪輪速指令 (rad/s)
         self.finished = False
         self.aborted = []
         self.truncated = []      # 踩到圍籬但資料還是留著的段落
 
         self.scenarios = build_scenarios(
             self.room, float(g('reposition_timeout').value),
-            self.wall_margin, blocks, spin_max_w=self.spin_max_w,
-            calib_duration=float(g('calib_duration').value))
+            self.wall_margin, blocks, max_wheel_speed=self.wmax,
+            calib_duration=float(g('calib_duration').value),
+            spin_wheel_speed=self.wspin, rpm_step=self.rpm_step)
         # trial 的原始段落 (重試時整組重放) 與各自的重試次數
         self.trials = {}
         for sc in self.scenarios:
@@ -592,18 +563,26 @@ class ControlCarNode(Node):
         self.idx = 0
         self.start_time = self._now()
         self.scenario_start = self.start_time
+        # use_sim_time 時, /clock 的第一則還沒到之前 _now() 是 0; 到了之後直接跳到
+        # 「模擬已經跑了多久」。逾時如果從 0 起算, Isaac 按 Play 超過 60 秒才啟動這個
+        # 節點就會在第一個週期判定「等了 N 秒狀態還是不齊」直接放棄整份腳本
+        # (2026-10-13 實測: Play 了 1154 s 之後啟動, 0.04 秒就放棄)。
+        # 所以起點等時鐘真的有值之後再定, 見 control_callback。
+        self._clock_anchored = False
         self._repos_state = 'turn_to_bearing'
-        self._i_v = 0.0
         self._i_w = 0.0
 
         est = sum(s['duration'] for s in self.scenarios
                   if s['type'] != 'reposition')
+        spin_ws = [round(snap_rpm(f * self.wspin, self.rpm_step), 3) for f in SPIN_LEVELS]
         self.get_logger().info(
             f'測試腳本: {len(self.scenarios)} 個情境, block {list(blocks)}, '
             f'量測時間約 {est:.0f} s (不含 reposition)\n'
             f'  狀態來源 {self.source}: 位姿 {odom_topic}'
             + (f', 轉速/加速度 {g("imu_topic").value}' if self.sensor else '')
-            + f'; 自旋目標 {spin_targets(self.spin_max_w)} rad/s\n'
+            + f'\n  輪速指令上限 {self.wmax:g} rad/s ({self.wmax * self.wheel_r:.2f} m/s), '
+            f'自旋輪速 {spin_ws} rad/s'
+            + (f' (指令量化成 {self.rpm_step:g} rpm 的整數倍)' if self.rpm_step > 0 else '') + '\n'
             f'  房間 x[{self.room[0]}, {self.room[1]}] y[{self.room[2]}, {self.room[3]}], '
             f'離牆 {self.wall_margin} m (再加上當下速度的煞停距離) 內提前結束情境\n'
             f'  分析時只取 phase == "measure" 的列')
@@ -673,27 +652,19 @@ class ControlCarNode(Node):
         if self._collecting:
             self._calib_buf.append((gz, ax, ay))
 
-        prev_wz = self.wz
         self.wz = gz - self.gyro_bias
-        # 角加速度 (低通): 觸發提前量用。自旋末段 ~25 rad/s^2, 乘上 TRIGGER_LEAD
-        # 就是「現在放開的話, 實際會停在哪個轉速」的修正量。
-        if dt > 0.0:
-            a = (abs(self.wz) - abs(prev_wz)) / dt
-            self.wz_rate += 0.3 * (a - self.wz_rate)
         self._gyro_int += self.wz * dt
         self._gyro_hist.append((st, self._gyro_int))
         while self._gyro_hist and st - self._gyro_hist[0][0] > 3.0:
             self._gyro_hist.popleft()
         if self.acc_ref is not None and dt > 0.0:
-            acc = self._fwd_acc(ax, ay)
-            self.v_imu += acc * dt
-            self.acc_fwd += 0.3 * (acc - self.acc_fwd)
+            self.v_imu += self._fwd_acc(ax, ay, self.wz) * dt
 
         if self.calibrated and self._imu_still():
             self.v_imu = 0.0
-            # 沒在出力時才更新零偏/基準: 出力但卡住不動 (高 mu 的 creep 前段)
+            # 輪速指令是 0 時才更新零偏/基準: 有指令但卡住不動 (高 mu 的 ramp 前段)
             # 也是靜止, 但那時車體可能被扭矩壓得微微傾斜
-            if all(e == 0.0 for e in self.current_efforts):
+            if all(c == 0.0 for c in self.current_cmd):
                 n = len(self._imu_win)
                 self.gyro_bias += 0.02 * (sum(w[1] for w in self._imu_win) / n - self.gyro_bias)
                 mx = sum(w[2] for w in self._imu_win) / n
@@ -765,10 +736,16 @@ class ControlCarNode(Node):
             self.get_logger().error(f'定位失效: {why} —— sigma {self.pose_sigma:.3f} 看不出來')
         self._loc_bad_why = why
 
-    def _fwd_acc(self, ax, ay):
-        """IMU 前向加速度 (扣掉靜止基準)。IMU 裝在車體上、跟 base_link 同向。"""
+    def _fwd_acc(self, ax, ay, wz=0.0):
+        """base_link 原點的前向加速度 (扣掉靜止基準)。IMU 跟 base_link 同向。
+
+        IMU 不在旋轉中心時, 車子一轉它就量到向心加速度 -w^2 * r; 前向分量是
+        -w^2 * lever_fwd, 這裡補回去。不補的話自旋 4 秒 (1.7 rad/s) v_imu 會
+        積出 -1.5 m/s 的假速度, geofence 的煞停距離跟著膨脹。切線項 (角加速度 x r)
+        沒補: 它積分起來是 dw * r, 轉速回到 0 就自己抵消了。"""
         return (math.cos(self.fwd_off) * (ax - self.acc_ref[0])
-                + math.sin(self.fwd_off) * (ay - self.acc_ref[1]))
+                + math.sin(self.fwd_off) * (ay - self.acc_ref[1])
+                + wz * wz * self.lever_fwd)
 
     def _imu_still(self):
         """靜止判定: 最近 IMU_STILL_WINDOW 秒的 gyro 與加速度都沒在動。"""
@@ -813,10 +790,6 @@ class ControlCarNode(Node):
             return self.v_fused
         h = self._heading()
         return self.vel_w[0] * math.cos(h) + self.vel_w[1] * math.sin(h)
-
-    def _trigger_speed(self):
-        """stop_at_speed 用的前向速度。sensor 模式用 IMU 積分: 不吃輪速, 不受打滑影響。"""
-        return self.v_imu if self.sensor else self._fwd_speed()
 
     def _omni_speed(self):
         """geofence 用的全向速率。
@@ -863,9 +836,8 @@ class ControlCarNode(Node):
         """回傳中止原因, 沒問題就回 None。
 
         前方門檻是**動態**的: 靜態餘裕再加上目前速度的煞停距離 v^2/(2a)。
-        固定門檻在這裡沒有用 —— 低 mu 的地面 coast 段還維持著 3.4 m/s, 等到
-        「剩 1 m」才踩煞車已經來不及; 高 mu 的地面則會被過度保守的門檻白白
-        中止掉還有效的資料。"""
+        固定門檻不是太鬆 (高速時來不及煞) 就是太緊 (低速時白白中止掉還有效的
+        資料)。"""
         # 舊版這裡是「沒有 odom 就回 None」= 不檢查、開迴路繼續衝。GT 不會斷所以
         # 沒出過事; 感測器會 (自旋時 LiDAR 追丟、相機被擋), 必須當成違規處理。
         if not self.pose_fresh:
@@ -877,9 +849,8 @@ class ControlCarNode(Node):
         if self.sensor and self._loc_bad_since is not None:
             return f'定位跟 gyro 不一致 ({self._loc_bad_why})'
 
-        # 通用轉速防呆: 不管有沒有設 stop_at_wz, 轉速真的衝到危險區就中止。
-        # stop_at_wz 是主要防線 (在還沒到 spin_max_w 就先放開), 這裡抓的
-        # 是 overshoot 或其他 block 意外飄轉的情況。
+        # 轉速防呆: 輪速是指令給的, 正常不會超過運動學上限; 超過代表車子在
+        # 失控飄轉 (撞到東西、輪子離地) 或 IMU 壞了。
         if abs(self.wz) > 1.5 * self.spin_max_w:
             return f'轉速過快 wz={self.wz:.1f} rad/s, 有失控飄移風險'
 
@@ -913,10 +884,10 @@ class ControlCarNode(Node):
         self.idx = idx
         self.scenario_start = self._now()
         self._repos_state = 'turn_to_bearing'
-        self._i_v = self._i_w = 0.0
+        self._i_w = 0.0
         self._loc_wait_since = None
-        if idx < len(self.scenarios) and self.scenarios[idx].get('stop_at_speed') is not None:
-            # 加速段從靜止開始 (前面是歸位 settle, 已確認停住) -> IMU 速度積分歸零。
+        if idx < len(self.scenarios) and self.scenarios[idx].get('from_rest'):
+            # 這一段從靜止開始 (前面是歸位 settle, 已確認停住) -> IMU 速度積分歸零。
             # 不等靜止偵測自己歸零: settle 剛結束時 0.3 s 的窗還沒安靜下來。
             self.v_imu = 0.0
         name = (self.scenarios[idx]['name'] if idx < len(self.scenarios)
@@ -929,9 +900,8 @@ class ControlCarNode(Node):
         self.aborted.append(sc['name'])
         self.get_logger().warn(f'中止「{sc["name"]}」: {reason}')
 
-        # 同一個 trial 剩下的段落全部丟掉。留著會讓 coast 段在車子已經被煞停之後
-        # 才執行, 記到一整段速度為 0 的假資料 —— 比沒有資料更糟, 因為它看起來
-        # 像是「這個環境摩擦力大到一秒就停」。
+        # 同一個 trial 剩下的段落全部丟掉。留著會讓急煞段在車子已經被煞停之後
+        # 才執行, 記到一整段速度為 0 的假資料 —— 比沒有資料更糟。
         j = self.idx + 1
         while j < len(self.scenarios) and self.scenarios[j].get('group') == gid \
                 and gid is not None:
@@ -942,8 +912,8 @@ class ControlCarNode(Node):
                   _repos(f'Reposition (after abort: {sc["name"]})', *home,
                          float(self.get_parameter('reposition_timeout').value))]
 
-        # 重試是以 **trial** 為單位, 不是以段落為單位: coast 段的初始速度是前面
-        # 那個加速段給的, 單獨重跑一個 coast 只會得到一條全 0 的軌跡。
+        # 重試是以 **trial** 為單位, 不是以段落為單位: 急煞段的初始速度是前面
+        # 那個直行段給的, 單獨重跑一個急煞只會得到一條全 0 的軌跡。
         key = gid if gid is not None else sc['name']
         tries = self._group_retries.get(key, 0)
         if tries < self.retry_limit:
@@ -973,6 +943,11 @@ class ControlCarNode(Node):
     # ═══════════════════════════════════════════════════ MAIN CONTROL LOOP
     def control_callback(self):
         now = self._now()
+        if not self._clock_anchored:
+            if now <= 0.0:
+                return                       # 模擬時鐘還沒來
+            self._clock_anchored = True
+            self.start_time = self.scenario_start = now
         elapsed = now - self.scenario_start
         if self.sensor:
             self._check_loc_consistency()
@@ -996,14 +971,13 @@ class ControlCarNode(Node):
             return
 
         if sc['type'] == 'brake':
-            # 主動煞停: 目標速度 0, 給反向扭矩。放開油門是停不下來的。
+            # 煞停: 輪速指令 0, 馬達的速度環自己出反向扭矩; 這裡只負責判斷停了沒。
             # sensor 模式: 轉速永遠用 gyro (定位斷了也有); 前向速度用融合的,
-            # 融合過期就退回 IMU 積分。兩個都沒有才只能放開等。
+            # 融合過期就退回 IMU 積分。兩個都沒有就只能等固定時間。
             have_w = self.imu_ok if self.sensor else self.pose_fresh
             if not have_w:
                 stopped = elapsed > 1.0
                 dangerous = False
-                efforts = [0.0] * 4
             else:
                 if self.sensor:
                     v = self.v_fused if (self.pose_fresh and self.v_fused is not None) \
@@ -1017,22 +991,17 @@ class ControlCarNode(Node):
                     # 加上 IMU 靜止判定才算真的停了。
                     stopped = stopped and self._imu_still()
                 dangerous = abs(v) > 0.3 or abs(w) > 1.0
-                efforts = self._mix(_clamp(-5.0 * v, -MAX_EFFORT, MAX_EFFORT),
-                                    _clamp(-3.0 * w, -MAX_EFFORT, MAX_EFFORT))
-            self._publish(sc['phase'], sc['name'], efforts, rate_limited=False)
+            self._publish(sc['phase'], sc['name'], [0.0] * 4, rate_limited=False)
             # 固定 duration 是給正常情況 (通常 <1 s 就停) 的下限, 不是上限:
-            # 低 mu 的自轉段煞車前 wz 可能還有 20~30 rad/s, 3 s 常常煞不完,
-            # 若強行到點就切下一段, 車子會帶著這個轉速衝進下一個情境, 造成
-            # 不規則飄移甚至撞牆。改成「沒停就至多再等到 hard_cap」, hard_cap
-            # 只在真的還沒煞停時才會被拉長。
+            # 車子還在滑就切下一段, 下一個情境的初始條件就不是靜止了。
             hard_cap = max(sc['duration'], 12.0) if dangerous else sc['duration']
             if stopped or elapsed > hard_cap:
                 self._enter(self.idx + 1)
             return
 
         if sc['type'] == 'reposition':
-            efforts, done = self._run_reposition(sc, elapsed)
-            self._publish('reposition', sc['name'], efforts, rate_limited=False)
+            cmd, done = self._run_reposition(sc, elapsed)
+            self._publish('reposition', sc['name'], cmd, rate_limited=False)
             if done or elapsed > sc['duration']:
                 if not done:
                     self.get_logger().warn(f'{sc["name"]} 逾時, 直接進下一個情境')
@@ -1043,8 +1012,7 @@ class ControlCarNode(Node):
         bad = self._violation(sc)
         if bad is not None:
             # 已經收到夠長的一段就當「提早收工」: 資料留著, 不重試。
-            # 截斷的 coast-down 還是合法資料; 丟掉再重跑一次只會在同一個地方
-            # 再撞一次 —— run2 有 70% 的時間耗在這個迴圈裡。
+            # 截斷的量測段還是合法資料; 丟掉再重跑一次只會在同一個地方再撞一次。
             need = sc.get('min_useful')
             if need is not None and elapsed >= float(need):
                 self.truncated.append(sc['name'])
@@ -1064,37 +1032,15 @@ class ControlCarNode(Node):
         else:
             throttle, steer = sc['throttle'], sc['steer']
 
-        efforts = self._mix(throttle, steer)
-        self._publish(sc['phase'], sc['name'], efforts,
+        self._publish(sc['phase'], sc['name'], self._mix(throttle, steer),
                       rate_limited=(sc['type'] != 'instant'))
-
-        # 速度觸發的結束條件 (加速段用)。到了目標速度就放開, coast 的進入速度
-        # 因此是**指定的**, 不是被地面摩擦係數決定的。
-        #
-        # 判斷用的是 **TRIGGER_LEAD 秒之後的預測值**, 不是當下值: 從這裡決定放開
-        # 到 Isaac 真的斷油有 ~0.05 s, 加速中的車在這段時間還會再往上衝
-        # (自旋末段 25 rad/s^2 -> +1.2 rad/s)。不補的話目標值形同虛設。
-        # 安全: 預測只在已經到目標 70% 之後才算數, 免得起步瞬間的大加速度誤觸發。
-        vt = sc.get('stop_at_speed')
-        if vt is not None and self.odom_ok:
-            v = self._trigger_speed()
-            if v >= 0.7 * float(vt) and v + max(self.acc_fwd, 0.0) * TRIGGER_LEAD >= float(vt):
-                self._enter(self.idx + 1)
-                return
-
-        wt = sc.get('stop_at_wz')
-        if wt is not None and self.odom_ok:
-            w = abs(self.wz)
-            if w >= 0.7 * float(wt) and w + max(self.wz_rate, 0.0) * TRIGGER_LEAD >= float(wt):
-                self._enter(self.idx + 1)
-                return
 
         if elapsed > sc['duration']:
             self._enter(self.idx + 1)
 
     # -------------------------------------------------- 閉迴路歸位 (非量測)
     def _run_reposition(self, sc, elapsed):
-        """把車開回起跑點並轉到指定朝向。回傳 (efforts, done)。
+        """把車開回起跑點並轉到指定朝向。回傳 (四輪輪速指令, done)。
 
         這一段是**唯一**的閉迴路, 而且標成 phase='reposition' —— 分析時要整段
         丟掉, 否則等於把「控制器補償摩擦力」的行為混進資料裡。
@@ -1150,7 +1096,7 @@ class ControlCarNode(Node):
             err = _wrap_pi(math.atan2(dy, dx) - h)
             if abs(err) < 0.12:
                 self._goto('drive')
-            return self._mix(0.0, self._steer_for(err)), False
+            return self._drive(0.0, self._turn_rate(err)), False
 
         if self._repos_state == 'drive':
             if dist < 0.15:
@@ -1162,28 +1108,23 @@ class ControlCarNode(Node):
                 return [0.0] * 4, False
             # 歸位這一段沒有 geofence (它本來就是要開過房間), 所以速度上限
             # 直接綁在「剩下的距離煞不煞得住」上。
+            # 留 20% 的輪速給轉向修正用。速度直接當指令送, 馬達的速度環自己會追。
             ahead = max(self._ahead_clearance() - 0.6, 0.0)
-            v_cap = min(0.6, math.sqrt(2.0 * self.brake_decel * ahead))
+            v_cap = min(0.6, 0.8 * self.wmax * self.wheel_r,
+                        math.sqrt(2.0 * self.brake_decel * ahead))
             v_des = _clamp(1.2 * dist, -v_cap, v_cap)
-            e = v_des - self._fwd_speed()
-            self._i_v = _clamp(self._i_v + e * self.dt, -3.0, 3.0)
-            thr = _clamp(5.0 * e + 4.0 * self._i_v, -8.0, 8.0)
-            return self._mix(thr, self._steer_for(err, kp=1.2)), False
+            return self._drive(v_des, self._turn_rate(err, kp=1.2)), False
 
         if self._repos_state == 'turn_to_heading':
             err = _wrap_pi(sc['target_heading'] - h)
-            v = self._fwd_speed()
-            # 順手把 drive 段殘餘的線速度煞掉 —— 低 mu 的地面光靠滑行會滑出好幾公尺
-            thr = _clamp(-5.0 * v, -6.0, 6.0)
             if abs(err) < 0.10 and abs(self.wz) < 0.30:
                 self._goto('settle')
                 return [0.0] * 4, False
-            return self._mix(thr, self._steer_for(err)), False
+            # 線速度指令 0 = drive 段殘餘的速度由馬達煞掉
+            return self._drive(0.0, self._turn_rate(err)), False
 
-        # settle: 主動**維持**位置與朝向直到真的靜止, 不是放開 effort 等它自己停。
-        # 放開 effort 在低 mu 的地面會轉過頭 30~40 度 (離線模擬 mu=0.4 實測), 接著
-        # 直線段就朝著側牆發車, 前方餘裕從 8.5 m 掉到 3.4 m, 一發車就被 geofence
-        # 中止 —— Block 4 在 mu<=0.4 時 6 次全滅, 偏偏那正是它最有訊號的區間。
+        # settle: 維持朝向直到真的靜止。朝向跑掉太多就回去重轉 —— 直線段朝著側牆
+        # 發車的話一起步就會被 geofence 中止。
         err = _wrap_pi(sc['target_heading'] - h)
         if dist > 0.5:                       # 被自己的慣性帶離目標點
             self._goto('turn_to_bearing')
@@ -1194,7 +1135,7 @@ class ControlCarNode(Node):
         v = self._fwd_speed()
         if abs(v) < 0.05 and abs(self.wz) < 0.08:
             return [0.0] * 4, True
-        return self._mix(_clamp(-5.0 * v, -6.0, 6.0), self._steer_for(err)), False
+        return self._drive(0.0, self._turn_rate(err)), False
 
     # ------------------------------------------------------ 開跑前靜止校正
     def _run_calibrate(self, sc, now, elapsed):
@@ -1275,50 +1216,49 @@ class ControlCarNode(Node):
 
     def _goto(self, state):
         self._repos_state = state
-        self._i_v = self._i_w = 0.0
+        self._i_w = 0.0
 
-    def _steer_for(self, yaw_err, kp=2.0):
-        """角度誤差 -> steer effort。串級: 角度 -> 目標角速度 -> effort。
+    def _turn_rate(self, yaw_err, kp=2.0):
+        """角度誤差 -> 要下的車體轉速指令 (rad/s)。
 
-        角速度那一層**必須有積分項**。這台車的自轉阻力是 Coulomb 的 (跟轉速無關),
-        純 P 控制在誤差變小時輸出也跟著變小, 到某個點就再也推不動車子 —— 車子
-        卡在死區裡不動, 一路撐到 reposition 逾時。實測 (離線模擬, mu=1.2):
-        沒有積分項時 16 個 reposition 全部逾時, 整份腳本從 4 分鐘變成 10 分鐘。
+        目標轉速 = kp * 誤差; 再加一個小的積分項修正「指令轉速 vs 實際轉速」的
+        落差: 輪速換成車體轉速用的是 effective_track, 它跟地面有關 (輪子滑多少),
+        給得不準時純前饋會一直轉太慢或太快。積分讓收斂不靠它準不準。
         """
-        w_des = _clamp(kp * yaw_err, -1.5, 1.5)
+        w_des = _clamp(kp * yaw_err, -1.2, 1.2)
         e = w_des - self.wz
-        self._i_w = _clamp(self._i_w + e * self.dt, -4.0, 4.0)
-        return _clamp(3.0 * e + 3.0 * self._i_w, -8.0, 8.0)
+        self._i_w = _clamp(self._i_w + e * self.dt, -1.0, 1.0)
+        return w_des + 0.8 * self._i_w
+
+    def _drive(self, v, w):
+        """車體速度 (m/s, rad/s) -> 四輪輪速指令 (rad/s)。閉迴路歸位用。"""
+        half = 0.5 * self.eff_track * w
+        return self._mix(v / self.wheel_r, half / self.wheel_r)
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _mix(throttle, steer):
-        """[FL, FR, RL, RR] = [thr-steer, thr+steer, thr-steer, thr+steer]。
+    def _mix(self, throttle, steer):
+        """[FL, FR, RL, RR] = [thr-steer, thr+steer, thr-steer, thr+steer] (rad/s)。
 
-        超過 MAX_EFFORT 時**等比縮放**而不是各自 clamp。舊版是各自 clamp,
-        結果 (T=1,S=8)/(T=2,S=8)/(T=3,S=8) 全部塌成同一個指令 (-10,+10),
-        矩陣掃描裡有 6/25 格是重複的。等比縮放至少保住 throttle:steer 的比例。
+        steer > 0 = 右輪比較快 = 車體往左轉 (wz > 0)。超過 max_wheel_speed 時
+        **等比縮放**而不是各自 clamp, 保住 throttle:steer 的比例 (各自 clamp 會讓
+        直線速度吃掉轉向, 歸位時車子就轉不過來)。
         """
         left = throttle - steer
         right = throttle + steer
         peak = max(abs(left), abs(right))
-        if peak > MAX_EFFORT:
-            k = MAX_EFFORT / peak
+        if peak > self.wmax:
+            k = self.wmax / peak
             left, right = left * k, right * k
         return [left, right, left, right]
 
-    def _publish(self, phase, name, target_efforts, rate_limited=True):
+    def _publish(self, phase, name, target, rate_limited=True):
         if rate_limited:
             for i in range(4):
-                self.current_efforts[i] = _rate_limit(
-                    target_efforts[i], self.current_efforts[i], RATE_LIMIT, self.dt)
+                self.current_cmd[i] = _rate_limit(
+                    target[i], self.current_cmd[i], self.wheel_acc, self.dt)
         else:
-            self.current_efforts = list(target_efforts)
-
-        msg = JointState()
-        msg.name = list(JOINT_NAMES)
-        msg.effort = [float(e) for e in self.current_efforts]
-        self.effort_pub.publish(msg)
+            self.current_cmd = list(target)
+        self._send_wheels(self.current_cmd)
 
         m = String()
         m.data = name
@@ -1326,6 +1266,25 @@ class ControlCarNode(Node):
         m = String()
         m.data = phase
         self.phase_pub.publish(m)
+
+    def _send_wheels(self, speeds):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = list(JOINT_NAMES)
+        # 量化只做在送出去的值上; current_cmd (斜率限制的狀態) 保持連續, 不然斜率
+        # 小於 1 rpm / 週期的 ramp 會卡在原地爬不上去。
+        msg.velocity = [snap_rpm(v, self.rpm_step) for v in speeds]
+        self.cmd_pub.publish(msg)
+
+    def stop_car(self):
+        """結束前補送幾次輪速 0。Isaac 的 articulation controller 會**一直維持最後
+        一筆指令**, 不送的話車子會照最後的輪速繼續跑 (實體車有 0.3 s 逾時, 沒差)。"""
+        self.current_cmd = [0.0] * 4
+        try:
+            for _ in range(5):
+                self._send_wheels(self.current_cmd)
+        except Exception:        # context 已經關掉了就算了
+            pass
 
 
 def main(args=None):
@@ -1336,6 +1295,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.stop_car()
         node.destroy_node()
         rclpy.try_shutdown()
 

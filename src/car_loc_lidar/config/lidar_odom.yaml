@@ -10,7 +10,7 @@ lidar_odometry:
     base_frame: base_link
     publish_tf: true
 
-    lidar_translation: [0.0, 0.0, 0.20]
+    lidar_translation: [0.045, 0.0, 0.236]    # kros_car.usd; 舊的 car.usd 是 [0, 0, 0.20]
     lidar_rpy_deg: [0.0, 0.0, 0.0]
 
     range_min: 0.05
@@ -55,6 +55,13 @@ lidar_odometry:
     #    10.00 x 6.00 m), 殘差投票不算數。
     scan_stamp: end
     time_order: reverse           # 見 lidar_loc.yaml 的說明
+    # 見 lidar_loc.yaml: Isaac 的一圈是 6 個算繪幀拼的, 不是連續掃, 而且接縫每次
+    # Play 都可能不一樣。**這一端沒有自動校正** (沒有地圖可以對), 建圖時請慢慢開
+    # (轉速 < 0.5 rad/s 時接縫填錯的影響不到 1 cm)。
+    scan_time_model: auto
+    scan_frames: 6
+    scan_seam_deg: 0.0
+    scan_lead_frames: 0.5
 
     publish_scan: true
     # **不要發回 /scan** —— 那是感測器自己的 topic (實體車也一樣), 蓋掉會變成

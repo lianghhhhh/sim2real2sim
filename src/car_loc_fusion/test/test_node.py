@@ -31,16 +31,28 @@ from nav_msgs.msg import Odometry                           # noqa: E402
 from sensor_msgs.msg import Imu, JointState                 # noqa: E402
 
 DT = 1.0 / 60.0
-RADIUS = 0.075
+# 車體參數 (輪半徑、scale、車頭軸) 都從節點自己的設定反推, 不寫死 —— 寫死的話
+# 預設一改 (例如從 car.usd 換成 kros_car.usd) 測試就假 fail。
 WHEELS = ['front_left_joint', 'front_right_joint',
           'rear_left_joint', 'rear_right_joint']
 
 
-def imu_msg(t, a_fwd=0.0, wz=0.0):
+def phi_of(node):
+    """車頭軸 (base_link +X 量到車頭的角度, rad)。"""
+    return node.ekf.ins.phi
+
+
+def along(s, phi):
+    """沿車頭軸走了 s 公尺 (yaw = 0) 的世界座標。"""
+    return (s * math.cos(phi), s * math.sin(phi))
+
+
+def imu_msg(t, a_fwd=0.0, wz=0.0, phi=0.0):
     m = Imu()
     m.header.stamp.sec, m.header.stamp.nanosec = int(t), int((t % 1) * 1e9)
-    # 車頭是 -Y (forward_deg = -90), 所以前進加速度落在 body 的 -y
-    m.linear_acceleration.y = -float(a_fwd)
+    # 前進加速度落在 body 的「車頭軸」上
+    m.linear_acceleration.x = float(a_fwd) * math.cos(phi)
+    m.linear_acceleration.y = float(a_fwd) * math.sin(phi)
     m.linear_acceleration.z = 9.80665
     m.angular_velocity.z = float(wz)
     return m
@@ -94,10 +106,11 @@ def drive(node, dur, v, *, t0=0.0, cam=None, lid=None, cam_delay=0.0,
     """
     n = int(dur / DT)
     pending = []
+    r_eff = node.ekf.ins.scale * float(node.get_parameter('wheel_radius').value)
     for i in range(n):
         t = t0 + i * DT
-        node.on_joint(joint_msg(t, v / (0.93 * RADIUS)))
-        node.on_imu(imu_msg(t, a_fwd=a_fwd))
+        node.on_joint(joint_msg(t, v / r_eff))
+        node.on_imu(imu_msg(t, a_fwd=a_fwd, phi=phi_of(node)))
         for src, spec in (('camera', cam), ('lidar', lid)):
             if spec is None:
                 continue
@@ -128,21 +141,35 @@ def case1():
 
 
 def case2():
-    print('[2] 車頭軸 (forward_deg = -90: car.usd 的車頭是 -Y)')
+    print('[2] 車頭軸 (位置要沿 forward_deg 那一軸走, 不是固定沿 +X)')
     n = make_node()
     drive(n, 1.5, 0.0)
     n.on_abs(odom_msg(1.5, 0.0, 0.0), 'camera')
     drive(n, 3.0, 0.6, t0=1.5)            # 開 3 秒, 只有輪速沒有絕對量測
     x, y = n.ekf.pos
     print(f'     開 3 秒 @0.6 m/s -> ({x:+.3f}, {y:+.3f})')
-    assert y < -1.0 and abs(x) < 0.2, f'應該往 -Y 走, 實際 ({x:.3f}, {y:.3f})'
-    print('     往 -Y 走了 1.7 m —— 軸是對的。給成 0 (REP-103) 的話會往 +X 跑,')
-    print('     而且絕對量測會一直跟它吵架 (car_loc_imu 表 [CC]: 差 45 倍)。')
+    phi = phi_of(n)
+    fwd = x * math.cos(phi) + y * math.sin(phi)
+    lat = -x * math.sin(phi) + y * math.cos(phi)
+    assert fwd > 1.0 and abs(lat) < 0.2, \
+        f'應該沿車頭軸 ({math.degrees(phi):+.0f}°) 走, 實際 ({x:.3f}, {y:.3f})'
+    print(f'     沿車頭軸 ({math.degrees(phi):+.0f}°) 走了 {fwd:.1f} m —— 軸是對的。給錯的話會往')
+    print('     垂直的方向跑, 而且絕對量測會一直跟它吵架 (car_loc_imu 表 [CC]: 差 45 倍)。')
+
+    # 換一個車頭軸再驗一次: 舊的 car.usd 是 -90 (車頭 -Y)
+    n = make_node(forward_deg=-90.0)
+    drive(n, 1.5, 0.0)
+    n.on_abs(odom_msg(1.5, 0.0, 0.0), 'camera')
+    drive(n, 3.0, 0.6, t0=1.5)
+    x, y = n.ekf.pos
+    assert y < -1.0 and abs(x) < 0.2, f'forward_deg=-90 應該往 -Y 走, 實際 ({x:.3f}, {y:.3f})'
+    print(f'     forward_deg:=-90 -> ({x:+.3f}, {y:+.3f}), 往 -Y —— 參數有接上。')
 
 
 def case3():
     print('[3] 延遲的絕對量測: 時戳是過去的, 不可以當成現在')
-    truth = lambda t: (0.0, -0.6 * max(t - 1.5, 0.0))
+    phi = phi_of(make_node())
+    truth = lambda t: along(0.6 * max(t - 1.5, 0.0), phi)
     for rewind, tag in ((True, '倒帶'), (False, '不倒帶')):
         n = make_node(rewind=rewind)
         drive(n, 1.5, 0.0)
@@ -162,12 +189,13 @@ def case4():
     def truth(t):
         # 掉線那 10 秒車子實際上比輪速說的快 10% (輪徑尺度誤差 / 打滑) ——
         # 航位推算沒有絕對參考, 這種系統性誤差只會一路累積下去。
-        y = -0.6 * max(min(t, 4.5) - 1.5, 0.0)
-        y -= 0.66 * max(min(t, 14.5) - 4.5, 0.0)
-        y -= 0.6 * max(t - 14.5, 0.0)
-        return (0.0, y)
+        s = 0.6 * max(min(t, 4.5) - 1.5, 0.0)
+        s += 0.66 * max(min(t, 14.5) - 4.5, 0.0)
+        s += 0.6 * max(t - 14.5, 0.0)
+        return along(s, phi)
 
     n = make_node()
+    phi = phi_of(n)
     drive(n, 1.5, 0.0)
     n.on_abs(odom_msg(1.5, 0.0, 0.0), 'camera')
     drive(n, 3.0, 0.6, t0=1.5, cam=(30.0, 0.0), truth=truth)

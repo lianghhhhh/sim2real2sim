@@ -38,6 +38,8 @@ def main():
     finally:
         executor.shutdown()
         spin_thread.join(timeout=2.0)
+        # Isaac 會一直維持最後一筆輪速指令 -> 收尾前一定要補送 0
+        control_car_node.stop_car()
         collect_data_node.destroy_node()
         control_car_node.destroy_node()
         if rclpy.ok():

@@ -24,6 +24,7 @@ Isaac Sim `car.usd` 場景的車輛定位。五種方法各自一個 package, �
 > 報告:
 > * 五種方法的實作細節與離線 bench 比較: **[report_5methods.md](report_5methods.md)**
 > * Isaac 上一次全開的實測 (誤差大小、隨時間的變化): **[report_all_sensors.md](report_all_sensors.md)**
+> * IMU 雜訊模型與校正 (含 Isaac 的 IMU 跟真車差多少): **[report_imu_noise.md](report_imu_noise.md)**
 
 ---
 
@@ -316,6 +317,122 @@ ros2 launch car_loc_imu imu_loc.launch.py use_sim_time:=false \
 
 舊的定位 package (`car_localization`、`car_inference`、`car_navigation` 等) 已經在
 commit `b029732` 刪掉, 要翻舊程式就 `git show 7c984df:src/<package>/...`。
+
+---
+
+## kros_car.usd (實體車的模型, 2026-10 新增)
+
+`kros_car.usd` 是實體車 (KROS car) 的模型, 由 `kros_car_description/urdf/kros_car.urdf`
+匯入。房間、俯視相機跟 `car.usd` 完全一樣, 所以 `src/car_loc_lidar/maps/room.yaml` 可以沿用。
+實體車那邊的程式與介面在 `~/kros_car/kros_car_new` (見它的 README)。
+
+**程式的預設值已經是這台車的 (2026-10-12)**: 車頭軸、輪半徑、雷射外參、IMU 位置、
+輪速控制。上面各節的**操作流程**還適用, 但裡面提到的 effort / 扭矩控制、`car.usd` 的
+數字 (車頭 -Y、輪半徑 0.075、自旋 8 rad/s ...) 都是舊車的。要回去跑舊的 `car.usd`
+就照下面「參數對照」那張表把值給回去 —— 但 `control_car_node` / `cmd_vel_bridge`
+現在只會送輪速, 舊車 (只收 effort) 開不動。
+
+### 結構
+
+| prim | 內容 |
+| --- | --- |
+| `/kros_car/base_link` | articulation root, 車體。**+X 是車頭 (手臂那側)、+Y 朝左**, 照 REP-103 |
+| `/kros_car/base_link/laser_frame/kros_car_oradar_ms200` | MS200, 在 base_link 的 (+0.045, 0, 0.236) |
+| `/kros_car/base_link/imu_link/Imu_Sensor_02` | IMU, 在 base_link 的 (+0.125, -0.0286, 0.110) |
+| `/kros_car/base_link/ActionGraph_lidar` | `/scan` + `/clock` |
+| `/kros_car/base_link/ActionGraph_imu` | `/imu` |
+| `/kros_car/ActionGraph_odom` | `/odom` (ground truth)、`/joint_states`、`/joint_command` |
+| `/kros_car/joints/{front,rear}_{left,right}_joint` | 輪子。正值往前; 速度驅動, 最大力矩 2.0 N·m、最高 200 rpm |
+
+車體在 base_link 原點時輪子最低點是 z = -0.0416, 所以 `/kros_car` 要放在 z = 0.0416 才剛好貼地。
+
+`scripts/setup_oradar_lidar.py` 的預設已經指到這份 USD 與上面的 prim。
+
+### 參數對照 (預設值已經是右邊那一欄)
+
+| 項目 | `car.usd` (舊) | `kros_car.usd` (現在的預設) | 在哪裡 |
+| --- | --- | --- | --- |
+| 車頭相對 base_link +X | -90 度 (車頭是 -Y) | 0 | `forward_deg`: `imu_loc.yaml`、`wheel_loc.yaml`、`fusion_loc.yaml` 與各自的 launch; `forward_axis_deg`: `control_car_node`、`tour_drive.py`、`estimate_friction.py` |
+| 相機那條的 yaw 補償 | 90 度 | 0 | `yaw_offset_deg`: `car_loc_camera/config/camera_loc.yaml` |
+| 輪半徑 | 0.075 | 0.05035 | `wheel_radius`: `wheel_loc.yaml`、`fusion_loc.yaml`、`cmd_vel_bridge`、`control_car_node` |
+| 有效輪半徑比例 | 0.93 (effort 控制下量的) | 1.0 (2026-10-12 實跑量到 1.0005) | `wheel_scale`: `wheel_loc.yaml`、`fusion_loc.yaml` |
+| 輪距 | 0.25 | 幾何 0.27, 轉向用的等效輪距 0.95 (實跑 0.945 / 1.055) | `effective_track`: `cmd_vel_bridge`、`control_car_node` |
+| 雷射外參 | (0, 0, 0.20) | (0.045, 0, 0.236) | `lidar_translation`: `lidar_loc.yaml`、`lidar_odom.yaml`; static TF: 四個 launch 的 `lidar_x` / `lidar_z` |
+| IMU 位置 | 旋轉中心 (0.6 mm) | (0.125, -0.0286), 離中心 12.8 cm | `imu_lever_arm`: `imu_loc.yaml`、`wheel_loc.yaml`、`fusion_loc.yaml`、`control_car_node` (節點會把加速度換算回 base_link 原點) |
+| 控制介面 | `/joint_command` 的 `effort` | `/joint_command` 的 `velocity` (rad/s) | `control_car_node`、`cmd_vel_bridge` |
+| 輪速上限 | — | 10 rad/s (= 實體車 max_rpm 100; USD 是 20.94) | `max_wheel_speed`: `control_car_node`、`cmd_vel_bridge`、`friction_test.launch.py` |
+| 摩擦力測試的自旋輪速 | 8 rad/s | 6 rad/s, 指令量化成整數 rpm | `spin_wheel_speed`、`command_rpm_step`: `control_car_node`、`friction_test.launch.py` |
+| 相機量到的點 | 車體中心 | bbox 中心在 base_link **前方 1.5 cm** (車頭有手臂) | `body_offset`: `camera_ground.yaml`; `camera_offset`: `fusion_loc.yaml` (兩個要一樣, 校正腳本會一起寫) |
+| 雷射一圈的時間模型 | 線性 reverse/end | Isaac 是 6 個算繪幀拼的階梯; 哪個扇區最新 (接縫) **每次按 Play 都可能不同**, 定位節點開機後在轉彎的掃描上自己校正 | `scan_time_model: auto`、`auto_scan_seam`、`scan_frames`、`scan_seam_deg`、`scan_lead_frames`: `lidar_loc.yaml`、`lidar_odom.yaml` (`use_sim_time:=false` 時自動用線性) |
+| IMU 槓桿臂補償 | 不需要 (IMU 在中心) | 實體車要補 (0.125, -0.0286); **Isaac 的 IMU 不模擬安裝位置, 模擬裡自動不補** | `imu_lever_arm`、`imu_lever_arm_in_sim`: `imu_loc.yaml`、`wheel_loc.yaml`、`fusion_loc.yaml`、`control_car_node` |
+
+**還沒處理的**:
+
+* **車重。** `base_link` 的 `physics:mass` 目前是 5.0 kg (整車 12.5 kg), 那是為了讓車子轉得動
+  先填的假設值, 要秤實車: 質量 = 整車重 - 7.51 kg, 慣量 = (0.1556, 0.2975, 0.3868) x 質量 / 37.56。
+  自旋扭矩正比於「mu x 車重」, 車重錯多少, 校正出來的 mu 就反向錯多少。
+* **`kros_car_05_sim.usd` / `kros_car_10_real.usd` 不存在** (`run_car.sh` 的預設輸入), 要從
+  `kros_car.usd` 另存兩份、各自改地面摩擦。
+* **相機的 yaw 在原地轉時是錯的** (速度方向推的, 車體沒位移就停在舊值; 低速時誤差中位
+  53~105 度)。要換 OBB 定向框模型才解得了; 融合不吃這個 yaw, 不受影響。
+* **相機的單應性只做了局部修正** (比例 + 平移 + body_offset)。要整個重擬得先繞場錄一份
+  涵蓋整個房間的資料 (`scripts/tour_drive.py`), 再跑
+  `scripts/calibrate_camera_ground.py <CSV> --model homography --write`。
+* **純 IMU / IMU+輪速這兩條在摩擦力測試裡本來就不準** (2026-10-13 全開那一輪, 走 47 m):
+  IMU+輪速 中位 37~45 cm —— 原地轉時車體會平移 10~15 cm, 輪速看不到 (左右輪速相反,
+  平均是 0); 純 IMU 中位 0.5 m、最後 25 m —— 輪速控制下等速直行時加速度與角速度都是 0,
+  IMU 分不出「等速」跟「靜止」, 靜止偵測會誤判並把速度歸零 (實體車行進時有振動, 不會
+  這麼嚴重)。這兩條只是對照組, 控制與分析用的是融合 (中位 0.9~1.1 cm)。
+* 原因不明、先擱著的: 原地自旋時車體轉速忽快忽慢並且會平移 (4 秒 10~15 cm); 靜止時以
+  約 0.75 mm/s 爬行。兩個都不影響摩擦力的主特徵。
+
+2026-10-13 在這台車上量過的三件事, 換硬體 / 換設定時要重量:
+
+```bash
+# 雷射一圈裡每個方位角是什麼時候打的 (只有模擬能量; 量到的是這一次 Play 的值,
+# 拿來對照定位節點 log 裡「掃描接縫校正完成 ... 用 X°」選得對不對)
+docker exec ros2_node bash -lc 'r && python3 /workspaces/scripts/check_scan_timing.py --spin'
+# 相機的 bbox 中心偏移 + 比例 (先不加 --write 看數字)
+python3 scripts/calibrate_camera_ground.py car_run_data/sim_data.csv --write
+# 地圖原點對 ground truth
+./scripts/calibrate_map_origin.py car_run_data/sim_data.csv --rotation yaw --write
+```
+
+### 控制方式與摩擦力校正
+
+`/joint_command` 的 `velocity` 放四輪的 rad/s, 跟實體車的 `wheel_velocity_controller` 同一種訊息。
+**指令要持續送**: 實體車 0.3 秒沒收到就停, Isaac 則會一直維持最後一筆 (所以節點結束前會補送 0)。
+
+輪速控制下沒有「斷油滑行」, 舊的摩擦力特徵 (coast-down 的減速度、起轉 effort) 不存在。
+現在的主特徵是**等速原地轉時的輪子扭矩** (正比於 mu), 細節見
+[control_car_node.py](src/calibrate_env_pkg/calibrate_env_pkg/control_car_node.py) 與
+[scripts/estimate_friction.py](scripts/estimate_friction.py) 的檔頭。`run_car.sh` 預設用
+`kros_car_05_sim.usd` / `kros_car_10_real.usd`。
+
+**前提是馬達扭矩沒有飽和**, 而馬達出得了的扭矩隨轉速下降 (USD 的輪子關節現在有
+DDSM115 的扭矩-轉速曲線: 堵轉 2.0 N·m, 115 rpm 剩 0.96, 200 rpm 是 0)。所以自旋用比較低的
+輪速 (`spin_wheel_speed`, 預設 6 rad/s), 分析時飽和的那幾檔輪速會被拿掉 (兩邊拿掉同樣的)。
+無頭 PhysX 直接跑同一套指令的結果 (2026-10-13, 整車 12.5 kg, 輪子材質 0.5):
+
+| 地面 mu | 自旋輪速 (rad/s) | 自旋的輪子扭矩 | 結果 |
+| --- | --- | --- | --- |
+| 0.5 | 2.4 / 4.2 / 6.0 | 0.566 / 0.587 / 0.593 N·m | 都沒飽和 |
+| 1.0 | 2.4 / 4.2 / 6.0 | 0.853 / 0.889 / 0.943 | 最高檔飽和 -> 用前兩檔, 比值 1.50 (真值 1.50), 估出地面 1.00 |
+| 1.0 | 4 / 7 / 10 | 0.881 / 0.923 / 0.969 | 後兩檔飽和 -> 只剩一檔, 比值 1.51 |
+
+(舊的 45 kg 車重在地面 0.5 就轉不動 —— 自旋扭矩正比於車重, 車重要用實際值。)
+
+**實體車的扭矩回授含馬達自己的損耗** (電流 x 扭矩常數; 規格書額定點 1.5 A x 0.75 = 1.13 N·m,
+軸輸出 0.96)。B3 的等速直行就是量它的, 分析時會擬合 `loss(w) = c0 + c1*w` 從自旋扭矩裡
+扣掉。用假資料驗過: 在模擬資料上加 0.12 + 0.008*w 的損耗, 擬合出 0.116 + 0.0083*w,
+比值 1.01 (不扣是 1.28)。模擬自己的損耗是 0, 扣不扣沒差。
+
+實體車收資料時 topic 不一樣 (`spin_wheel_speed` / `max_wheel_speed` 要跟模擬那一輪相同):
+
+```bash
+ros2 launch bringup_pkg friction_test.launch.py use_sim_time:=false \
+    wheel_feedback_topic:=/wheel_feedback imu_topic:=/imu/data csv_filename:=real.csv
+```
 
 ---
 

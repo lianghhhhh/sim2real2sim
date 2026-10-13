@@ -125,6 +125,49 @@ def quat_to_yaw(q) -> float:
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+class LeverArm:
+    """把不在旋轉中心的 IMU 量到的加速度, 換算回 base_link 原點的加速度。
+
+    IMU 裝在車體上的 r = (rx, ry) (base_link 座標, m), 車體以 w 轉、角加速度 dw/dt:
+
+        a_imu = a_base + (dw/dt) x r + w x (w x r)
+              = a_base + (dw/dt) * (-ry, rx) - w^2 * (rx, ry)        (平面運動)
+
+    所以  a_base = a_imu + w^2 * (rx, ry) + (dw/dt) * (ry, -rx)。
+
+    不補的後果 (kros_car.usd, r = 12.8 cm): 1.7 rad/s 的原地轉就多出 0.39 m/s^2
+    的假加速度 —— 慣性導航會把它積成速度, 「原地自旋」偵測 (水平加速度要接近 0)
+    也會失效。舊的 car.usd IMU 就在旋轉中心 (0.6 mm), 所以以前不需要。
+
+    dw/dt 用相鄰兩筆 gyro 直接差分, 不濾波: 差分的雜訊積分回去剛好是 gyro 自己的
+    雜訊乘上 r (0.005 rad/s x 0.128 m = 0.6 mm/s), 可以忽略; 濾波反而會帶進相位
+    落後。只處理平面運動 (yaw), roll / pitch 的角速度不管。
+    """
+
+    def __init__(self, xy=(0.0, 0.0)):
+        xy = list(xy) + [0.0, 0.0]
+        self.rx, self.ry = float(xy[0]), float(xy[1])
+        self.enabled = abs(self.rx) + abs(self.ry) > 1e-9
+        self._t = None
+        self._w = 0.0
+
+    def to_base(self, t: float, acc, omega_z: float) -> np.ndarray:
+        """acc: IMU 量到的加速度 (3 軸, 車體座標); 回傳換算到 base_link 原點的。"""
+        a = np.array(acc, dtype=np.float64)
+        if not self.enabled:
+            return a
+        w = float(omega_z)
+        alpha = 0.0
+        if self._t is not None:
+            dt = t - self._t
+            if 0.0 < dt < 0.1:               # 亂序 / 掉包太久 -> 這一步不算切線項
+                alpha = (w - self._w) / dt
+        self._t, self._w = t, w
+        a[0] += w * w * self.rx + alpha * self.ry
+        a[1] += w * w * self.ry - alpha * self.rx
+        return a
+
+
 class StillDetector:
     """靜止偵測 —— ZUPT / ZARU 的觸發條件, 也是整個抗漂移的核心。
 

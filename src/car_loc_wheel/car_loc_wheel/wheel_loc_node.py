@@ -59,7 +59,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, JointState
 from std_srvs.srv import Trigger
 
-from .wheel_ins import (G, WHEELS, TiltTracker, WheelIns, WheelReader,
+from .wheel_ins import (G, LeverArm, WHEELS, TiltTracker, WheelIns, WheelReader,
                         WheelStillDetector, quat_to_matrix, quat_to_yaw)
 
 SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -86,7 +86,7 @@ class WheelLocalizer(Node):
 
         # --- 車體 -----------------------------------------------------------------
         p('wheel_names', list(WHEELS))
-        p('wheel_radius', 0.075)      # car.usd: cylinder radius 0.5 * scale 0.15
+        p('wheel_radius', 0.05035)    # kros_car.usd: 輪子碰撞圓柱的半徑
         # v_true = wheel_scale * wheel_radius * omega。
         # 尺度誤差是**系統性**的 (走 100 m 就是幾公尺, 停車不會讓它消失)。
         # 它**跟牽引狀態有關, 不是幾何常數**: 有扭矩時輪胎一定有縱向滑移, 輪子
@@ -97,11 +97,19 @@ class WheelLocalizer(Node):
         # 端到端 (214 秒那一輪): 1.0 -> RMS 0.74, 0.93 -> 0.68。
         # 要自己校就錄一段**正常開的直線** (不是滑行、不是自旋):
         #   python3 test/replay_bag.py <bag> --measure
-        p('wheel_scale', 0.93)
-        # base_link 的 +X 量到車頭的角度 (度)。REP-103 的車是 0, 但 car.usd 的
-        # base_link 是 **+X 朝左、車頭 -Y**, 所以是 -90。從 sim_data.csv 量到
-        # atan2(dy, dx) - gt_yaw 的中位數 = -90.0° (n=1718)。
-        p('forward_deg', -90.0)
+        p('wheel_scale', 1.0)         # kros_car 還沒量過, 見 config/wheel_loc.yaml
+        # base_link 的 +X 量到車頭的角度 (度)。kros_car.usd 照 REP-103 是 0;
+        # 舊的 car.usd 是 **+X 朝左、車頭 -Y**, 那台要給 -90。
+        p('forward_deg', 0.0)
+        # IMU 在 base_link 裡的位置 [x, y] (m), 見 wheel_ins.LeverArm
+        p('imu_lever_arm', [0.125, -0.0286])
+        # **Isaac 的 IMU 不模擬安裝位置**: 它回報的是車體原點的加速度, 不是 imu_link
+        # 那一點的。2026-10-13 用三輪資料對 ground truth 擬合「IMU 等效位置」都是
+        # (+0.006~0.008, -0.001) m, 不是 USD 裡的 (0.125, -0.0286) —— 模擬裡照實際
+        # 位置去扣, 等於憑空加進 w^2 * 0.125 的假加速度 (1.5 rad/s 自旋 0.28 m/s^2)。
+        # 所以 use_sim_time 開著時預設不補償; 實體車 (use_sim_time:=false) 照常補。
+        # Isaac 哪天改成有模擬了, 把這一項設成 true。
+        p('imu_lever_arm_in_sim', False)
 
         # --- 重力 / yaw 的來源 (跟 car_loc_imu 同一套) -----------------------------
         p('gravity_mode', 'orientation')   # orientation | complementary | none
@@ -198,6 +206,7 @@ class WheelLocalizer(Node):
                                       gyro_th=float(g('still_gyro').value),
                                       window=float(g('still_window').value))
         self.tilt = TiltTracker(alpha=float(g('tilt_alpha').value))
+        self.lever = LeverArm(self._lever_arm())
 
         self.initial_pose = list(g('initial_pose').value)
         self.started = False
@@ -245,6 +254,17 @@ class WheelLocalizer(Node):
             self.get_logger().warn(
                 'enable_wheel:=false —— 這樣就退化成純 IMU 了 (誤差回到 t^2)。'
                 '這個模式是拿來做 A/B 的, 不是拿來用的。')
+
+    def _lever_arm(self):
+        """要補償的 IMU 槓桿臂 [x, y]; 模擬裡預設是 0 (見 imu_lever_arm_in_sim)。"""
+        g = self.get_parameter
+        try:
+            sim = bool(g('use_sim_time').value)
+        except Exception:          # 離線測試的假節點沒有這個參數
+            sim = False
+        if sim and not bool(g('imu_lever_arm_in_sim').value):
+            return [0.0, 0.0]
+        return [float(v) for v in g('imu_lever_arm').value]
 
     # ------------------------------------------------------------------
     def _make_ins(self) -> WheelIns:
@@ -339,11 +359,18 @@ class WheelLocalizer(Node):
                          msg.angular_velocity.z])
         acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y,
                         msg.linear_acceleration.z])
+        # IMU 不在旋轉中心 -> 先換算回 base_link 原點, 後面全部用換算過的
+        acc = self.lever.to_base(t, acc, float(gyro[2]))
         self.last_gyro = gyro
         dt = None if self.last_t is None else t - self.last_t
         self.last_t = t
 
-        still = self.det.is_still()
+        # 偵測器只在收到 /joint_states 時更新。輪速停掉的話它會一直回報最後的狀態,
+        # 而那個狀態如果是「靜止」, ZUPT 與位置錨定會把車子釘在原地。
+        # 輪速不新鮮就當作「不知道」= 不靜止。
+        # (這一行**不是** 2026-10-13 run_car.sh 的 sim 輪「融合在開頭 15 秒停在起點」
+        #  的解法: 加了之後 16:42 那一輪照樣發生。那個問題的原因還沒找到。)
+        still = self.det.is_still() and (t - self.t_wheel) <= self.wheel_timeout
         self.n_still += int(still)
 
         a_fwd = self._forward_accel(msg, gyro, acc, dt, still)

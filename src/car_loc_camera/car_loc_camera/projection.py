@@ -84,6 +84,12 @@ class GroundProjection:
                          half_len=float(a.get('half_len', 0.21)),
                          half_wid=float(a.get('half_wid', 0.14)))
         self.cam_xy = np.asarray(a.get('cam_xy', [0.0, 0.0]), dtype=np.float64)
+        # bbox 中心在 base_link 裡的位置 [x, y] (m): 投影出來的是
+        #     p_base + R(yaw) @ body_offset
+        # 這裡**只讀不扣** —— 扣它需要可信的 yaw, 而相機自己的 yaw 是速度方向推的
+        # (原地轉時是舊值)。留給有 yaw 的下游 (融合節點的 camera_offset)。
+        self.body_offset = np.asarray(cfg.get('body_offset', [0.0, 0.0]),
+                                      dtype=np.float64).reshape(2)
         # 校正腳本自己報的殘差 (m)。節點拿它當量測雜訊 R 的預設值 ——
         # 「這個模型有多準」本來就該由校正檔自己說, 不該在節點裡另外猜一個。
         self.sigma = float(cfg.get('residual_rms', 0.075))

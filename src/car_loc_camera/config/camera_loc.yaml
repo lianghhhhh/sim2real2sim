@@ -49,19 +49,23 @@ camera_localizer:
 
     # 朝向: 從速度方向推。低於 yaw_min_speed 就維持上一個值。
     # allow_reverse 見 tracker._update_yaw 的說明 —— 預設關著是刻意的。
+    # !! kros_car (skid-steer) **原地轉的時候這個 yaw 是錯的** —— 車體沒有位移,
+    #    速度低於門檻, yaw 就停在轉之前的值。2026-10-13 的摩擦力測試 (一半時間在
+    #    原地轉) 量到: 車速 > 0.3 m/s 時誤差中位 2.5 度, 低於 0.15 m/s 時 53~105 度。
+    #    這不是調門檻能解的: 單一個軸對齊的框沒有朝向資訊, 要換 OBB 定向框模型
+    #    (重新標注 + 重新訓練)。發出去的共變異數在低速時會放到 90 度, 下游看得到;
+    #    融合節點本來就不吃這個 yaw (camera_use_yaw: false)。
     yaw_min_speed: 0.15
     yaw_init_speed: 0.30
     allow_reverse: false
 
     # base_link 的 x 軸領先行進方向多少度。濾波器只看得到行進方向, 這一項把它
     # 轉成 base_frame 真正的朝向。
-    # car.usd 量出來是 +90 度 —— GT 的行進方向減 gt_yaw 是 -90.00 度,
-    # IQR [-90, -90] (n=508, car_run_data/sim_data.csv), 也就是這台車
-    # base_link 的前方是 -y 不是 x。
-    # 之前是 0 (等於假設 x 就是前方), 所以發出去的 map->base_link 整個轉了
-    # 90 度, twist 也把前進速度掛到錯的軸 —— 位置準到 2 cm 也一樣不能用。
-    # 換車 / 改 USD 的軸向就要重量。
-    yaw_offset_deg: 90.0
+    # kros_car.usd 照 REP-103 (base_link 的 +X 就是車頭), 所以是 0。
+    # 舊的 car.usd 量出來是 +90 度 (base_link 的前方是 -y 不是 x)。
+    # 給錯的話發出去的 map->base_link 整個轉 90 度, twist 也把前進速度掛到錯的
+    # 軸 —— 位置準到 2 cm 也一樣不能用。換車 / 改 USD 的軸向就要重量。
+    yaw_offset_deg: 0.0
 
     lost_after: 1.0
     reset_after: 3.0

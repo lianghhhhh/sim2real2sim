@@ -50,8 +50,8 @@ ISAAC = os.environ.get('ISAAC_SIM_PATH', os.path.expanduser('~/isaac-sim'))
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
-LIDAR_PRIM = '/World/small_car/Cube/oradar_ms200'
-GRAPH_PRIM = '/World/small_car/Cube/ActionGraph_lidar'
+LIDAR_PRIM = '/kros_car/base_link/laser_frame/kros_car_oradar_ms200'
+GRAPH_PRIM = '/kros_car/base_link/ActionGraph_lidar'
 PROFILE = os.path.join(REPO, 'src/car_loc_lidar/config/oradar_ms200.json')
 
 WORKER = r'''
@@ -283,7 +283,7 @@ else:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--usd', default=os.path.join(REPO, 'car.usd'))
+    ap.add_argument('--usd', default=os.path.join(REPO, 'kros_car.usd'))
     ap.add_argument('--profile', default=PROFILE)
     ap.add_argument('--publish', default='laser_scan',
                     choices=['laser_scan', 'point_cloud', 'both'],
@@ -293,6 +293,9 @@ def main():
                     help='感測器的目標世界高度 (m); keep = 不動')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
+    # worker 是在 ISAAC 目錄底下跑的 (cwd=ISAAC), 相對路徑到那邊會找不到檔案
+    args.usd = os.path.abspath(args.usd)
+    args.profile = os.path.abspath(args.profile)
 
     usdlib = glob.glob(os.path.join(ISAAC, 'extscache', 'omni.usd.libs-*'))
     if not usdlib:

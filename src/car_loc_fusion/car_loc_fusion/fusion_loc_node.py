@@ -46,7 +46,7 @@ from sensor_msgs.msg import Imu, JointState
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
-from car_loc_wheel.wheel_ins import (G, WHEELS, TiltTracker, WheelReader,
+from car_loc_wheel.wheel_ins import (G, LeverArm, WHEELS, TiltTracker, WheelReader,
                                      WheelStillDetector, quat_to_matrix,
                                      quat_to_yaw)
 
@@ -80,9 +80,18 @@ class FusionLocalizer(Node):
 
         # --- 車體 (跟 car_loc_wheel 同一組, 值也要一樣) ----------------------
         p('wheel_names', list(WHEELS))
-        p('wheel_radius', 0.075)
-        p('wheel_scale', 0.93)
-        p('forward_deg', -90.0)          # car.usd 的車頭是 -Y, 不是 REP-103 的 +X
+        p('wheel_radius', 0.05035)       # kros_car.usd
+        p('wheel_scale', 1.0)
+        p('forward_deg', 0.0)            # kros_car 照 REP-103; 舊的 car.usd 是 -90
+        # IMU 在 base_link 裡的位置 [x, y] (m), 見 car_loc_wheel 的 LeverArm
+        p('imu_lever_arm', [0.125, -0.0286])
+        # **Isaac 的 IMU 不模擬安裝位置**: 它回報的是車體原點的加速度, 不是 imu_link
+        # 那一點的。2026-10-13 用三輪資料對 ground truth 擬合「IMU 等效位置」都是
+        # (+0.006~0.008, -0.001) m, 不是 USD 裡的 (0.125, -0.0286) —— 模擬裡照實際
+        # 位置去扣, 等於憑空加進 w^2 * 0.125 的假加速度 (1.5 rad/s 自旋 0.28 m/s^2)。
+        # 所以 use_sim_time 開著時預設不補償; 實體車 (use_sim_time:=false) 照常補。
+        # Isaac 哪天改成有模擬了, 把這一項設成 true。
+        p('imu_lever_arm_in_sim', False)
 
         p('gravity_mode', 'orientation')   # orientation | complementary | none
         p('yaw_source', 'imu_orientation')  # imu_orientation | gyro
@@ -146,6 +155,10 @@ class FusionLocalizer(Node):
         p('camera_min_dt', 0.0)          # 0 = 不限流 (量出來限流反而更差, 見 README [G])
         p('camera_use_yaw', False)       # 相機的 yaw 是速度方向推的, 15~22 度
         p('camera_timeout', 0.5)
+        # 相機量到的那一點 (bbox 中心) 在 base_link 裡的位置 [x, y] (m)。
+        # 由 scripts/calibrate_camera_ground.py 量, 要跟 camera_ground.yaml 的
+        # body_offset 一致 (腳本會兩邊一起寫)。見 fusion_ekf.AbsMeas。
+        p('camera_offset', [0.0, 0.0])
         # 時戳跟濾波器差超過這麼多就認定是**時鐘基準差**, 量一次鎖定並扣掉。
         # 2026-09-10 那一輪實測 /rgb 比 /imu 早 **625.55 秒** (std 10 ms)。
         # 這個功能只救得回「不要壞掉」, 救不回精度 —— 時鐘一偏, 真正的延遲就
@@ -208,6 +221,9 @@ class FusionLocalizer(Node):
                                       gyro_th=float(g('still_gyro').value),
                                       window=float(g('still_window').value))
         self.tilt = TiltTracker(alpha=float(g('tilt_alpha').value))
+        self.lever = LeverArm(self._lever_arm())
+        co = [float(v) for v in g('camera_offset').value][:2]
+        self.abs_offset = {'camera': (co[0], co[1]), 'lidar': (0.0, 0.0)}
 
         self.src = {
             'camera': AbsSource(
@@ -268,6 +284,17 @@ class FusionLocalizer(Node):
             '方法五 (全感測器融合) 啟動 —— 遞推吃 /imu + /joint_states, '
             f"絕對量測吃 {g('camera_topic').value} 與 {g('lidar_topic').value}。"
             '那兩條要另外開起來 (fusion_loc.launch.py 會一起開)。')
+
+    def _lever_arm(self):
+        """要補償的 IMU 槓桿臂 [x, y]; 模擬裡預設是 0 (見 imu_lever_arm_in_sim)。"""
+        g = self.get_parameter
+        try:
+            sim = bool(g('use_sim_time').value)
+        except Exception:          # 離線測試的假節點沒有這個參數
+            sim = False
+        if sim and not bool(g('imu_lever_arm_in_sim').value):
+            return [0.0, 0.0]
+        return [float(v) for v in g('imu_lever_arm').value]
 
     # ------------------------------------------------------------------
     def _make_ekf(self) -> FusionEkf:
@@ -345,11 +372,18 @@ class FusionLocalizer(Node):
                          msg.angular_velocity.z])
         acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y,
                         msg.linear_acceleration.z])
+        # IMU 不在旋轉中心 -> 先換算回 base_link 原點, 後面全部用換算過的
+        acc = self.lever.to_base(t, acc, float(gyro[2]))
         self.last_gyro = gyro
         dt = None if self.last_t is None else t - self.last_t
         self.last_t = t
 
-        still = self.det.is_still()
+        # 偵測器只在收到 /joint_states 時更新。輪速停掉的話它會一直回報最後的狀態,
+        # 而那個狀態如果是「靜止」, ZUPT 與位置錨定會把車子釘在原地。
+        # 輪速不新鮮就當作「不知道」= 不靜止。
+        # (這一行**不是** 2026-10-13 run_car.sh 的 sim 輪「融合在開頭 15 秒停在起點」
+        #  的解法: 加了之後 16:42 那一輪照樣發生。那個問題的原因還沒找到。)
+        still = self.det.is_still() and (t - self.t_wheel) <= self.wheel_timeout
         self.n_still += int(still)
         a_fwd = self._forward_accel(msg, gyro, acc, dt, still)
         self.last_a_fwd = a_fwd
@@ -437,7 +471,8 @@ class FusionLocalizer(Node):
         yaw = quat_to_yaw((msg.pose.pose.orientation.x, msg.pose.pose.orientation.y,
                            msg.pose.pose.orientation.z, msg.pose.pose.orientation.w))
         m = AbsMeas(t, which, p.x, p.y, s.sigma_for(rep),
-                    yaw=yaw, yaw_sigma=s.yaw_sigma)
+                    yaw=yaw, yaw_sigma=s.yaw_sigma,
+                    offset=self.abs_offset.get(which, (0.0, 0.0)))
 
         first = not self.ekf.initialized
         if first and not self.started:

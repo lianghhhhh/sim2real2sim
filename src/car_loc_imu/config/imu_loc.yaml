@@ -73,15 +73,23 @@ imu_localizer:
     # 之後不需要, 留著是給 nhc_sigma 設得很小的時候用。
     nhc_pos_cap: -1.0
 
-    # base_link 的 +X 量到「車頭」的角度 (度)。**這台車不是 0。**
-    # car.usd 的 base_link 是 +X 朝左、車頭 -Y (car_teleop/cmd_vel_bridge.py
-    # 裡也寫著同一件事), 所以是 -90。
-    # 從 sim_data.csv 量出來的佐證: 車子在動的時候
-    #   atan2(dy_gt, dx_gt) - gt_yaw = -90.0° (中位數, 標準差 0.6°, n=1159)
-    # NHC 約束的是**垂直車頭**的那一軸。給 0 的話它會把前進速度當成側滑歸零,
-    # 估計裡的車子幾乎不前進, 而真正的側向 (body x) 完全沒有約束 ->
-    # 誤差自由累積。實測就是 213 秒漂了 11 公尺的原因。
-    forward_deg: -90.0
+    # base_link 的 +X 量到「車頭」的角度 (度)。kros_car.usd 照 REP-103 (+X 是車頭),
+    # 所以是 0。舊的 car.usd 是 +X 朝左、車頭 -Y, 那台要給 -90。
+    # NHC 約束的是**垂直車頭**的那一軸。給錯的話它會把前進速度當成側滑歸零,
+    # 估計裡的車子幾乎不前進, 而真正的側向完全沒有約束 -> 誤差自由累積
+    # (舊車給錯時實測 213 秒漂了 11 公尺)。
+    forward_deg: 0.0
+    # IMU 在 base_link 裡的位置 [x, y] (m)。不在旋轉中心時, 車子一轉 IMU 就會量到
+    # 向心加速度 w^2*r 與切線加速度 (角加速度 x r); 節點會把量到的加速度換算回
+    # base_link 原點。kros_car.usd 的 imu_link 在 (+0.125, -0.0286), 離中心 12.8 cm
+    # (1.7 rad/s 的自旋就是 0.39 m/s^2)。IMU 在中心的車給 [0.0, 0.0]。
+    imu_lever_arm: [0.125, -0.0286]
+    # !! **Isaac 的 IMU 不模擬安裝位置** (它回報的是車體原點的加速度; 2026-10-13 對
+    #    ground truth 擬合出來的等效位置是 (+0.007, -0.001) m)。所以 use_sim_time 開著
+    #    時節點**不會**做這個補償, 上面那個值只在實體車 (use_sim_time:=false) 生效。
+    #    模擬裡照樣扣的話是憑空加進假加速度 (1.5 rad/s 自旋 0.28 m/s^2): 同一套摩擦力
+    #    測試, 純 IMU 那條的誤差中位 4.1 m -> 0.5 m, IMU+輪速 45 -> 37 cm。
+    imu_lever_arm_in_sim: false
     anchor_sigma: 0.02
     anchor_after: 0.5
     v_max: 4.0

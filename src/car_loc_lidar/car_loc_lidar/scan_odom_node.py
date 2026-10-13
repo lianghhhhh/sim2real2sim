@@ -77,7 +77,7 @@ class ScanOdometry(Node):
         p('base_frame', 'base_link')
         p('publish_tf', True)
 
-        p('lidar_translation', [0.0, 0.0, 0.20])
+        p('lidar_translation', [0.045, 0.0, 0.236])     # kros_car.usd
         p('lidar_rpy_deg', [0.0, 0.0, 0.0])
 
         # MS200: 0.03~12 m。range_max 要比感測器上限大一點, 見 lidar_loc_node。
@@ -126,6 +126,11 @@ class ScanOdometry(Node):
         #    2026-09-08 照它改成 forward/mid, 地圖直接建爛 (見 lidar_odom.yaml)。
         #    唯一的驗收是重建地圖再量佔據範圍。
         p('time_order', 'reverse')
+        # 見 lidar_loc_node / frontend.py: Isaac 的一圈是算繪幀拼的 (階梯), 不是連續掃
+        p('scan_time_model', 'auto')  # 'auto' (use_sim_time -> frames) | 'linear' | 'frames'
+        p('scan_frames', 6)
+        p('scan_seam_deg', 0.0)
+        p('scan_lead_frames', 0.5)
 
         p('publish_scan', True)
         # **不要發回 /scan** —— 那是感測器自己的 topic (實體車也是), 蓋掉會變成
@@ -154,6 +159,9 @@ class ScanOdometry(Node):
         self.sweep_xy = float(g('sweep_xy_span').value)
 
         self.input_type = g('input_type').value
+        tm = str(g('scan_time_model').value)
+        if tm == 'auto':
+            tm = 'frames' if self.get_parameter('use_sim_time').value else 'linear'
         self.front = ScanFrontend(
             input_type=self.input_type,
             translation=list(g('lidar_translation').value),
@@ -165,7 +173,11 @@ class ScanOdometry(Node):
             scan_period=float(g('scan_period').value),
             scan_stamp=g('scan_stamp').value,
             do_deskew=bool(g('deskew').value),
-            time_order=g('time_order').value)
+            time_order=g('time_order').value,
+            time_model=tm,
+            scan_frames=int(g('scan_frames').value),
+            seam_deg=float(g('scan_seam_deg').value),
+            lead_frames=float(g('scan_lead_frames').value))
         self.motion = ConstVelMotion(alpha=float(g('twist_alpha').value),
                                      v_max=float(g('v_max').value),
                                      omega_max=float(g('omega_max').value))

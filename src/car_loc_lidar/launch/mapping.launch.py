@@ -63,7 +63,9 @@ def generate_launch_description():
         DeclareLaunchArgument('cloud_topic', default_value='/lidar/point_cloud'),
         DeclareLaunchArgument('lidar_frame', default_value='laser_frame',
                               description='要跟 car.usd 裡 helper 的 frameId 一致'),
-        DeclareLaunchArgument('lidar_z', default_value='0.20'),
+        # laser_frame 相對 base_link 的位置 (kros_car.usd); 舊的 car.usd 是 x 0 / z 0.20
+        DeclareLaunchArgument('lidar_x', default_value='0.045'),
+        DeclareLaunchArgument('lidar_z', default_value='0.236'),
         DeclareLaunchArgument('slam_params_file', default_value=slam_params),
         DeclareLaunchArgument('teleop', default_value='true',
                               description='建圖一定要手動開一圈, 預設就把速度控制層開起來'),
@@ -77,7 +79,8 @@ def generate_launch_description():
     static_lidar = Node(
         package='tf2_ros', executable='static_transform_publisher',
         name='static_tf_lidar',
-        arguments=['--x', '0', '--y', '0', '--z', LaunchConfiguration('lidar_z'),
+        arguments=['--x', LaunchConfiguration('lidar_x'), '--y', '0',
+                   '--z', LaunchConfiguration('lidar_z'),
                    '--frame-id', 'base_link',
                    '--child-frame-id', LaunchConfiguration('lidar_frame')],
         parameters=[{'use_sim_time': use_sim_time}])

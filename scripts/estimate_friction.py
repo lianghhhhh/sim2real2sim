@@ -13,58 +13,68 @@
 不寫死任何環境的數字 —— 摩擦係數、房間大小、trial 數、有沒有跑某個 block 都不假設,
 缺的特徵就跳過, 被中止 / 截斷的 trial 照樣能用。
 
+**這是輪速控制版** (kros_car.usd / 實體 KROS car: /joint_command 給輪速, 馬達的
+速度環出扭矩)。舊的 effort 控制版 (car.usd) 收的 CSV 讀不了 —— 那一版的特徵
+(斷油滑行的減速度、起轉 effort) 在輪速控制下不存在, 見 control_car_node.py 檔頭。
+
 ────────────────────────────────────────────────────────────────────────
 用了哪些特徵, 為什麼
 ────────────────────────────────────────────────────────────────────────
-這台 skid-steer 原地轉時四輪都在橫向滑, 阻力矩 M = mu*m*g*(半軸距), 跟轉速無關
-(Coulomb)。所以下面兩個量都**正比於 mu**, 取兩環境的比值就把車子的幾何、質量、
-慣量全部消掉了, 不需要知道它們:
+輪速控制下, 車體的運動被速度環釘死, 摩擦力跑到**馬達出多少扭矩**上。
+skid-steer 原地轉時四輪都在滑, 每輪摩擦力大小 mu*N, 穩態時
 
-  [主] B1 spin_coast   斷油後的角減速度 alpha。  alpha = M / I_z  ∝ mu_dynamic
-       放開之後轉速不是馬上開始等減速 (Isaac 60 Hz IMU 實測):
-         1) 先再往上衝 30~70 ms —— 指令延遲 + 輪子轉得比車體快, 還在推車
-         2) 過渡段 —— 輪子跟地面同步中, 減速度逐漸變大
-         3) 線性段 —— 純 Coulomb, 斜率就是 alpha      <- 取這段
-         4) 尾段 —— 低速時減速度又變小
-       做法: 從 0.2 s 內的轉速峰值開始, 取 80%~20% 峰值之間的點做直線擬合。
-       高 mu 地面整段只有 0.15~0.3 s, 需要 IMU 全速率檔 (60 Hz 以上) 才湊得到點;
-       主 CSV 20 Hz 的位姿資料湊不滿就所有檔案一起退回能量法
-           alpha = (w_peak² - w_end²) / (2 dθ)
-       它把過渡段也平均進去, 高 mu 那邊 coast 短、過渡段佔比大 -> 比值被壓向 1。
-       2026-09-15 那一輪 (ground 0.5 vs 2.0): 線性段 2.27, 能量法 gyro 1.98;
-       GT 的 2.73 則是主 CSV 標籤晚了 50~67 ms、錯過轉最快那段造成的高估。
+    tau_wheel = r * mu * N * a / sqrt(a² + b²)      (a 半軸距, b 半輪距)
 
-  [主] B2 creep_spin   steer effort 從 0 慢慢拉高, 車子開始轉的那一刻的 effort。
-       驅動力矩 ∝ effort, 臨界時 = 靜摩擦力矩 ∝ mu_static。
-       「角度超過門檻」的那一刻已經比真正起轉晚了, 而且這個延遲在兩個環境裡換算
-       成 effort 差不多一樣 -> 加性偏差, 會把比值往 1 壓 (實測 2.07, 真值 2.5)。
-       effort 線性 ramp -> 起轉後多出來的力矩 ∝ (t - t_b) -> 角度 ∝ (t - t_b)³,
-       所以拿 ∛θ 對 t 做直線, 外插回 0 的時刻 t_b 才是起轉點 (實測 2.32)。
+正比於 mu, 跟轉速無關 (Coulomb)。取兩環境的比值就把幾何、質量全部消掉了。
 
-  [副] B1 spin_up      同上, 但 ramp 快 (6 effort/s), 20 Hz 下解析度只有 0.3。
+  [主] B1 spin_torque   等速原地轉時四輪 |扭矩| 的平均。  ∝ mu_dynamic
+       丟掉每段前 1 秒 (起轉過渡), 剩下的取中位數。穩態量, 可以平均好幾秒,
+       每個 trial 的雜訊很小。
+       **前提: 馬達沒飽和。** 需要的扭矩超過馬達在那個轉速下出得了的扭矩時,
+       量到的就是馬達的上限、輪速也追不上指令 —— 那一趟會被標成「飽和」。
+       上限**隨轉速下降** (DDSM115: 堵轉 2.0 N·m, 115 rpm 剩 0.96, 200 rpm 是 0;
+       --torque-limit / --no-load-speed / --rated-speed / --rated-torque)。
+       飽和的環境不能拿來校正, 比值也不能信 (不保證偏哪一邊: 2026-10-13 無頭
+       PhysX 地面 0.5 -> 1.0, 最高檔飽和, 量到 1.58, 真值 1.50)。
+       把 control_car_node 的 spin_wheel_speed 調低再收一次。
 
-  [副] B1 spinup_time  spin_up 從靜止到轉速第一次到 w_ref 的**時間**。
-       這是**靜摩擦**特徵: 把兩個環境的 w(t) 疊起來看, 起轉之後的那一段幾乎
-       重合 (Δt(2->5 rad/s) 對 mu 的敏感度只有 0.04~0.12, 因為那時是馬達扭矩
-       說了算), 差異全部集中在「推得動之前卡住多久」。
-       跟 creep_breakaway 比:
-         敏感度  d ln t / d ln mu ≈ 0.47   (creep 是 ~0.8, 時間特徵比較鈍)
-         精度    每個 trial 的 cv 0.6~0.9%, 一輪 15 個 trial -> 標準誤 0.2%
-                 (creep 每個 trial 的散佈是 8%, 一輪 6 個 -> 4%)
-       淨效果是解析度好 5~10 倍: 2026-09-15 的資料用它反推 real 的地面 mu 得到
-       2.01 (真值 2.0), 用 creep 只能給 1.7~2.6 的區間。
-       **代價: 它包含馬達 ramp, 所以兩個環境的驅動系統必須一樣。**
-       sim-to-sim 校正 (同一台車只改地面) 成立; 對真車要先看 B3 對照組是不是 ≈ 1。
-       比值**不正比於 mu** -> 不進綜合比值, 也不進 ★ 地面係數換算, 由校正迴圈
-       (friction_calib_step.py) 用割線法直接內插。
-  [副] B4 slip_launch  瞬間滿油門起步的平均加速度。抓地力受限時 = mu*g, 但扭矩上限
-       ~3.4~6 m/s², 高 mu 的環境會被馬達卡住 -> 只能當下界, 比值會被壓向 1。
-       另外印 slip ratio 當參考。
+       **馬達自己的損耗要扣掉。** 回授的扭矩是「電流 x 扭矩常數」, 裡面除了輪胎
+       的摩擦力還有馬達 / 軸承自己吃掉的那一塊 (DDSM115 規格書: 額定點 1.5 A x
+       0.75 = 1.13 N·m, 軸輸出只有 0.96 -> 差 0.17 N·m)。模擬的馬達沒有這一塊,
+       不扣的話實體車的 mu 會被高估三成左右。B3 等速直行量到的就是它 (直行時輪胎
+       不滑, 扭矩 = 損耗 + 滾動阻力), 用兩檔車速擬合 loss(w) = c0 + c1*w, 從 B1 / B2
+       的扭矩裡扣掉該輪速的值。模擬只有 0.015 N·m, 扣不扣幾乎沒差; 兩邊都扣才一致。
+       (--no-loss-correction 可以關掉。)
 
-  [對照] B3 sprint_accel / B3 sprint_coast
-       直線加速是扭矩受限、直線 coast 是輪子 joint damping 主導, 兩者理論上**跟地面
-       摩擦無關**。它們的比值應該 ≈ 1; 如果差很多, 代表這兩個環境不只摩擦不同
-       (馬達、質量、阻尼也變了), 主特徵的比值就不能直接解讀成摩擦比。
+  [副] B2 ramp_torque   慢速 ramp 滑動段的扭矩。跟 B1 量的是同一個量, 低速版;
+       兩者差很多代表扭矩跟轉速有關 (有黏滯項), 不是純 Coulomb。
+
+  [副] B2 breakaway_torque   ramp 起轉瞬間 (車體開始轉之前) 的峰值扭矩。
+       ∝ mu_static。速度環很硬時峰值只有一兩個取樣, 解析度差; 靜摩擦預設跟著
+       動摩擦走 (friction_calib_step.py 的 --static-mode tied)。
+
+  [副] B3/B4 brake_decel   輪速指令瞬間歸零後的車體減速度。
+       輪子鎖死 (brake_slip → 1) 時 = mu*g, 直接就是絕對值; 輪子沒鎖死
+       (brake_slip → 0) 代表扭矩先到上限, 減速度跟地面無關。
+       整段只有 0.1~0.2 秒, IMU 全速率檔才量得到。
+
+  [副] B4 launch_accel / launch_slip   輪速階躍起步的加速度與 slip ratio。
+       抓地力受限時加速度 = mu*g; 扭矩受限時跟地面無關 (slip → 0)。
+
+  [副] B1 spin_yaw_gain   車體轉速 / 輪速。理想 Coulomb 摩擦下是純幾何量
+       b*r/(a²+b²) = 0.174, 跟 mu 無關 —— **但 PhysX 實測不是**: 無頭 PhysX 量到
+       0.10~0.15, 隨 mu 與轉速變 (mu 大 -> 轉得慢)。所以它不能當對照組, 只印出來
+       參考, 順便給出等效輪距 T_eff = 2r / gain (cmd_vel_bridge 的 effective_track)。
+
+  [副] B3 cruise_torque   等速直行的扭矩 = 滾動阻力 + 馬達損耗, 跟地面摩擦
+       係數無關。模擬裡接近 0 (0.015 N·m)。上面說的損耗就是從這裡來的。
+
+驗證 (2026-10-12, 無頭 PhysX 直接跑同一套指令, 車重 12.5 kg, 輪子材質 0.5):
+    地面 0.5 -> 1.0 (有效 0.50 -> 0.75, 真值比值 1.50):
+        spin_torque 0.578 -> 0.869  比值 1.50   (理論值 r*mu*N*a/sqrt(a²+b²) = 0.563 / 0.845)
+        ramp_torque 1.53, breakaway_torque 1.50, launch_accel 4.83 -> 7.20 (= mu*g)
+    地面 2.0: 需要 1.41 N·m, 個別輪子已經貼到 2.0 的上限 -> 輪速追不上, 判定飽和。
+    USD 原本的車重 45 kg: 地面 0.5 就轉不動 (車體轉速 0.03 rad/s), 全部飽和。
 
 最後把 [主] 特徵的 log 比值用 bootstrap 變異數做反變異數加權, 得到綜合比值與信賴區間。
 
@@ -73,15 +83,15 @@
 ────────────────────────────────────────────────────────────────────────
 量到的是**輪子與地面合起來**的有效摩擦。PhysX 預設 combine mode 是 average:
     mu_eff = (mu_ground + mu_wheel) / 2
-car_*.usd 的輪子沒綁物理材質 -> 用預設材質 0.5。所以 ground 0.5 -> 2.0 (4 倍)
+kros_car*.usd 的輪子沒綁物理材質 -> 用預設材質 0.5。所以 ground 0.5 -> 2.0 (4 倍)
 量到的是 mu_eff 0.5 -> 1.25 (2.5 倍), 不是 4 倍。
 
 **要的是地面摩擦係數就給參考環境的 USD**, 最後會印一個 ★ 區塊:
 
-    ./scripts/estimate_friction.py sim.csv real.csv --ref-usd car_sim.usd
+    ./scripts/estimate_friction.py sim.csv real.csv --ref-usd kros_car_05_sim.usd
 
-  physics:dynamicFriction  <- B1 自旋減速 (滑動中量的)
-  physics:staticFriction   <- B2 起轉 effort (從靜止推到開始動)
+  physics:dynamicFriction  <- B1 等速自旋扭矩 (滑動中量的)
+  physics:staticFriction   <- B2 起轉峰值扭矩 (從靜止推到開始動)
   換算: 參考地面 + 輪子 -> 參考有效值 -> x 比值 -> 目標有效值 -> 反解目標地面。
   USD 讀不了 (沒有 pxr) 就用數字: --ref-ground-mu 0.5 [--wheel-mu 0.5 --combine average]
   真實世界沒有「輪子材質」這層, 直接看比值。
@@ -89,17 +99,18 @@ car_*.usd 的輪子沒綁物理材質 -> 用預設材質 0.5。所以 ground 0.5
 ────────────────────────────────────────────────────────────────────────
 訊號來源 (--source)
 ────────────────────────────────────────────────────────────────────────
+扭矩永遠來自輪子回授 (`*_effort` 欄); --source 只決定**車體運動**從哪裡來:
+
 auto   (預設) 有 <csv>_imu.csv 就用 gyro, 沒有才退回 gt
 gyro   **真車流程**: collect_data_node 全速率記的 /imu。
          轉速 = gyro z - 零偏 (零偏從 phase=='calibrate' 的靜止段估)
-         角度 = 轉速積分;  前向速度 = 前向加速度從靜止積分 (每個加速段起點歸零,
-         基準取起點前 0.25 s 的靜止平均)。不吃輪速、不吃定位 -> 不受打滑與
-         LiDAR 追丟影響。IMU 假設跟 base_link 同向 (car.usd 是這樣裝的)。
+         前向速度 = 前向加速度從靜止積分 (B3 cruise / B4 launch 起點歸零,
+         基準取起點前 0.25 s 的靜止平均)。不吃輪速、不吃定位。
+         IMU 假設跟 base_link 同向; 直線段幾乎不轉, 所以沒做槓桿臂補償。
 gt     Isaac ground truth (car_position_*, gt_yaw, twist)。模擬器裡對答案用。
-fus / lid / cam / imu / whl   各定位線的位姿 (主 CSV 20 Hz 取樣, 依 _stamp 去重)
-         * 自旋 > ~8 rad/s 時 LiDAR 會追丟, 用 lid 算 B1 會壞掉。
+fus / lid / cam / imu / whl   各定位線的位姿 (主 CSV 取樣, 依 _stamp 去重)
          * whl (以及吃輪速的 fus 的速度) 打滑時是錯的, 而打滑就是摩擦造成的 ——
-           循環論證。角度類特徵 (B1/B2) 相對安全, B4 不要信。
+           B3/B4 不要信。
 
 --compare-gt       同一份資料再用 GT 算一次, 並排印出 (模擬器驗證感測器流程用)
 --gyro-noise 等    對 IMU 注入雜訊 / 零偏, 模擬真車 MEMS (Isaac 的 IMU 是理想的)
@@ -115,35 +126,113 @@ import numpy as np
 import pandas as pd
 
 G = 9.81
-STRAIGHT_MAX_TURN = math.radians(10.0)   # B3/B4 加速段車頭最多轉這麼多, 超過就排除
-SPIN_MIN_PTS = 5                         # B1 線性段至少幾個點才採用 (見 run() 的說明)
-WHEELS = ['front_left_velocity', 'front_right_velocity',
-          'rear_left_velocity', 'rear_right_velocity']
+STRAIGHT_MAX_TURN = math.radians(10.0)   # B3/B4 直行段車頭最多轉這麼多, 超過就排除
+SPIN_SETTLE = 1.0                        # B1 每段開頭丟掉幾秒 (起轉過渡)
+CRUISE_TAIL = 1.0                        # B3 直行段取最後幾秒當穩態
+SPIN_ONSET_W = 0.05                      # B2 車體轉速超過這個值算「開始轉」 [rad/s]
+SAT_TORQUE_FRAC = 0.95                   # 扭矩 >= 這個比例 x 上限 -> 飽和
+SAT_TRACK_ERR = 0.10                     # 輪速比指令低這麼多 -> 飽和 (追不上)
+MAX_SAT_FRAC = 0.3                       # 自旋 trial 超過這個比例飽和 -> 那個環境的主特徵不能用
+
+
+class Motor:
+    """馬達在某個輪速下最多出得了多少扭矩 —— 規格書上那條直線。
+
+        limit(w) = min(堵轉扭矩, 額定扭矩 x (空載轉速 - w) / (空載轉速 - 額定轉速))
+
+    no_load <= 0 = 不管轉速, 一律用堵轉扭矩 (沒有扭矩-轉速曲線的馬達 / 舊的 USD)。
+    """
+
+    def __init__(self, stall=2.0, no_load=20.94, rated_speed=12.04, rated_torque=0.96):
+        self.stall = float(stall)
+        self.no_load = float(no_load)
+        self.rated_speed = float(rated_speed)
+        self.rated_torque = float(rated_torque)
+
+    def limit(self, w) -> float:
+        if self.no_load <= self.rated_speed or self.no_load <= 0.0:
+            return self.stall
+        lim = self.rated_torque * (self.no_load - abs(float(w))) / (self.no_load - self.rated_speed)
+        return max(0.0, min(self.stall, lim))
+
+
+def fit_loss(rows):
+    """B3 等速直行的 (輪速, 扭矩) -> loss(w) = c0 + c1*|w| 的 (c0, c1)。沒資料回 None。
+
+    兩檔車速才擬合得出斜率; 只有一檔、或擬合出來是負斜率 (損耗不會隨轉速變小,
+    那是雜訊) 就當成常數。
+    """
+    a = np.asarray([r for r in rows if np.all(np.isfinite(r))], float)
+    if not len(a):
+        return None
+    w, tq = np.abs(a[:, 0]), a[:, 1]
+    if len(a) >= 2 and np.ptp(w) > 0.2 * w.max():
+        c1, c0 = np.polyfit(w, tq, 1)
+        if c1 >= 0.0:
+            return float(c0), float(c1)
+    return float(np.median(tq)), 0.0
+
+
+def loss_at(model, w) -> float:
+    if model is None or not np.isfinite(w):
+        return 0.0
+    return max(0.0, model[0] + model[1] * abs(float(w)))
+WHEEL_KEYS = ('front_left', 'front_right', 'rear_left', 'rear_right')
+WHEELS = [f'{k}_velocity' for k in WHEEL_KEYS]
+EFFORTS = [f'{k}_effort' for k in WHEEL_KEYS]
 
 # 特徵 -> (說明, 角色)。角色: primary 參與綜合估計; secondary 只印; control 應該 ≈ 1
 FEATURES = {
-    'spin_decel':      ('B1 自旋 coast 角減速度 [rad/s²]', 'primary'),
-    'spin_decel_energy': ('B1 同上, 能量法 (含過渡段, 偏低)', 'secondary'),
-    'creep_breakaway': ('B2 慢速 ramp 起轉 steer effort', 'primary'),
-    'spinup_time':     ('B1 spin_up 從靜止到 w_ref 的時間 [s] (靜摩擦, 需馬達一致)', 'secondary'),
-    'spinup_breakaway': ('B1 spin_up 起轉 steer effort', 'secondary'),
-    'launch_accel':    ('B4 滿油門起步加速度 [m/s²]', 'secondary'),
-    'launch_slip':     ('B4 起步 slip ratio', 'secondary'),
-    'sprint_accel':    ('B3 直線加速度 [m/s²]  (對照, 應≈1)', 'control'),
-    'coast_lin_decel': ('B3 直線 coast 減速度/速度 [1/s]  (對照, 應≈1)', 'control'),
+    'spin_torque':      ('B1 等速自旋的輪子扭矩 [N·m]', 'primary'),
+    'ramp_torque':      ('B2 慢速 ramp 滑動段扭矩 [N·m]', 'secondary'),
+    'breakaway_torque': ('B2 起轉峰值扭矩 [N·m] (靜摩擦)', 'secondary'),
+    'brake_decel':      ('B3/B4 急煞減速度 [m/s²]', 'secondary'),
+    'brake_slip':       ('B3/B4 急煞 slip (1=輪子鎖死在滑)', 'secondary'),
+    'launch_accel':     ('B4 階躍起步加速度 [m/s²]', 'secondary'),
+    'launch_slip':      ('B4 起步 slip ratio', 'secondary'),
+    'cruise_torque':    ('B3 等速直行扭矩 [N·m] (滾動阻力)', 'secondary'),
+    'spin_yaw_gain':    ('B1 車體轉速/輪速 [-]', 'secondary'),
 }
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  讀檔: 把 CSV 變成統一格式的 track (不管位姿來自哪個來源)
 # ═══════════════════════════════════════════════════════════════════════
+def _check_format(path, cols):
+    if 'velocity_command_front_left' in cols:
+        return
+    if 'effort_command_front_left' in cols:
+        sys.exit(f'{path}: 這是舊的 effort 控制版收的 CSV (欄位是 effort_command_*)。'
+                 '這支腳本現在只吃輪速控制版的資料 —— 兩種控制方式的特徵完全不同。')
+    sys.exit(f'{path}: 缺少欄位 velocity_command_* —— 不是 calibrate_env_node 收的 CSV?')
+
+
+def _wheel_cols(d):
+    """輪速指令 / 輪速 / 扭矩 -> track 共用的那幾欄。缺的就是 NaN。"""
+    fl, fr = d['velocity_command_front_left'], d['velocity_command_front_right']
+    out = {'steer': 0.5 * (fr - fl), 'thr': 0.5 * (fr + fl)}
+    if set(WHEELS) <= set(d.columns):
+        out['wheel'] = d[WHEELS].abs().mean(axis=1)
+        out['wheel_fwd'] = d[WHEELS].mean(axis=1)
+    else:
+        out['wheel'] = out['wheel_fwd'] = np.nan
+    if set(EFFORTS) <= set(d.columns):
+        out['tq'] = d[EFFORTS].abs().mean(axis=1)
+        out['tq_max'] = d[EFFORTS].abs().max(axis=1)
+        # 沿著輪子指令方向的扭矩 (正 = 在推)。直行時扭矩很小, 取絕對值會把雜訊
+        # 折成正的偏差, 所以損耗用這個算。
+        cmd = np.sign(d[[f'velocity_command_{k}' for k in WHEEL_KEYS]].to_numpy(float))
+        out['tq_dir'] = pd.Series((d[EFFORTS].to_numpy(float) * cmd).mean(axis=1), index=d.index)
+    else:
+        out['tq'] = out['tq_max'] = out['tq_dir'] = np.nan
+    return out
+
+
 def load_track(path, source, forward_axis_deg, max_sigma, max_age):
     d = pd.read_csv(path)
-    need = {'scenario_name', 'phase', 'effort_command_front_left',
-            'effort_command_front_right'}
-    missing = need - set(d.columns)
-    if missing:
-        sys.exit(f'{path}: 缺少欄位 {sorted(missing)} —— 不是 calibrate_env_node 收的 CSV?')
+    _check_format(path, d.columns)
+    if not {'scenario_name', 'phase'} <= set(d.columns):
+        sys.exit(f'{path}: 缺少 scenario_name / phase —— 不是 calibrate_env_node 收的 CSV?')
 
     if source == 'gt':
         t, x, y, yaw = (d['odom_stamp'], d['car_position_x'],
@@ -163,12 +252,9 @@ def load_track(path, source, forward_axis_deg, max_sigma, max_age):
     tr = pd.DataFrame({
         'name': d['scenario_name'].astype(str), 'phase': d['phase'].astype(str),
         't': t.astype(float), 'x': x.astype(float), 'y': y.astype(float),
-        'yaw': yaw.astype(float), 'valid': valid.values,
-        'steer': 0.5 * (d['effort_command_front_right'] - d['effort_command_front_left']),
-        'thr': 0.5 * (d['effort_command_front_right'] + d['effort_command_front_left']),
-        'wheel': d[WHEELS].abs().mean(axis=1) if set(WHEELS) <= set(d.columns) else np.nan,
+        'yaw': yaw.astype(float), 'valid': valid.values, **_wheel_cols(d),
     })
-    # 感測器欄位是 20 Hz 複製最新一則 -> 同一個 stamp 只算一次, 之後 forward-fill
+    # 感測器欄位是複製最新一則 -> 同一個 stamp 只算一次, 之後 forward-fill
     fresh = tr['valid'] & (tr['t'] != tr['t'].where(tr['valid']).ffill().shift())
     s = tr[fresh]
     yaw_u = np.unwrap(s['yaw'].to_numpy())
@@ -204,6 +290,7 @@ def load_imu_track(path, forward_axis_deg, noise, rng):
     d = pd.read_csv(path)
     if len(d) < 10:
         sys.exit(f'{path}: IMU 檔幾乎是空的 ({len(d)} 列) —— /imu 有沒有在發?')
+    _check_format(path, d.columns)
     d = d.sort_values('stamp').drop_duplicates('stamp').reset_index(drop=True)
     n = len(d)
     gz = d['gyro_z'].to_numpy(float).copy()
@@ -215,16 +302,15 @@ def load_imu_track(path, forward_axis_deg, noise, rng):
         ay += rng.normal(0, noise['acc'], n)
 
     t = d['stamp'].to_numpy(float)
-    steer = 0.5 * (d['effort_command_front_right'] - d['effort_command_front_left'])
     phase = d['phase'].astype(str)
     name = d['scenario_name'].astype(str)
 
-    # gyro 零偏: calibrate 段 (去頭 0.3 s) > B2 creep 開頭 (steer<1, 車子還沒動) > 0
+    # gyro 零偏: calibrate 段 (去頭 0.3 s) > Rest 段 > 0
     still = (phase == 'calibrate').to_numpy().copy()
     if still.sum() > 10:
         still &= t > t[still][0] + 0.3
     if still.sum() < 10:
-        still = (name.str.startswith('B2 creep') & (steer.abs() < 1.0)).to_numpy()
+        still = ((phase == 'measure') & name.str.startswith('Rest')).to_numpy()
     bias = float(np.median(gz[still])) if still.sum() >= 10 else 0.0
     if still.sum() < 10:
         print(f'! {path}: 找不到靜止段估 gyro 零偏, 當作 0')
@@ -239,36 +325,26 @@ def load_imu_track(path, forward_axis_deg, noise, rng):
 
     tr = pd.DataFrame({
         'name': name, 'phase': phase, 't': t, 'x': np.nan, 'y': np.nan,
-        'yaw': np.nan, 'valid': True, 'steer': steer,
-        'thr': 0.5 * (d['effort_command_front_right'] + d['effort_command_front_left']),
-        'wheel': d[[f'{k}_velocity' for k in
-                    ('front_left', 'front_right', 'rear_left', 'rear_right')]].abs().mean(axis=1),
+        'yaw': np.nan, 'valid': True, **_wheel_cols(d),
         'yaw_u': yaw_u, 'w': w, 'vf': np.nan, 'fresh': True,
     })
     tr['seg'] = (tr['name'] != tr['name'].shift()).cumsum()
-    # 段落起點: 新版 collect_data_node 會記 scenario_recv (收到段落標籤的時刻,
-    # 節點時鐘)。同一列的 recv 也是節點時鐘 -> 用兩者的中位數差換算到 stamp 時鐘。
-    # 舊檔沒有這兩欄就是 NaN, 分析端退回「第一列帶著新標籤的資料」(誤差 1 個 IMU 週期)。
-    if 'scenario_recv' in d.columns and 'recv' in d.columns:
-        off = float(np.median(d['recv'].to_numpy(float) - t))
-        tr['t0'] = d['scenario_recv'].to_numpy(float) - off
-    else:
-        tr['t0'] = np.nan
 
-    # 前向速度: 加速段起點歸零, 積分到它後面的 coast 段結束
+    # 前向速度: 從靜止起步的段落 (B3 cruise / B4 launch) 起點歸零, 一路積分到它
+    # 後面的急煞段結束。基準取起點前 0.25 s 的靜止平均 (扣掉零偏與車體傾斜)。
     vf = np.full(n, np.nan)
     active, v, ref = False, 0.0, 0.0
     for _, g in tr.groupby('seg', sort=True):
         i0, i1 = g.index[0], g.index[-1]
         nm, meas = g['name'].iloc[0], g['phase'].iloc[0] == 'measure'
         start = i1 + 1                                   # 不積分
-        if meas and nm.startswith(('B3 sprint_accel', 'B4 slip_launch')):
+        if meas and nm.startswith(('B3 cruise', 'B4 launch')):
             pre = (t >= t[i0] - 0.25) & (t < t[i0])
             ref = float(np.median(a_f[pre])) if pre.sum() >= 3 else float(a_f[i0])
             active, v = True, 0.0
             vf[i0] = 0.0
             start = i0 + 1
-        elif active and meas and nm.startswith(('B3 sprint_coast', 'B4 slip_coast')):
+        elif active and meas and nm.startswith(('B3 brake', 'B4 brake')):
             start = i0
         else:
             active = False
@@ -277,6 +353,7 @@ def load_imu_track(path, forward_axis_deg, noise, rng):
             vf[i] = v
     tr['vf'] = vf
     tr.attrs['gyro_bias'] = bias
+    tr.attrs['vf_integrated'] = True     # 前向速度是加速度積分來的 (見 extract 的 min_rows)
     return tr
 
 
@@ -345,257 +422,192 @@ def segments(tr):
     return out
 
 
-def yaw_noise(segs):
-    """位姿來源的 yaw 雜訊 (決定起轉偵測門檻)。
-
-    取 B2 creep 開頭 steer effort < 1 的那段 —— 那時車子一定還沒動。不用 Rest 段:
-    Rest 接在 brake 後面, 低 mu 的環境車子常常還在微微滑 (sim 0.5 實測 Rest 的
-    yaw 抖動是 real 2.0 的一萬倍), 會把門檻墊高、兩邊不一致。"""
-    vals = [g.loc[g['fresh'] & (g['steer'].abs() < 1.0), 'yaw_u'].diff().dropna()
-            for b, _, g in segs if b == 'B2 creep_spin']
-    vals = pd.concat(vals) if vals else pd.Series(dtype=float)
-    return float(vals.std()) if len(vals) > 5 else 0.0
+def _cross_time(t, v, level):
+    """v 第一次掉到 level 以下的時刻 (線性內插); 一開始就在下面或從沒掉下來回 None。"""
+    below = np.flatnonzero(v <= level)
+    if not len(below) or below[0] == 0:
+        return None
+    k = below[0]
+    return float(np.interp(level, [v[k], v[k - 1]], [t[k], t[k - 1]]))
 
 
-def breakaway_effort_w(g, w_lo=0.10, w_hi=1.0):
-    """慢速 ramp 的起轉 effort, 從**角速度**外插回去 (不看累積角度)。
+def spin_onset(t, w, th=SPIN_ONSET_W, hold=3):
+    """車體開始轉的時刻: |w| 連續 hold 個點超過門檻的第一個點。沒轉回 None。
 
-    起轉之後多出來的力矩 ∝ (t - tb) -> w ∝ (t - tb)², 所以 √w 對 t 是直線,
-    外插回 0 的時刻就是起轉點。
-
-    為什麼不用角度門檻 (breakaway_effort): 真正打滑之前有一段**預滑移** ——
-    輪胎與底盤被扭矩扭出彈性變形, 車體會非常慢地轉個 1~4 度然後停住。
-    2026-09-15 的資料裡 9 個 B2 trial 有 3 個是這樣, 角度在 effort≈2 就越過
-    0.02 rad 的門檻, 量到的起轉 effort 是 2.0 而不是真正的 5.6 (差 3 倍),
-    3 個 trial 的中位數因此完全不可靠 (散佈 69%)。預滑移的角速度只有
-    ~0.02 rad/s, 而真正起轉後 0.1 rad/s 是瞬間的事 -> 用角速度區間就避開了。
-
-    實測 (同一份資料, 中位數的散佈 / 真值 2.50 的比值):
-        角度門檻 + ∛θ   散佈 69%   比值 2.17 (偏向 1)
-        角速度 + √w     散佈 14%   比值 2.53
-    """
-    t = g['t'].to_numpy() - g['t'].iloc[0]
-    w = np.abs(g['w'].to_numpy())
-    st = g['steer'].abs().to_numpy()
-    m = (w >= w_lo) & (w <= w_hi)
-    if m.sum() >= 4:
-        i = np.flatnonzero(m)
-        p = np.polyfit(t[i], np.sqrt(w[i]), 1)
-        if p[0] > 0:
-            tb = -p[1] / p[0]
-            if t[0] <= tb <= t[i[0]]:          # 外插點要落在區間開始之前
-                return float(np.interp(tb, t, st))
+    要連續幾個點: 起轉前有一段預滑移 (輪胎與底盤被扭矩扭出彈性變形), 車體會
+    抖一下又停住, 單點超過門檻不算。"""
+    over = np.abs(w) > th
+    run = 0
+    for i, o in enumerate(over):
+        run = run + 1 if o else 0
+        if run >= hold:
+            return float(t[i - hold + 1])
     return None
-
-
-def spinup_time(g, w_ref, t0=None):
-    """spin_up 段從**指令發出**到轉速第一次到 w_ref 的時間 [s]。
-
-    t0 = 段落真正的起點 (collect_data_node 記的 scenario_recv)。沒有的話只能用
-    第一列帶著這個標籤的 IMU 資料, 誤差是一個 IMU 週期 (60 Hz -> 16.7 ms,
-    對 1.5 s 的量測是 1.1% 的抖動, 跟特徵本身 0.7% 的散佈同一個量級)。
-    """
-    t = g['t'].to_numpy()
-    w = np.abs(g['w'].to_numpy())
-    if w.max() < w_ref:
-        return None
-    k = int(np.argmax(w >= w_ref))
-    if k == 0:                                  # 一開始就在轉 -> 沒有從靜止起步
-        return None
-    start = t0 if (t0 is not None and np.isfinite(t0) and
-                   t[0] - 0.1 <= t0 <= t[0]) else t[0]
-    return float(np.interp(w_ref, [w[k - 1], w[k]], [t[k - 1], t[k]]) - start)
-
-
-def breakaway_effort(g, th_yaw):
-    """慢速 ramp 裡車子開始轉的 steer effort。∛θ 外插, 做不到就退回門檻穿越點。"""
-    t = g['t'].to_numpy() - g['t'].iloc[0]
-    th = np.abs(g['yaw_u'] - g['yaw_u'].iloc[0]).to_numpy()
-    st = g['steer'].abs().to_numpy()
-    moved = th > th_yaw
-    if not moved.any() or moved.argmax() == 0:
-        return None
-    k0 = moved.argmax()
-    # 擬合窗: 從過門檻到轉了 0.5 rad (再後面動摩擦 / 轉速效應開始進來)
-    k1 = np.argmax(th > 0.5) if (th > 0.5).any() else len(th)
-    k1 = max(k1, k0 + 4)
-    tt, yy = t[k0:k1], np.cbrt(th[k0:k1])
-    if len(tt) >= 4:
-        p = np.polyfit(tt, yy, 1)
-        if p[0] > 0:
-            tb = -p[1] / p[0]
-            if t[max(k0 - 20, 0)] <= tb <= t[k0]:          # 外插合理才用
-                return float(np.interp(tb, t, st))
-    return float(st[k0])
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  逐 trial 抽特徵
 # ═══════════════════════════════════════════════════════════════════════
-def extract(tr, th_yaw=None):
+def extract(tr, r_wheel, motor, loss_correction=True):
     segs = segments(tr)
-    if th_yaw is None:
-        th_yaw = max(0.02, 6.0 * yaw_noise(segs))
     F = {k: [] for k in FEATURES}
-    F['_spin_rows'] = []           # 畫圖用: (w0, w_end, dθ)
-    F['_spinup_segs'] = []         # spinup_time 用: (spin_up 段, 段落起點)
-    F['_spin_pts'] = []            # spin_decel 每個 trial 線性段用了幾個點
-    F['_spin_w0'] = []             # spin_decel 每個 trial 的起始轉速 (w0 校正用)
-
-    # 輪半徑: 直線 coast 時輪子是自由滾動的 -> r ≈ v / w_wheel
-    r_samples = []
-    for b, _, g in segs:
-        if b == 'B3 sprint_coast':
-            ok = (g['vf'] > 0.5) & (g['wheel'] > 3.0)
-            r_samples += (g.loc[ok, 'vf'] / g.loc[ok, 'wheel']).tolist()
-    r_wheel = float(np.median(r_samples)) if len(r_samples) > 5 else None
+    # B1 每個 trial 一列: (輪速指令, 扣掉損耗的扭矩, 車體轉速, 實際輪速, 是否飽和, 原始扭矩)
+    F['_spin_rows'] = []
+    # 損耗要等 B3 跑完才知道, 所以先記「原始扭矩 + 當時的輪速」, 最後一起扣
+    raw = {'spin': [], 'ramp': [], 'breakaway': [], 'cruise': []}
+    n_spin = n_no_effort = 0
+    # 急煞 / 起步的速度變化只有 0.05~0.15 s。IMU 積分出來的速度在取樣點之間是準的
+    # (加速度幾乎是常數), 兩個點就能內插; 位姿差分的速度是「上一個區間的平均」,
+    # 落後半個取樣而且有雜訊, 窗內不到 4 個點時算出來的加速度可以差到 2~3 倍
+    # (60 Hz 的 GT 實測: 真值 7.2 量到 25) -> 那種 trial 直接不採用。
+    min_rows = 2 if tr.attrs.get('vf_integrated') else 4
 
     excluded = []
     bad_trial = False
-    for i, (b, name, g) in enumerate(segs):
+    for b, name, g in segs:
         g = g[g['valid']]
         if len(g) < 3:
             continue
         t = g['t'].to_numpy() - g['t'].iloc[0]
 
-        # 直線段 (B3/B4) 的加速段車頭轉了很多 = 起點 / 朝向不對 (通常是定位壞掉,
-        # 歸位把車擺歪了)。那一趟的加速度與後面的 coast 都不是直線的量, 整趟排除。
-        if b in ('B3 sprint_accel', 'B4 slip_launch'):
+        # 直行段車頭轉了很多 = 起點 / 朝向不對 (通常是定位壞掉, 歸位把車擺歪了)。
+        # 那一趟的加速度與後面的急煞都不是直線的量, 整趟排除。
+        if b in ('B3 cruise', 'B4 launch'):
             turn = abs(g['yaw_u'].iloc[-1] - g['yaw_u'].iloc[0])
             bad_trial = turn > STRAIGHT_MAX_TURN
             if bad_trial:
                 excluded.append(f'{name} (轉了 {math.degrees(turn):.0f}°)')
                 continue
-        elif b in ('B3 sprint_coast', 'B4 slip_coast'):
+        elif b in ('B3 brake', 'B4 brake'):
             if bad_trial:
                 continue
         else:
             bad_trial = False
 
-        if b == 'B1 spin_coast':
-            w = g['w'].abs().to_numpy()
-            th = g['yaw_u'].to_numpy()
-            # 起點取放開後 0.2 s 內的轉速峰值, 不是放開那一刻: 指令傳進模擬器 / 馬達
-            # 驅動器要時間, 輪子也還轉得比車體快在推車, 轉速會再往上衝 30~70 ms
-            # (Isaac 60 Hz IMU 實測)。峰值之前淨力矩還是正的, 不算 coast。
-            k = int(np.argmax(w[:max(3, np.searchsorted(t, 0.2))]))
-            w0, we = w[k], w[-1]
-            if w0 < 1.0:
+        if b == 'B1 spin_hold':
+            k = t >= SPIN_SETTLE
+            if k.sum() < 5:
                 continue
-            dth = abs(th[-1] - th[k])
-            if dth > 1e-3 and w0 > we:
-                F['_spin_rows'].append((w0, we, dth))
-                F['spin_decel_energy'].append((w0 ** 2 - we ** 2) / (2 * dth))
-            # 線性段: 峰值之後落在 80%~20% 峰值的點。過渡段 (輪子跟地面還沒同步)
-            # 與尾段 (低速時的靜摩擦 / 接觸抖動) 都不是純 Coulomb, 夾掉。
-            after = w[k:]
-            below = np.flatnonzero(after < 0.2 * w0)
-            idx = k + np.arange(below[0] if len(below) else len(after))
-            idx = idx[w[idx] <= 0.8 * w0]
-            if len(idx) >= 3:
-                F['spin_decel'].append(-np.polyfit(t[idx], w[idx], 1)[0])
-                F['_spin_pts'].append(len(idx))    # run() 依點數挑 trial, 見 SPIN_MIN_PTS
-                F['_spin_w0'].append(float(w0))    # 見 match_spin_w0
+            n_spin += 1
+            s = g[k]
+            cmd = float(s['steer'].abs().median())
+            wheel = float(s['wheel'].median())
+            w_body = float(s['w'].abs().median())
+            tq = float(s['tq'].median())
+            if not np.isfinite(tq):
+                n_no_effort += 1
+                continue
+            # 飽和: 任何一輪的扭矩貼著上限, 或輪速明顯追不上指令。兩個都看 ——
+            # 扭矩回授的刻度不準 (真車的扭矩常數) 時只有後者靠得住。
+            # 上限用**實際輪速**查: 馬達轉得愈快出得了的扭矩愈少 (見 Motor)。
+            sat = bool(float(s['tq_max'].median()) >= SAT_TORQUE_FRAC * motor.limit(wheel)
+                       or (cmd > 0.5 and wheel < (1.0 - SAT_TRACK_ERR) * cmd))
+            raw['spin'].append((cmd, tq, w_body, wheel, sat))
+            if wheel > 0.5:
+                F['spin_yaw_gain'].append(w_body / wheel)
 
-        elif b == 'B2 creep_spin':
-            # 先用角速度外插 (避開預滑移), 做不到才退回角度門檻
-            e = breakaway_effort_w(g)
-            if e is None:
-                e = breakaway_effort(g, th_yaw)
-            if e is not None:
-                F['creep_breakaway'].append(e)
+        elif b == 'B2 spin_ramp':
+            w = g['w'].to_numpy()
+            tq = g['tq'].to_numpy()
+            if not np.isfinite(tq).any():
+                continue
+            ton = spin_onset(t, w)
+            if ton is None:
+                continue                     # 整段都沒轉起來 (扭矩不夠), 沒有起轉點
+            # 峰值找在起轉點前後: 前 0.5 s (扭矩爬升) 到後 0.1 s (回授的延遲)
+            win = (t >= ton - 0.5) & (t <= ton + 0.1)
+            wh = g['wheel'].to_numpy()
+            if win.any() and np.isfinite(tq[win]).any():
+                j = int(np.nanargmax(np.where(win, tq, -np.inf)))
+                raw['breakaway'].append((float(tq[j]), float(wh[j])))
+            slide = (t >= ton + 0.3) & (np.abs(w) > 0.2)
+            if slide.sum() >= 5:
+                raw['ramp'].append((float(np.nanmedian(tq[slide])), float(np.nanmedian(wh[slide]))))
 
-        elif b == 'B1 spin_up':
-            # ramp 快 (6 effort/s), 門檻穿越點會被 0.3 effort 的 tick 量化 (5.4 / 6.3 兩檔);
-            # 60 Hz IMU 下 ∛θ 外插有足夠的點, 給的是連續值。20 Hz 資料外插不起來時
-            # breakaway_effort 自己會退回門檻穿越點。
-            e = breakaway_effort(g, th_yaw)
-            if e is not None:
-                F['spinup_breakaway'].append(e)
-            # spinup_time 的 w_ref 要**所有檔案共用**, 所以只先把軌跡存起來,
-            # 由 run() 決定共同的 w_ref 之後再算 (見 fill_spinup_time)
-            t0 = g['t0'].iloc[0] if 't0' in g else np.nan
-            F['_spinup_segs'].append((g, t0))
+        elif b == 'B3 cruise':
+            k = t >= t[-1] - CRUISE_TAIL
+            tq = g.loc[k, 'tq_dir']
+            if k.sum() >= 5 and tq.notna().any():
+                F['cruise_torque'].append(float(tq.median()))
+                raw['cruise'].append((float(g.loc[k, 'wheel'].median()), float(tq.median())))
 
-        elif b == 'B4 slip_launch':
-            if t[-1] > 0.1:
-                F['launch_accel'].append(np.polyfit(t, g['vf'], 1)[0])
-            if r_wheel:
-                ok = g['wheel'] > 5.0
-                if ok.sum() >= 2:
-                    rw = r_wheel * g.loc[ok, 'wheel']
-                    F['launch_slip'].append(float(np.median(
-                        np.clip((rw - g.loc[ok, 'vf']) / rw, 0, 1))))
+        elif b in ('B3 brake', 'B4 brake'):
+            vf = g['vf'].to_numpy()
+            if not np.isfinite(vf).all() or vf[0] < 0.15:
+                continue
+            v0 = float(vf[0])
+            t90, t10 = _cross_time(t, vf, 0.9 * v0), _cross_time(t, vf, 0.1 * v0)
+            # 90% 那個點落在第一個取樣之前 (指令一變就開始減速) -> 從段落起點算
+            if t10 is None:
+                continue
+            ta, va = (t90, 0.9 * v0) if t90 is not None else (0.0, v0)
+            if t10 - ta < 1e-3:
+                continue
+            mid = (t >= ta) & (t <= t10) & (vf > 0.05)
+            if mid.sum() < min_rows:
+                continue
+            F['brake_decel'].append((va - 0.1 * v0) / (t10 - ta))
+            if g['wheel_fwd'].notna().any():
+                rw = r_wheel * g.loc[mid, 'wheel_fwd'].to_numpy()
+                F['brake_slip'].append(float(np.median(np.clip(1.0 - rw / vf[mid], 0, 1))))
 
-        elif b == 'B3 sprint_accel':
-            if t[-1] > 0.3:
-                F['sprint_accel'].append(np.polyfit(t, g['vf'], 1)[0])
+        elif b == 'B4 launch':
+            vf = g['vf'].to_numpy()
+            v_t = r_wheel * float(g['thr'].abs().max())
+            if not np.isfinite(vf).all() or v_t < 0.1:
+                continue
+            # 10% -> 60% 目標車速花多久。上面那 40% 不取: 快到速時輪子不滑了,
+            # 加速度由速度環的收斂決定, 不是摩擦。
+            t10, t60 = _cross_time(t, -vf, -0.1 * v_t), _cross_time(t, -vf, -0.6 * v_t)
+            if t60 is None:
+                continue
+            ta = t10 if t10 is not None else 0.0
+            if t60 - ta < 1e-3 or ((t >= ta) & (t <= t60)).sum() < min_rows:
+                continue
+            F['launch_accel'].append((0.6 * v_t - (0.1 * v_t if t10 is not None else 0.0))
+                                     / (t60 - ta))
+            early = (t <= t60) & (g['wheel_fwd'].to_numpy() * r_wheel > 0.1)
+            if early.sum() >= 2:
+                rw = r_wheel * g.loc[early, 'wheel_fwd'].to_numpy()
+                F['launch_slip'].append(float(np.median(np.clip((rw - vf[early]) / rw, 0, 1))))
 
-        elif b == 'B3 sprint_coast':
-            k = t < 1.0
-            v0 = g['vf'].iloc[0]
-            if k.sum() >= 4 and v0 > 0.5:
-                F['coast_lin_decel'].append(-np.polyfit(t[k], g['vf'][k], 1)[0] / v0)
+    # ── 扣掉馬達自己的損耗 (B3 量到的), 剩下的才是輪胎的摩擦力 ──
+    loss = fit_loss(raw['cruise']) if loss_correction else None
+    for cmd, tq, w_body, wheel, sat in raw['spin']:
+        net = tq - loss_at(loss, wheel)
+        F['spin_torque'].append(net)
+        F['_spin_rows'].append((cmd, net, w_body, wheel, sat, tq))
+    F['ramp_torque'] = [tq - loss_at(loss, wh) for tq, wh in raw['ramp']]
+    F['breakaway_torque'] = [tq - loss_at(loss, wh) for tq, wh in raw['breakaway']]
 
-    F['_meta'] = {'yaw_threshold': th_yaw, 'wheel_radius': r_wheel, 'excluded': excluded}
+    rows = F['_spin_rows']
+    spin_w = [r[3] for r in rows]
+    F['_meta'] = {
+        'excluded': excluded,
+        'spin_trials': n_spin,
+        'no_effort': n_no_effort,
+        'saturated': sum(1 for r in rows if r[4]),
+        'sat_frac': (sum(1 for r in rows if r[4]) / len(rows)) if rows else 0.0,
+        # 連輪速最低的那一檔都飽和 = 降低轉速也救不了 (馬達的上限在低轉速就是堵轉扭矩,
+        # 不會再變大) -> 這個地面超出這台車量得到的範圍。
+        'out_of_range': bool(rows) and all(r[4] for r in rows
+                                           if r[0] <= min(q[0] for q in rows) + 0.05),
+        'stall_torque': motor.stall,
+        'spin_torque_raw': float(np.median([r[5] for r in rows])) if rows else None,
+        # 扭矩回授全是 0 = 發布端沒填 (不是摩擦力真的是 0)
+        'effort_zero': bool(rows) and max(r[5] for r in rows) < 1e-4,
+        # 損耗模型 loss(w) = c0 + c1*w [N·m]; None = 沒有 B3 的資料 (或被關掉), 沒扣
+        'loss': None if loss is None else {
+            'c0': loss[0], 'c1': loss[1], 'n': len(raw['cruise']),
+            'cruise_speeds': sorted({round(r[0], 1) for r in raw['cruise']}),
+            # 自旋輪速範圍裡的損耗, 以及它佔原始扭矩的比例 (太大 = 結果很吃這個修正)
+            'at_spin': [loss_at(loss, min(spin_w)), loss_at(loss, max(spin_w))] if spin_w else None,
+            'frac_of_spin': (float(np.median([loss_at(loss, r[3]) / r[5] for r in rows if r[5] > 1e-6]))
+                             if rows else None),
+        },
+        'loss_requested': bool(loss_correction),
+    }
     return F
-
-
-def match_spin_w0(Fs):
-    """把每個 trial 的自旋減速度校正到**共同的起始轉速**, 再比較。
-
-    純 Coulomb 的話減速度跟轉速無關, 但實測不是: 迴歸 decel = a + b*w0 得到的 b 是
-    +0.25 ~ +0.81 (rad/s² per rad/s), 也就是還有一個跟轉速有關的阻力 (輪子 joint
-    damping / 空氣)。它不隨地面摩擦等比例變化, 所以只要兩個檔案的實際 w0 不一樣,
-    比值就有系統性偏差。
-
-    w0 為什麼會不一樣: 「到目標轉速就放開」有殘餘的觸發延遲 (+1~9%), 而延遲期間的
-    角加速度本身就跟地面摩擦有關 —— 摩擦大的環境衝得慢、overshoot 小。也就是說
-    **這個偏差跟要量的東西相關**, 不會自己抵消。
-
-    做法: 每個檔案各自迴歸 (斜率跟 mu 有關, 不能共用), 每個 trial 減掉
-    b*(w0_i - w_ref), w_ref 取所有檔案所有 trial 的中位數。
-
-    2026-09-16 的那一輪 (sim 2.0 -> real 0.5, 真值 0.5): 校正前內插出 0.4865
-    (-2.7%), 校正後 0.4968 (-0.6%); 每個 trial 的 cv 也從 2.0~2.3% 掉到 1.1%。"""
-    ok = [F for F in Fs if len(F['spin_decel']) == len(F['_spin_w0']) >= 5]
-    if len(ok) < len(Fs) or not ok:
-        return None
-    allw = [w for F in ok for w in F['_spin_w0']]
-    w_ref = float(np.median(allw))
-    for F in ok:
-        w0 = np.asarray(F['_spin_w0'], float)
-        d = np.asarray(F['spin_decel'], float)
-        if w0.max() - w0.min() < 0.3:        # 轉速沒拉開, 斜率不可信 -> 不校正
-            F['_meta']['spin_w0_slope'] = None
-            continue
-        b = float(np.polyfit(w0, d, 1)[0])
-        F['spin_decel'] = (d - b * (w0 - w_ref)).tolist()
-        F['_meta']['spin_w0_slope'] = b
-        F['_meta']['spin_w0_shift'] = float(np.median(w0) - w_ref)
-    for F in ok:
-        F['_meta']['spin_w0_ref'] = w_ref
-    return w_ref
-
-
-def fill_spinup_time(Fs):
-    """所有檔案共用一個 w_ref, 算 B1 spin_up 的「從靜止到 w_ref」時間。
-
-    w_ref 必須是**每個檔案的每個 trial 都到得了**的轉速, 否則某一邊會少 trial
-    (而且少的一定是摩擦大的那邊 -> 系統性偏差)。取所有 trial 峰值最小的那個的
-    60%: 低一點比較接近純起轉 (敏感度略高), 又離噪聲夠遠。"""
-    peaks = [float(np.abs(g['w'].to_numpy()).max())
-             for F in Fs for g, _ in F['_spinup_segs']]
-    if not peaks:
-        return None
-    w_ref = round(0.6 * min(peaks), 2)
-    if w_ref < 1.0:
-        return None
-    for F in Fs:
-        F['spinup_time'] = [v for v in (spinup_time(g, w_ref, t0)
-                                        for g, t0 in F['_spinup_segs']) if v is not None]
-        F['_meta']['spinup_w_ref'] = w_ref
-    return w_ref
 
 
 def stat(F, key, idx=None):
@@ -696,8 +708,12 @@ def read_usd_friction(usd_path, ground_prim, wheel_pattern):
     """從 USD 讀地面與輪子的物理材質: {'ground': {...}, 'wheel': {...}, 'combine': str}。
 
     綁定解析跟 PhysX 一樣: 先找 material:binding:physics, 再找 material:binding,
-    自己沒有就往上找祖先; 綁到的材質沒有 PhysicsMaterialAPI (例如 car.usd 輪子綁的
-    是只有外觀的 /World/Looks/wheel) 就當沒綁 -> PhysicsScene 的預設材質 -> 0.5/0.5。
+    自己沒有就往上找祖先; 綁到的材質沒有 PhysicsMaterialAPI (只有外觀的材質) 就當
+    沒綁 -> PhysicsScene 的預設材質 -> 0.5/0.5。
+
+    輪子是用 prim **路徑**比對的, 而且會走進 instance proxy: URDF 匯入的車
+    (kros_car.usd) 輪子的碰撞體是 /kros_car/new_wheel_v1_1/collisions/mesh_0/cylinder,
+    名字本身沒有 wheel, 又在 instanceable 的子樹裡, 一般的 Traverse 看不到。
 
     需要 pxr (Isaac Sim 的 python 有; 一般環境 `pip install usd-core`)。"""
     try:
@@ -747,10 +763,10 @@ def read_usd_friction(usd_path, ground_prim, wheel_pattern):
         print(f'! {usd_path}: 地面 {ground_prim} 沒綁物理材質, 用預設 {ground["static"]}')
 
     pat = re.compile(wheel_pattern, re.I)
-    wheels = [p for p in stage.Traverse()
-              if pat.search(p.GetName()) and p.HasAPI(_collision_api())]
+    wheels = [p for p in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies())
+              if pat.search(str(p.GetPath())) and p.HasAPI(_collision_api())]
     if not wheels:
-        sys.exit(f'{usd_path}: 找不到名字符合 /{wheel_pattern}/ 的碰撞體 (用 --wheel-pattern 指定)')
+        sys.exit(f'{usd_path}: 找不到路徑符合 /{wheel_pattern}/ 的碰撞體 (用 --wheel-pattern 指定)')
     mats = {}
     for w in wheels:
         m = props(material_of(w)) or dict(default)
@@ -770,9 +786,11 @@ def _collision_api():
 
 # 地面的哪個係數由哪個特徵決定。B1 是在滑動中量的 -> 動摩擦; B2/B1 spin_up 是
 # 「從靜止推到開始動」-> 靜摩擦。
+# 地面的哪個係數由哪個特徵決定。B1 是在滑動中量的 -> 動摩擦; B2 的起轉峰值是
+# 「從靜止推到開始動」-> 靜摩擦。
 GROUND_TERMS = [
-    ('dynamic', 'physics:dynamicFriction', ['spin_decel', 'spin_decel_energy']),
-    ('static', 'physics:staticFriction', ['creep_breakaway', 'spinup_breakaway']),
+    ('dynamic', 'physics:dynamicFriction', ['spin_torque', 'ramp_torque']),
+    ('static', 'physics:staticFriction', ['breakaway_torque']),
 ]
 
 
@@ -795,7 +813,7 @@ def ground_report(res, args, p=print):
             continue
         r = res[key]
         # 信賴區間: bootstrap 與「trial 太少時的保守下限」取寬的那個
-        # (B2 通常只有 2 個 trial, bootstrap 會窄得不合理)
+        # (B2 只有幾個 trial, bootstrap 會窄得不合理)
         lo_b, hi_b = r['ci90']
         k = math.exp(1.645 * r['log_sd'])
         lo = min(x for x in (lo_b, r['ratio'] / k) if np.isfinite(x))
@@ -810,7 +828,7 @@ def ground_report(res, args, p=print):
               f'{"≥" if mode == "min" else "≤"} {w:g}')
         elif vals[1] < 0:
             p('    ! 信賴區間下界是負的: 有效摩擦接近輪子那一側, 地面值對它不敏感, 數字不可靠')
-        if key.endswith('_energy') or key.startswith('spinup'):
+        if key != keys[0]:
             p(f'    (主特徵沒資料, 用副特徵 {key}, 準度較差)')
         if np.isfinite(vals[0]) and lo <= 1.0 <= hi:
             # 比值跟 1 分不出來 -> 點估計只是雜訊, 不要照它去改參數
@@ -827,7 +845,7 @@ def ground_report(res, args, p=print):
             if abs(a - b) <= 0.15 * max(a, b):
                 p(f'  靜 / 動差不多 -> 只想填一個數字的話: {0.5 * (a + b):.2f}')
             elif b > a:
-                p('  ! 動摩擦 > 靜摩擦: 物理上不合理, 通常是 B2 trial 太少或偵測門檻問題, 以動摩擦為準')
+                p('  ! 動摩擦 > 靜摩擦: 物理上不合理, 通常是 B2 的起轉峰值沒被取樣到, 以動摩擦為準')
     if mode == 'average':
         p('  註: average 模式下 地面 = 2 x 有效值 - 輪子, 比值的誤差換到地面會放大約 2 倍。')
     return out
@@ -844,22 +862,122 @@ def verdict(ci, ratio, tol):
     return f'{"偏小" if ratio < 1 else "偏大"}, 但信賴區間跨過 1, 資料不足以確定'
 
 
+def motor_saturated(*Fs):
+    """任何一邊的自旋 trial 有超過 MAX_SAT_FRAC 馬達飽和 -> 主特徵不能當摩擦力用。"""
+    return any(F['_meta']['sat_frac'] > MAX_SAT_FRAC for F in Fs)
+
+
+def use_clean_levels(Fr, Ft):
+    """B1 只留**兩邊都沒飽和**的輪速檔。回傳 (Fr, Ft); 沒有東西要拿掉就原樣回傳。
+
+    馬達出得了的扭矩隨轉速下降, 所以飽和幾乎都從最高那一檔開始。整份資料丟掉太可惜:
+    低的那幾檔還是乾淨的 (2026-10-13 無頭 PhysX, 地面 0.5 -> 1.0, 輪速 2.4 / 4.2 / 6.0:
+    最高檔飽和, 三檔全用比值 1.54, 只用乾淨的兩檔 1.50, 真值 1.50)。
+    兩邊要拿掉同樣的檔位 —— 扭矩隨輪速有幾個百分點的變化, 只拿掉一邊會變成拿
+    不同轉速在比。剩不到 3 趟就不處理, 讓後面照「飽和」報。
+    """
+    def by_level(F):
+        out = {}
+        for r in F['_spin_rows']:
+            out.setdefault(round(r[0], 2), []).append(bool(r[4]))
+        return out
+
+    bad = sorted({c for F in (Fr, Ft) for c, v in by_level(F).items()
+                  if np.mean(v) > MAX_SAT_FRAC})
+    if not bad:
+        return Fr, Ft
+
+    def keep(F):
+        rows = [r for r in F['_spin_rows'] if round(r[0], 2) not in bad]
+        G = dict(F)
+        G['_spin_rows_all'] = F['_spin_rows']
+        G['_spin_rows'] = rows
+        G['spin_torque'] = [r[1] for r in rows]
+        G['spin_yaw_gain'] = [r[2] / r[3] for r in rows if r[3] > 0.5]
+        G['_meta'] = dict(F['_meta'], dropped_levels=bad,
+                          saturated=sum(1 for r in rows if r[4]),
+                          sat_frac=(sum(1 for r in rows if r[4]) / len(rows)) if rows else 0.0)
+        return G
+
+    Gr, Gt = keep(Fr), keep(Ft)
+    if min(len(Gr['_spin_rows']), len(Gt['_spin_rows'])) < 3:
+        return Fr, Ft
+    return Gr, Gt
+
+
+def spin_table(F, r_wheel, p=print, tag=''):
+    """B1 逐檔輪速的扭矩 / 車體轉速 —— 驗證 Coulomb 假設 (扭矩跟轉速無關) 用。"""
+    rows = F.get('_spin_rows_all', F['_spin_rows'])
+    if not rows:
+        return
+    dropped = F['_meta'].get('dropped_levels', [])
+    a = np.asarray([r[:4] for r in rows], float)
+    sat = np.asarray([r[4] for r in rows], bool)
+    lost = np.asarray([r[5] - r[1] for r in rows], float)
+    p(f'  {tag}B1 逐檔: {"輪速指令":>8}{"實際輪速":>9}{"車體轉速":>9}{"扭矩":>8}{"(已扣損耗)":>9}   n  飽和')
+    for c in sorted(set(np.round(a[:, 0], 2))):
+        k = np.abs(a[:, 0] - c) < 0.02
+        p(f'  {"":<{len(tag) + 9}}{c:>10.2f}{np.median(a[k, 3]):>11.2f}{np.median(a[k, 2]):>11.2f}'
+          f'{np.median(a[k, 1]):>10.3f}{np.median(lost[k]):>12.3f}  {k.sum():>2}  {int(sat[k].sum())}'
+          + ('   <- 這一檔不用' if round(float(c), 2) in dropped else ''))
+    gain = np.asarray(F['spin_yaw_gain'], float)
+    if len(gain):
+        g = float(np.median(gain))
+        p(f'  {"":<{len(tag) + 9}}車體轉速/輪速 = {g:.4f}  ->  等效輪距 T_eff = 2r/gain = '
+          f'{2 * r_wheel / g:.3f} m' if g > 1e-6 else '  車體沒在轉')
+
+
 def report(ref_path, tgt_path, res, combined, Fr, Ft, args):
     p = print
     p('═' * 78)
     p(f'參考: {ref_path}')
     p(f'目標: {tgt_path}')
-    p(f'位姿來源: {args.source}   (起轉偵測門檻 yaw {Fr["_meta"]["yaw_threshold"]:.3f} rad)')
+    p(f'車體運動來源: {args.source}   (扭矩一律來自輪子回授的 *_effort)')
+    problems = []
     for tag, path, F in (('參考', ref_path, Fr), ('目標', tgt_path, Ft)):
         q = args.loc_quality.get(path)
         if q is not None:
             msg, bad = q
             p(f'{"!" if bad else " "} {tag}收資料時的定位: {msg}'
               + ('  <- 定位壞了, 控制是在錯的位置 / 朝向跑的' if bad else ''))
-        if F['_meta']['excluded']:
-            p(f'! {tag}排除 {len(F["_meta"]["excluded"])} 趟不是直線的 B3/B4: '
-              + ', '.join(F['_meta']['excluded'][:4])
-              + (' ...' if len(F['_meta']['excluded']) > 4 else ''))
+        m = F['_meta']
+        if m['excluded']:
+            p(f'! {tag}排除 {len(m["excluded"])} 趟不是直線的 B3/B4: '
+              + ', '.join(m['excluded'][:4]) + (' ...' if len(m['excluded']) > 4 else ''))
+        if m['spin_trials'] and m['no_effort'] == m['spin_trials']:
+            problems.append(f'{tag}沒有扭矩回授 (*_effort 全是 NaN)。模擬: /joint_states 有沒有 effort? '
+                            '實體車: collect_data_node 要給 wheel_feedback_topic:=/wheel_feedback')
+        elif m['effort_zero']:
+            problems.append(f'{tag}的扭矩回授全是 0 —— 發布端沒填 effort, 不是摩擦力真的是 0')
+        elif m['sat_frac'] > MAX_SAT_FRAC:
+            problems.append(
+                f'{tag}有 {m["saturated"]}/{len(F["_spin_rows"])} 趟自旋**馬達飽和** (扭矩貼著那個轉速下的'
+                '上限, 或輪速追不上指令): 量到的是馬達上限不是摩擦力, 比值不能信。'
+                + (f'**連最低那一檔都飽和, 再調低輪速也沒用** (低轉速時馬達的上限就是堵轉扭矩 '
+                   f'{m["stall_torque"]:g} N·m): 四輪平均要 {m["spin_torque_raw"]:.2f} N·m, 而載重會在'
+                   '對角輪之間跳, 個別輪子瞬間要的是平均的 1.4 倍以上。這個地面的摩擦力超出這台車 '
+                   '(車重 / 馬達) 量得到的範圍 —— 換一個摩擦小一點的地面, 或確認車重'
+                   if m['out_of_range'] else
+                   '把 spin_wheel_speed 調低再收一次 (轉得慢, 馬達出得了的扭矩才多)'))
+        ls = m['loss']
+        if ls is not None:
+            lo, hi = ls['at_spin'] or (float('nan'),) * 2
+            p(f'  {tag}馬達損耗 (B3 直行 {ls["n"]} 趟, 輪速 {ls["cruise_speeds"]}): '
+              f'loss(w) = {ls["c0"]:.3f} + {ls["c1"]:.4f}·w N·m -> 自旋輪速下 {lo:.3f}~{hi:.3f}, '
+              f'佔原始扭矩 {100 * (ls["frac_of_spin"] or 0):.0f}%, 已扣掉')
+        elif m['loss_requested'] and m['spin_trials']:
+            problems.append(f'{tag}沒有 B3 等速直行的資料 -> **馬達損耗沒有扣**。實體車的扭矩回授'
+                            '含馬達自己的損耗, 不扣會高估摩擦力; 兩邊要一致 (都扣或都不扣)')
+    dropped = Ft['_meta'].get('dropped_levels')
+    if dropped:
+        problems.append(
+            f'B1 輪速 {", ".join(f"{c:g}" for c in dropped)} rad/s 那幾檔馬達飽和 (扭矩貼著那個轉速下的'
+            '上限), 兩邊都拿掉, 只用剩下的檔位。下次把 spin_wheel_speed 調低, 三檔才都用得上')
+    for x in problems:
+        p(f'! {x}')
+    p('─' * 78)
+    spin_table(Fr, args.wheel_radius, p, '參考 ')
+    spin_table(Ft, args.wheel_radius, p, '目標 ')
     p('─' * 78)
     p(f'{"特徵":<44}{"參考":>8}{"目標":>8}{"比值":>7}   90% CI      n')
     for role, title in (('primary', '主特徵 (∝ mu)'), ('secondary', '副特徵'),
@@ -878,32 +996,45 @@ def report(ref_path, tgt_path, res, combined, Fr, Ft, args):
     p('─' * 78)
 
     if combined is None:
-        p('沒有任何主特徵 (B1 spin_coast / B2 creep_spin) 可用, 無法估計。')
+        p('沒有主特徵 (B1 spin_hold 的輪子扭矩) 可用, 無法估計。')
         return None
 
     r, (lo, hi) = combined['ratio'], combined['ci90']
     p(f'綜合 (主特徵加權 {combined["weights"]}):')
     p(f'  有效摩擦係數 目標/參考 = {r:.2f}   90% CI [{lo:.2f}, {hi:.2f}]')
-    p(f'  => 摩擦力{verdict(combined["ci90"], r, args.tol)},  約 {100 * (r - 1):+.0f}%')
+    if motor_saturated(Fr, Ft):
+        # 不下「至少 / 至多」的結論: 部分飽和時整台車的受力分布跟著變, 沒飽和的那幾輪
+        # 扭矩反而變大, 比值不保證偏向哪一邊 (實測真值 1.50 量到 1.58)。
+        sr, st = Fr['_meta']['sat_frac'] > MAX_SAT_FRAC, Ft['_meta']['sat_frac'] > MAX_SAT_FRAC
+        p('  => **馬達飽和, 這個比值不是摩擦力的比值**: '
+          + ('兩邊都飽和, 無法判斷。' if sr and st else
+             '目標飽和。' if st else '參考飽和。')
+          + (' 連最低那一檔都飽和, 超出這台車量得到的範圍 (見上面的 ! 訊息);'
+             if Ft['_meta']['out_of_range'] or Fr['_meta']['out_of_range'] else
+             ' 把 spin_wheel_speed 調低重收;')
+          + ' 這個數字不要拿來用。')
+    else:
+        p(f'  => 摩擦力{verdict(combined["ci90"], r, args.tol)},  約 {100 * (r - 1):+.0f}%')
 
     warn = []
-    prim = combined['features']
-    if len(prim) > 1:
-        signs = {np.sign(math.log(res[k]['ratio'])) for k in prim
-                 if abs(math.log(res[k]['ratio'])) > math.log(1 + args.tol)}
-        if len(signs) > 1:
-            warn.append('主特徵方向不一致 (一個說變大一個說變小), 結果不可信。')
-        ratios = [res[k]['ratio'] for k in prim]
-        if max(ratios) / min(ratios) > 1.5:
-            warn.append(f'主特徵之間差很多 ({", ".join(f"{x:.2f}" for x in ratios)}), '
-                        '靜摩擦與動摩擦可能不是同比例變化。')
+    if 'ramp_torque' in res and 'spin_torque' in res:
+        a, b = res['spin_torque']['ratio'], res['ramp_torque']['ratio']
+        if max(a, b) / min(a, b) > 1.3:
+            warn.append(f'B1 與 B2 的扭矩比值差很多 ({a:.2f} vs {b:.2f}): 扭矩跟轉速有關 '
+                        '(黏滯項 / 飽和), 不是純 Coulomb。')
     for k, x in res.items():
         if x['role'] == 'control' and abs(math.log(x['ratio'])) > math.log(1.2):
-            warn.append(f'對照組「{x["desc"]}」比值 {x["ratio"]:.2f} 偏離 1 —— 兩個環境'
-                        '可能不只摩擦不同 (馬達 / 質量 / 阻尼 / 位姿來源品質)。')
-    if 'launch_accel' in res and \
-            abs(math.log(res['launch_accel']['ratio'])) < 0.5 * abs(math.log(r)):
-        warn.append('B4 起步加速度的比值被壓向 1: 至少一邊是扭矩受限 (馬達卡住), 這是預期的。')
+            warn.append(f'對照組「{x["desc"]}」比值 {x["ratio"]:.2f} 偏離 1 —— '
+                        '兩個環境不只摩擦不同 (幾何 / 載重 / 馬達)。')
+    for key, slip in (('brake_decel', 'brake_slip'), ('launch_accel', 'launch_slip')):
+        # 綜合比值本身就接近 1 的時候不判斷: 兩邊摩擦差不多, 這個特徵的比值當然也
+        # 接近 1, 那不是「被壓向 1」(2026-10-13: 1.04 vs 1.00 就跳了這個警告)。
+        if (key in res and abs(math.log(r)) > math.log(1.15)
+                and abs(math.log(res[key]['ratio'])) < 0.5 * abs(math.log(r))):
+            s = res.get(slip)
+            warn.append(f'{FEATURES[key][0]} 的比值被壓向 1: 至少一邊是扭矩受限 (輪子沒在滑'
+                        + (f', slip 參考 {s["ref"]:.2f} / 目標 {s["target"]:.2f}' if s else '')
+                        + '), 這個特徵在這台車上不帶摩擦資訊。')
     for w in warn:
         p(f'  ! {w}')
 
@@ -932,13 +1063,13 @@ def plot(ref_path, tgt_path, Fr, Ft, res, outdir):
         ax.set_title(f'{k}\nratio {res[k]["ratio"]:.2f}', fontsize=9)
     ax = axes[-1]
     for F, lab in ((Fr, 'ref'), (Ft, 'target')):
-        a = np.asarray(F['_spin_rows'])
+        a = np.asarray([r[:4] for r in F['_spin_rows']], float)
         if len(a):
-            ax.scatter(a[:, 0], a[:, 2], s=12, label=f'{lab} α={stat(F, "spin_decel"):.1f}')
-    ax.set_xlabel('w0 [rad/s]')
-    ax.set_ylabel('coast angle dθ [rad]')
+            ax.scatter(a[:, 0], a[:, 1], s=12, label=f'{lab} tau={stat(F, "spin_torque"):.2f}')
+    ax.set_xlabel('wheel speed cmd [rad/s]')
+    ax.set_ylabel('wheel torque [N m]')
     ax.legend(fontsize=8)
-    ax.set_title('B1 coast: dθ vs w0', fontsize=9)
+    ax.set_title('B1: torque vs wheel speed', fontsize=9)
     fig.tight_layout()
     name = f'{os.path.splitext(os.path.basename(ref_path))[0]}_vs_' \
            f'{os.path.splitext(os.path.basename(tgt_path))[0]}.png'
@@ -983,7 +1114,7 @@ def main():
     ap.add_argument('targets', nargs='+', help='要跟參考比較的 CSV (可多個)')
     ap.add_argument('--source', default='auto',
                     choices=['auto', 'gyro', 'gt', 'fus', 'lid', 'cam', 'imu', 'whl'],
-                    help='訊號來源 (預設 auto: 有 _imu.csv 就用 gyro, 否則 gt)')
+                    help='車體運動的來源 (預設 auto: 有 _imu.csv 就用 gyro, 否則 gt)')
     ap.add_argument('--compare-gt', action='store_true',
                     help='同一份資料再用 GT 算一次並排印 (驗證感測器流程)')
     ap.add_argument('--gyro-noise', type=float, default=0.0,
@@ -991,8 +1122,21 @@ def main():
     ap.add_argument('--gyro-bias', type=float, default=0.0, help='注入 gyro 零偏 [rad/s]')
     ap.add_argument('--acc-noise', type=float, default=0.0, help='注入加速度白雜訊 std [m/s²]')
     ap.add_argument('--acc-bias', type=float, default=0.0, help='注入前向加速度零偏 [m/s²]')
-    ap.add_argument('--forward-axis-deg', type=float, default=-90.0,
-                    help='車頭相對 base_link 的角度, 跟 control_car_node 的參數一致')
+    ap.add_argument('--forward-axis-deg', type=float, default=0.0,
+                    help='車頭相對 base_link 的角度, 跟 control_car_node 的參數一致 '
+                         '(kros_car 是 0; 舊的 car.usd 是 -90)')
+    ap.add_argument('--wheel-radius', type=float, default=0.05035,
+                    help='輪半徑 [m] (算 slip ratio 與等效輪距用)')
+    ap.add_argument('--torque-limit', type=float, default=2.0,
+                    help='馬達堵轉扭矩 [N·m]。自旋扭矩貼著上限 = 飽和, 那一趟量到的不是摩擦')
+    ap.add_argument('--no-load-speed', type=float, default=20.94,
+                    help='馬達空載轉速 [rad/s] (DDSM115: 200 rpm)。0 = 上限不隨轉速變')
+    ap.add_argument('--rated-speed', type=float, default=12.04,
+                    help='額定轉速 [rad/s] (DDSM115: 115 rpm)')
+    ap.add_argument('--rated-torque', type=float, default=0.96,
+                    help='額定轉速下的扭矩 [N·m] (DDSM115: 0.96)')
+    ap.add_argument('--no-loss-correction', action='store_true',
+                    help='不要用 B3 等速直行的扭矩去扣馬達損耗')
     ap.add_argument('--max-sigma', type=float, default=None,
                     help='感測器 _sigma 上限 (lid 預設 0.0025, 其他不濾)')
     ap.add_argument('--max-age', type=float, default=0.3, help='感測器 _age 上限 [s]')
@@ -1008,7 +1152,7 @@ def main():
     g.add_argument('--ground-prim', default='/Environment/groundCollider',
                    help='地面碰撞體的 prim 路徑')
     g.add_argument('--wheel-pattern', default='wheel',
-                   help='輪子碰撞體名稱的 regex (不分大小寫)')
+                   help='輪子碰撞體 prim 路徑的 regex (不分大小寫)')
     g.add_argument('--ref-ground-mu', type=float, default=None,
                    help='參考環境地面 mu (靜 / 動相同時的簡寫)')
     g.add_argument('--ref-ground-static', type=float, default=None)
@@ -1039,10 +1183,8 @@ def main():
               + ('' if have_imu else ' (找不到 *_imu.csv; 舊資料或 imu_csv:=false)'))
     if args.max_sigma is None and args.source == 'lid':
         args.max_sigma = 0.0025
-    if args.source in ('whl', 'lid'):
-        print(f'! --source {args.source}: '
-              + ('輪速里程計在打滑時是錯的, 而打滑就是摩擦造成的 (循環論證)。'
-                 if args.source == 'whl' else 'B1 自旋 > ~8 rad/s 時雷射會追丟。'))
+    if args.source == 'whl':
+        print('! --source whl: 輪速里程計在打滑時是錯的, 而打滑就是摩擦造成的 (循環論證)。')
     noise = None
     if any((args.gyro_noise, args.gyro_bias, args.acc_noise, args.acc_bias)):
         if args.source != 'gyro':
@@ -1063,42 +1205,11 @@ def main():
         return load_track(p, source, args.forward_axis_deg, args.max_sigma, args.max_age)
 
     def run(source):
-        tracks = {p: load(p, source) for p in paths}
-        # 起轉偵測門檻**所有檔案共用一個**: 門檻不同 = 偵測延遲不同 = 起轉 effort 的
-        # 偏差不同, 比值就不公平了。取最吵的那個來源決定。
-        th = max(0.02, max(6.0 * yaw_noise(segments(t)) for t in tracks.values()))
-        F = {p: extract(tr, th) for p, tr in tracks.items()}
-        # B1 只用線性段點數夠的 trial。點太少的 coast (高 mu + 低轉速, 整段 < 0.1 s)
-        # 幾乎全是放開後的過渡段, 減速度系統性偏低 —— 2026-09-15 校正資料:
-        # sim mu 1.5 的 w0=2 那組 32 vs 其他 50, 混進去中位數的 cv 從 0.03 變 0.17。
-        # 門檻**所有檔案共用**, 從 SPIN_MIN_PTS 往下找到每個檔案都還有 3 個 trial 為止。
-        for m in range(SPIN_MIN_PTS, 2, -1):
-            if all(sum(p >= m for p in f['_spin_pts']) >= 3 for f in F.values()):
-                break
-        for f in F.values():
-            keep = [p >= m for p in f['_spin_pts']]
-            dropped = len(keep) - sum(keep)
-            f['spin_decel'] = [v for v, k in zip(f['spin_decel'], keep) if k]
-            f['_spin_w0'] = [v for v, k in zip(f['_spin_w0'], keep) if k]
-            f['_meta']['spin_min_pts'] = m
-            f['_meta']['spin_dropped'] = dropped
-        if m < SPIN_MIN_PTS:
-            print(f'! [{source}] B1 線性段 >= {SPIN_MIN_PTS} 點的 trial 不夠, 門檻降到 {m} 點 (偏差較大)')
-        # B1 線性擬合每個 coast 要 >= 3 個點。20 Hz 的位姿資料在高 mu 環境常常湊不滿
-        # (coast 只有 0.15 s) -> **所有檔案一起**退回能量法。只有一邊退回的話兩邊
-        # 偏差不同, 比值就不公平。
-        wr = match_spin_w0(list(F.values()))
-        if wr is None:
-            print(f'! [{source}] trial 數不夠, spin_decel 沒有做 w0 校正')
-        w_ref = fill_spinup_time(list(F.values()))
-        if w_ref is None:
-            print(f'! [{source}] B1 spin_up 沒有可用的軌跡, 沒有 spinup_time')
-        if any(len(f['spin_decel']) < 3 for f in F.values()):
-            print(f'! [{source}] B1 線性段點數不夠 (IMU 全速率檔才夠密), '
-                  'B1 主特徵改用能量法 —— 會含放開後的過渡段, 比值偏向 1')
-            for f in F.values():
-                f['spin_decel'], f['spin_decel_energy'] = f['spin_decel_energy'], []
-        return F
+        motor = Motor(args.torque_limit, args.no_load_speed, args.rated_speed,
+                      args.rated_torque)
+        return {p: extract(load(p, source), args.wheel_radius, motor,
+                           loss_correction=not args.no_loss_correction)
+                for p in paths}
 
     feats = run(args.source)
     gt_feats = None
@@ -1108,14 +1219,14 @@ def main():
         except (KeyError, SystemExit):
             print('! --compare-gt: 資料裡沒有 GT (真車?), 略過')
 
-    Fr = feats[args.ref]
     results = {}
     for tp in args.targets:
-        Ft = feats[tp]
+        Fr, Ft = use_clean_levels(feats[args.ref], feats[tp])
         res, combined = compare(Fr, Ft, args.boot, rng)
         out = report(args.ref, tp, res, combined, Fr, Ft, args)
         if gt_feats is not None and out is not None:
-            gres, gcomb = compare(gt_feats[args.ref], gt_feats[tp], args.boot, rng)
+            gres, gcomb = compare(*use_clean_levels(gt_feats[args.ref], gt_feats[tp]),
+                                  args.boot, rng)
             if gcomb:
                 err = 100 * (combined['ratio'] / gcomb['ratio'] - 1)
                 p = print
@@ -1126,14 +1237,24 @@ def main():
                     if k in gres:
                         p(f'      {k:<18} {args.source} {res[k]["ratio"]:.2f}   gt {gres[k]["ratio"]:.2f}')
                 out['gt_ratio'] = gcomb['ratio']
-        ground = ground_report(res, args) if res else None
+        if res and motor_saturated(Fr, Ft):
+            print('═' * 78)
+            print('★ 不換算地面摩擦係數: 馬達飽和, 量到的扭矩不是摩擦力 (見上面的 ! 訊息)。')
+            ground = None
+        else:
+            ground = ground_report(res, args) if res else None
         if args.plot and res:
             plot(args.ref, tp, Fr, Ft, res, args.plot)
         lq = {k: (None if args.loc_quality.get(pth) is None else
                   {'message': args.loc_quality[pth][0], 'bad': bool(args.loc_quality[pth][1])})
               for k, pth in (('ref', args.ref), ('target', tp))}
+        # 馬達飽和 / 沒有扭矩回授: friction_calib_step.py 靠這個決定資料能不能用
+        motor = {k: {key: F['_meta'][key] for key in
+                     ('spin_trials', 'no_effort', 'saturated', 'sat_frac', 'effort_zero',
+                      'loss', 'out_of_range', 'stall_torque', 'spin_torque_raw')} | {'dropped_levels': F['_meta'].get('dropped_levels', [])}
+                 for k, F in (('ref', Fr), ('target', Ft))}
         results[tp] = {'summary': out, 'combined': combined, 'features': res,
-                       'ground_friction': ground, 'loc_quality': lq,
+                       'ground_friction': ground, 'loc_quality': lq, 'motor': motor,
                        'excluded': {'ref': Fr['_meta']['excluded'],
                                     'target': Ft['_meta']['excluded']}}
     if args.json:

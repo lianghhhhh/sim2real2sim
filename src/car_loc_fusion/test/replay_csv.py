@@ -40,8 +40,11 @@ from car_loc_wheel.wheel_ins import WheelStillDetector              # noqa: E402
 
 WHEEL_COLS = ('front_left_velocity', 'front_right_velocity',
               'rear_left_velocity', 'rear_right_velocity')
-RADIUS = 0.075
-FORWARD_DEG = -90.0
+# kros_car.usd (舊的 car.usd 是 0.075 / -90 / wheel_scale 0.93)
+RADIUS = 0.05035
+FORWARD_DEG = 0.0
+# fusion_loc.yaml 的 camera_offset: 相機量到的點 (bbox 中心) 在 base_link 裡的位置
+CAMERA_OFFSET = (0.0151, -0.0008)
 
 
 def load(path):
@@ -105,7 +108,7 @@ def load(path):
 
 def replay(d, *, camera=True, lidar=True, rewind=True, clock_fix=True,
            lidar_sigma_max=0.0025, cam_extra_delay=0.0, sigma_acc=1.5,
-           wheel_scale=0.93):
+           wheel_scale=1.0, camera_offset=CAMERA_OFFSET):
     cmo, cft = (1.0, 0.1) if clock_fix else (1e9, 1e9)
     src = {
         'camera': AbsSource('camera', enabled=camera, sigma_floor=0.03,
@@ -146,7 +149,8 @@ def replay(d, *, camera=True, lidar=True, rewind=True, clock_fix=True,
             if not ok:
                 continue
             am = AbsMeas(mt, mm['src'], mm['x'], mm['y'], s.sigma_for(mm['reported']),
-                         yaw=mm['yaw'], yaw_sigma=s.yaw_sigma)
+                         yaw=mm['yaw'], yaw_sigma=s.yaw_sigma,
+                         offset=camera_offset if mm['src'] == 'camera' else (0.0, 0.0))
             if f.absolute(am, use_yaw=s.use_yaw):
                 s.mark_used(mt)
             else:
@@ -231,6 +235,12 @@ def main(argv):
     for ed in (0.0, 0.03, 0.05, 0.08):
         row(f'camera_extra_delay = {ed:.2f} s', replay(d, cam_extra_delay=ed))
     print('     掃出來的最小值就是該填的。**時鐘修好之後要設回 0** (不然扣兩次)。')
+
+    print('\n[6] 相機的量測點偏移 (bbox 中心不在 base_link 原點, 見 fusion_loc.yaml)')
+    row('camera_offset = (0, 0)', replay(d, camera_offset=(0.0, 0.0)))
+    row(f'camera_offset = {CAMERA_OFFSET}', replay(d, camera_offset=CAMERA_OFFSET))
+    row('  只有相機, (0, 0)', replay(d, lidar=False, camera_offset=(0.0, 0.0)))
+    row(f'  只有相機, {CAMERA_OFFSET}', replay(d, lidar=False, camera_offset=CAMERA_OFFSET))
 
     print('\n' + line)
     print('  提醒: 這支的遞推是 20 Hz 而且沒有加速度計 (CSV 沒錄), 所以絕對數字')

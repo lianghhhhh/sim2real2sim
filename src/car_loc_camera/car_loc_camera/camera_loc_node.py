@@ -173,6 +173,12 @@ class CameraLocalizer(Node):
         self.get_logger().info(
             f'校正檔 {calib} (擬合解析度 {self.proj.ref_w:.0f}x{self.proj.ref_h:.0f}, '
             f'殘差 {self.proj.sigma * 100:.1f} cm, 延遲 {self.proj.delay * 1000:.0f} ms)')
+        if self.proj.body_offset.any():
+            bo = self.proj.body_offset
+            self.get_logger().info(
+                f'發出去的位置是 **bbox 中心**, 在 base_link 的 '
+                f'({bo[0] * 100:+.1f}, {bo[1] * 100:+.1f}) cm 處 (車體座標)。這裡不扣 '
+                '(相機沒有可信的 yaw); 融合節點的 camera_offset 會扣。')
 
         # --- 濾波器 ------------------------------------------------------------
         ms = float(g('meas_sigma').value)

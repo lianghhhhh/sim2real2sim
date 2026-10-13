@@ -48,7 +48,9 @@ def generate_launch_description():
                               description='三條路線同時跑時只能留一條發 map->base_link'),
         DeclareLaunchArgument('publish_debug_cloud', default_value='false',
                               description='true = 把配準後的點雲發出去疊在地圖上看'),
-        DeclareLaunchArgument('lidar_z', default_value='0.20'),
+        # laser_frame 相對 base_link 的位置 (kros_car.usd); 舊的 car.usd 是 x 0 / z 0.20
+        DeclareLaunchArgument('lidar_x', default_value='0.045'),
+        DeclareLaunchArgument('lidar_z', default_value='0.236'),
         DeclareLaunchArgument('evaluate', default_value='false'),
         DeclareLaunchArgument('teleop', default_value='false'),
         DeclareLaunchArgument('csv', default_value=''),
@@ -58,7 +60,8 @@ def generate_launch_description():
     static_lidar = Node(
         package='tf2_ros', executable='static_transform_publisher',
         name='static_tf_lidar',
-        arguments=['--x', '0', '--y', '0', '--z', LaunchConfiguration('lidar_z'),
+        arguments=['--x', LaunchConfiguration('lidar_x'), '--y', '0',
+                   '--z', LaunchConfiguration('lidar_z'),
                    '--frame-id', 'base_link',
                    '--child-frame-id', LaunchConfiguration('lidar_frame')],
         parameters=[{'use_sim_time': use_sim_time}])

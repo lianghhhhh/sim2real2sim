@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""直接從 car.usd 的幾何算出 2D 佔據地圖 —— 不用開 Isaac, 也不用邊開車邊建圖。
+"""直接從 USD (預設 kros_car.usd) 的幾何算出 2D 佔據地圖 —— 不用開 Isaac, 也不用邊開車邊建圖。
 
 為什麼要這樣做:
     「建圖」跟「定位」的誤差長得一模一樣。用 SLAM 邊開邊建出來的地圖, 牆的位置
@@ -16,8 +16,8 @@
 
 用法 (在 host 上跑, 不是在 docker 裡):
     ./scripts/make_map_from_usd.py
-    ./scripts/make_map_from_usd.py --resolution 0.02 --out src/car_loc_lidar /maps/room.npz
-    ./scripts/make_map_from_usd.py car_sim.usd --out src/car_loc_lidar /maps/room_sim.npz
+    ./scripts/make_map_from_usd.py --resolution 0.02 --out src/car_loc_lidar/maps/room.npz
+    ./scripts/make_map_from_usd.py car_sim.usd --out src/car_loc_lidar/maps/room_sim.npz
 
 輸出:
     <out>.npz        car_loc_lidar  定位用的地圖
@@ -40,8 +40,8 @@ def run_worker(args):
     import numpy as np
     from pxr import Usd, UsdGeom
 
-    sys.path.insert(0, os.path.join(REPO, 'src', 'car_loc_lidar '))
-    from car_loc_lidar .gridmap import GridMap
+    sys.path.insert(0, os.path.join(REPO, 'src', 'car_loc_lidar'))
+    from car_loc_lidar.gridmap import GridMap
 
     stage = Usd.Stage.Open(args.usd)
     if stage is None:
@@ -224,8 +224,9 @@ def run_worker(args):
         keep[ok] = grid.occ[row[ok], col[ok]]
         kept_pts = pts[keep]
 
-    # 距離場直接用表面取樣點算, 不經過格點 -> 地圖幾何誤差 ~取樣間距, 不是半格
-    grid.set_exact_distance(kept_pts)
+    # (以前這裡會用表面取樣點直接算距離場; GridMap 現在一律從佔據格算, 存檔也只存
+    #  佔據格, 所以地圖的幾何誤差是半格 —— 要更細就把 --resolution 調小。)
+    del kept_pts
 
     out = os.path.abspath(os.path.expanduser(args.out))
     if not out.endswith('.npz'):
@@ -269,22 +270,21 @@ def _keep_visible(grid, seed):
     removed = int(grid.occ.sum() - visible.sum())
     grid.occ = visible
     grid._dist = None
-    grid._grad = None
     return removed
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('usd', nargs='?', default=os.path.join(REPO, 'car.usd'))
-    ap.add_argument('--out', default=os.path.join(REPO, 'src', 'car_loc_lidar ',
+    ap.add_argument('usd', nargs='?', default=os.path.join(REPO, 'kros_car.usd'))
+    ap.add_argument('--out', default=os.path.join(REPO, 'src', 'car_loc_lidar',
                                                   'maps', 'car_usd.npz'),
                     help='輸出的 .npz (同名的 .pgm/.yaml 也會一起產生)')
     ap.add_argument('--resolution', type=float, default=0.05, help='格點大小 (m)')
     ap.add_argument('--z-min', type=float, default=0.05,
                     help='高度帶下界 (m, 地面在 0)。要高過地面。')
     ap.add_argument('--z-max', type=float, default=0.95,
-                    help='高度帶上界 (m)。要低於牆的頂端 (car.usd 的牆頂在 1.00)。')
+                    help='高度帶上界 (m)。要低於牆的頂端 (房間的牆頂在 1.00)。')
     ap.add_argument('--min-surface-tilt', type=float, default=15.0,
                     help='表面要比水平面陡多少度才算牆 (度)。低於這個角度的面視為'
                          '地板/頂面, 不進地圖。')
@@ -293,7 +293,8 @@ def main():
     ap.add_argument('--circle-segments', type=int, default=256,
                     help='圓柱/球體切成幾段 (影響柱子的圓有多圓)')
     ap.add_argument('--exclude', nargs='*',
-                    default=['/World/small_car', '/Environment', '/Render', '/OmniverseKit'],
+                    default=['/kros_car', '/World/small_car', '/Environment', '/Render',
+                             '/OmniverseKit'],
                     help='要排除的 prim 路徑前綴 (車子本身一定要排除)')
     ap.add_argument('--seed', type=float, nargs=2, default=[0.0, 0.0],
                     metavar=('X', 'Y'),

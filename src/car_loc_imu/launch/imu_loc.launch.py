@@ -51,10 +51,10 @@ def generate_launch_description():
                               description='加速度過程雜訊底線; '
                                           'orientation 模式 0.03, '
                                           'complementary (6 軸) 要 0.35'),
-        DeclareLaunchArgument('forward_deg', default_value='-90.0',
+        DeclareLaunchArgument('forward_deg', default_value='0.0',
                               description='base_link +X 量到車頭的角度; '
-                                          'car.usd 車頭是 -Y 所以 -90, '
-                                          'REP-103 的車給 0'),
+                                          'kros_car 照 REP-103 是 0, '
+                                          '舊的 car.usd 車頭是 -Y 要給 -90'),
         DeclareLaunchArgument('enable_zupt', default_value='true'),
         DeclareLaunchArgument('enable_zaru', default_value='true'),
         DeclareLaunchArgument('enable_nhc', default_value='true'),

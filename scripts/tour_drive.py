@@ -53,11 +53,11 @@ def wrap(a):
 
 class Tour(Node):
     def __init__(self, loops, v_max, w_max, tol, stuck_timeout=25.0,
-                 forward_axis_deg=-90.0):
+                 forward_axis_deg=0.0):
         super().__init__('tour_drive')
-        # /odom 的 yaw 是 base_link +X 的方向, 但 car.usd 的 base_link 是 +X 朝左、
-        # 車頭 -Y。cmd_vel_bridge 的 linear.x 是「車頭方向」, 所以追點要用車頭的
-        # 方向算角度誤差, 不是 base_link +X —— 差 90° 的話車子會繞著路徑點打轉,
+        # /odom 的 yaw 是 base_link +X 的方向。cmd_vel_bridge 的 linear.x 是「車頭
+        # 方向」, 所以追點要用車頭的方向算角度誤差。kros_car.usd 的車頭就是 +X (0 度);
+        # 舊的 car.usd 是 +X 朝左、車頭 -Y (-90 度) —— 給錯的話車子會繞著路徑點打轉,
         # 一路甩到牆上。跟 control_car_node 的 forward_axis_deg 是同一件事。
         self.fwd_off = math.radians(forward_axis_deg)
         self._check = None  # (x, y, heading) 用來驗證車頭方向真的對
@@ -158,13 +158,13 @@ class Tour(Node):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--loops', type=int, default=1)
-    ap.add_argument('--v-max', type=float, default=0.55)
+    ap.add_argument('--v-max', type=float, default=0.45)     # 輪速上限 10 rad/s = 0.50 m/s
     ap.add_argument('--w-max', type=float, default=0.9)
     ap.add_argument('--tol', type=float, default=0.35)
     ap.add_argument('--stuck-timeout', type=float, default=25.0,
                     help='這麼久沒有更靠近目標就跳過它 (秒)')
-    ap.add_argument('--forward-axis-deg', type=float, default=-90.0,
-                    help='base_link +X 量到車頭的角度; car.usd 車頭是 -Y 所以 -90')
+    ap.add_argument('--forward-axis-deg', type=float, default=0.0,
+                    help='base_link +X 量到車頭的角度; kros_car 是 0, 舊的 car.usd 是 -90')
     a = ap.parse_args()
     rclpy.init()
     n = Tour(a.loops, a.v_max, a.w_max, a.tol, a.stuck_timeout,

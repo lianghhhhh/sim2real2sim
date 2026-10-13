@@ -20,15 +20,27 @@ fusion_localizer:
     # --- 車體 (跟 wheel_loc.yaml 相同) ---------------------------------------
     wheel_names: [front_left_joint, front_right_joint,
                   rear_left_joint, rear_right_joint]
-    wheel_radius: 0.075
-    # 有效輪半徑 / 幾何值。跟牽引狀態有關: 有扭矩 0.93, 滑行 1.008 (= 幾何值)。
+    wheel_radius: 0.05035        # kros_car.usd
+    # 有效輪半徑 / 幾何值。kros_car (輪速控制) 還沒量過, 1.0 是幾何值; 舊的
+    # car.usd 在 effort 控制下是 0.93。
     # 融合對這個值比純航位推算**不敏感** —— 尺度誤差被絕對量測按住了, 只影響
     # 兩則絕對量測之間的那 30~100 ms。但還是給對的好: 絕對量測掉線時它就是全部。
-    wheel_scale: 0.93
-    # base_link +X 量到車頭的角度。car.usd 是 +X 朝左、車頭 -Y, 所以 -90。
-    # REP-103 的車給 0。給錯的話遞推會往垂直於實際行進的方向跑, 然後絕對量測
-    # 一直在把它拉回來 —— 症狀是「閘門擋掉的數量很大, 但位置看起來還行」。
-    forward_deg: -90.0
+    wheel_scale: 1.0
+    # base_link +X 量到車頭的角度。kros_car.usd 照 REP-103 是 0; 舊的 car.usd
+    # (+X 朝左、車頭 -Y) 要給 -90。給錯的話遞推會往垂直於實際行進的方向跑, 然後
+    # 絕對量測一直在把它拉回來 —— 症狀是「閘門擋掉的數量很大, 但位置看起來還行」。
+    forward_deg: 0.0
+    # IMU 在 base_link 裡的位置 [x, y] (m)。不在旋轉中心時, 車子一轉 IMU 就會量到
+    # 向心加速度 w^2*r 與切線加速度 (角加速度 x r); 節點會把量到的加速度換算回
+    # base_link 原點。kros_car.usd 的 imu_link 在 (+0.125, -0.0286), 離中心 12.8 cm
+    # (1.7 rad/s 的自旋就是 0.39 m/s^2)。IMU 在中心的車給 [0.0, 0.0]。
+    imu_lever_arm: [0.125, -0.0286]
+    # !! **Isaac 的 IMU 不模擬安裝位置** (它回報的是車體原點的加速度; 2026-10-13 對
+    #    ground truth 擬合出來的等效位置是 (+0.007, -0.001) m)。所以 use_sim_time 開著
+    #    時節點**不會**做這個補償, 上面那個值只在實體車 (use_sim_time:=false) 生效。
+    #    模擬裡照樣扣的話是憑空加進假加速度 (1.5 rad/s 自旋 0.28 m/s^2): 同一套摩擦力
+    #    測試, 純 IMU 那條的誤差中位 4.1 m -> 0.5 m, IMU+輪速 45 -> 37 cm。
+    imu_lever_arm_in_sim: false
 
     # --- 重力 / yaw 的來源 ----------------------------------------------------
     gravity_mode: orientation        # 真車 6 軸 IMU 改 complementary (+ sigma_acc 0.35)
@@ -126,6 +138,15 @@ fusion_localizer:
     # 這裡的 yaw 已經有 IMU 的絕對姿態 (0.07 度), 吃它只會變差。
     camera_use_yaw: false
     camera_timeout: 0.5
+    # 相機量到的那一點 (bbox 中心) 在 base_link 裡的位置 [x, y] (m)。
+    # kros_car 車頭有手臂, bbox 中心在 base_link 原點**前方 1.5 cm**; 這個偏移跟著
+    # 車頭轉, 所以相機那邊的單應性吸收不掉, 而相機自己又沒有可信的 yaw 可以扣 ——
+    # 只有這裡 (yaw 0.06 度) 修得了。舊的 car.usd 是對稱的車身, 這一項是 0。
+    # 2026-10-13 用兩份 kros_car 的資料合起來量 (n=23201), 相機原始投影對
+    # ground truth 的 RMS: 不扣 2.55 cm -> 扣掉 1.79 cm。
+    # 換車 / 改手臂姿勢 / 換 YOLO 模型就要重量:
+    #   python3 scripts/calibrate_camera_ground.py <CSV>   (會連這一行一起改)
+    camera_offset: [0.0151, -0.0008]
 
     # --- 時鐘 (2026-09-10 踩到的真問題, 見 README [H]) -------------------------
     # 時戳跟濾波器差超過這麼多、**或是持續落在未來**, 就認定是時鐘基準不一樣,

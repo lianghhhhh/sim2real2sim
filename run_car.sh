@@ -6,7 +6,10 @@
 #    2. 迴圈:  用目前的摩擦係數量 sim
 #              -> scripts/friction_calib_step.py 比對 sim 與 real
 #              -> 兩邊量不出差別就停; 否則換算出新的摩擦係數, 再量一輪 sim
-#    3. 把收斂的摩擦係數另存成新的 USD (不動原本的 car_sim.usd)
+#    3. 把收斂的摩擦係數另存成新的 USD (不動原本的 kros_car_05_sim.usd)
+#
+#  車子是輪速控制 (kros_car*.usd): 摩擦力從「等速原地轉時的輪子扭矩」量,
+#  見 src/calibrate_env_pkg/calibrate_env_pkg/control_car_node.py 檔頭。
 #
 #  每一輪的 CSV、比對結果 JSON、history.json 都在 car_run_data/<run 名稱>/。
 #  Isaac 端是 load_isaac_usd.py 的工作佇列模式 (見那支檔案的說明)。
@@ -18,9 +21,9 @@ set -e
 # ─────────────────────────────────────────────────────────────
 ISAAC_SIM_PATH="${ISAAC_SIM_PATH:-/home/liang/isaac-sim/isaac-sim.streaming.sh}"   # 請改成你的路徑
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIM_USD_PATH="$REPO_DIR/car_sim.usd"
-REAL_USD_PATH="$REPO_DIR/car_real.usd"
-CALIBRATED_USD="$REPO_DIR/car_sim_calibrated.usd"
+SIM_USD_PATH="$REPO_DIR/kros_car_10_real.usd"
+REAL_USD_PATH="$REPO_DIR/kros_car_05_sim.usd"
+CALIBRATED_USD="$REPO_DIR/kros_car_sim_calibrated.usd"
 RUN_NAME="calib_$(date +%Y%m%d_%H%M%S)"
 # 測試腳本用什麼狀態控制車子: sensor = 融合定位 + IMU (接近真車, 會一起開定位節點)
 #                            gt     = Isaac /odom (舊流程)
@@ -33,12 +36,16 @@ INIT_STATIC=""          # sim 第 0 輪的地面 staticFriction; 空 = 用 USD �
 INIT_DYNAMIC=""
 GAIN=1.0                # 更新步長, 1 = 直接跳到估計值; 震盪的話調小
 TOL=0.05                # 收斂容許誤差: 預測的地面摩擦修正量 <= 這個值就停
-WHEEL_MU=0.5            # 輪子材質 mu (car_*.usd 的輪子沒綁物理材質 -> PhysX 預設 0.5)
+WHEEL_MU=0.5            # 輪子材質 mu (kros_car*.usd 的輪子沒綁物理材質 -> PhysX 預設 0.5)
 COMBINE="average"       # PhysX friction combine mode
 # tied = 只解一個 mu, staticFriction 跟著 dynamicFriction (預設; 見 friction_calib_step.py
-#        檔頭: 靜摩擦只有 B2 量得到, 敏感度只有 0.3, 分開解會生出假的靜動差)
-# free = 用 B2 起轉 effort 分開解靜摩擦
+#        檔頭: 靜摩擦只有 B2 的起轉峰值量得到, 解析度差, 分開解會生出假的靜動差)
+# free = 用 B2 起轉峰值扭矩分開解靜摩擦
 STATIC_MODE="tied"
+# B1 / B2 自旋與 B3 直行用的輪速 (rad/s)。分析報「馬達飽和」時調低 (例如 3):
+# 轉得慢, 馬達出得了的扭矩才多。real 與 sim 每一輪都用同一個值;
+# --reuse-real 的那份 real 也必須是用同一個值收的。
+SPIN_WHEEL_SPEED=6.0
 GROUND_PRIM="/Environment/groundCollider/PhysicsMaterial"
 REUSE_REAL=""           # 已經量好的 real CSV; 給了就不重量 real
 SKIP_ISAAC_LAUNCH=0     # 1 = Isaac 已經用 load_isaac_usd.py 開著了, 不要再開一個
@@ -85,6 +92,7 @@ usage() {
   --gain G                更新步長                    (預設 $GAIN)
   --wheel-mu MU           輪子材質 mu                 (預設 $WHEEL_MU)
   --combine MODE          average|min|multiply|max    (預設 $COMBINE)
+  --spin-wheel-speed W    自旋量測的輪速 rad/s; 報馬達飽和時調低 (預設 $SPIN_WHEEL_SPEED)
 
 其他
   --state-source sensor|gt                            (預設 $STATE_SOURCE)
@@ -113,6 +121,7 @@ while [[ $# -gt 0 ]]; do
         --tol)              TOL="$2"; shift 2 ;;
         --wheel-mu)         WHEEL_MU="$2"; shift 2 ;;
         --combine)          COMBINE="$2"; shift 2 ;;
+        --spin-wheel-speed) SPIN_WHEEL_SPEED="$2"; shift 2 ;;
         --state-source)     STATE_SOURCE="$2"; shift 2 ;;
         --static-mode)      STATIC_MODE="$2"; shift 2 ;;
         -n|--container)     CONTAINER_NAME="$2"; shift 2 ;;
@@ -271,13 +280,19 @@ isaac_stop() {
 measure() {
     local csv="$1"
     echo "開始收集資料 ($HOST_RUN_DIR/$csv)..."
-    docker exec "$CONTAINER_NAME" bash -ic "
-        r
-        ros2 launch bringup_pkg friction_test.launch.py \
-            state_source:=${STATE_SOURCE} \
-            csv_filename:=${csv} \
-            output_dir:=${CONT_RUN_DIR}
-    " || { echo "警告：測試腳本以非 0 結束"; }
+    # 節點的輸出同時存一份到 <csv 檔名>.log: 定位節點的狀態列 (各來源被採用 / 被擋的
+    # 次數、時鐘偏移、接縫校正結果) 只印在這裡, 事後要查定位問題沒有它查不了。
+    local log="$HOST_RUN_DIR/${csv%.csv}.log"
+    {
+        docker exec "$CONTAINER_NAME" bash -ic "
+            r
+            ros2 launch bringup_pkg friction_test.launch.py \
+                state_source:=${STATE_SOURCE} \
+                spin_wheel_speed:=${SPIN_WHEEL_SPEED} \
+                csv_filename:=${csv} \
+                output_dir:=${CONT_RUN_DIR}
+        " || echo "警告：測試腳本以非 0 結束"
+    } 2>&1 | tee "$log"
     local lines=0
     [[ -f "$HOST_RUN_DIR/$csv" ]] && lines=$(wc -l < "$HOST_RUN_DIR/$csv")
     if (( lines < 200 )); then

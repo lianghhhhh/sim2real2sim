@@ -9,9 +9,10 @@
 或者不用鍵盤, 從 Foxglove 的 Teleop 面板往 /cmd_vel 發也可以 (見
 car_viz 的 viz.launch.py)。
 
-為什麼要有這一層: car.usd 的車子是扭矩控制, 而且幾乎沒有滾動阻力 —— 固定 effort
-會一路加速, 鬆開也不會停。這個節點把 /cmd_vel 的「我要幾 m/s」用 PI 翻譯成扭矩,
-回授吃 /joint_states 的輪速與 /imu 的角速度 (都是真車上也有的感測器)。
+為什麼要有這一層: 車子 (kros_car.usd / 實體 KROS car) 收的是四輪的輪速
+(/joint_command 的 velocity, rad/s)。這個節點把 /cmd_vel 的「我要幾 m/s、幾 rad/s」
+換算成左右輪速, 轉速另外用 /imu 的 gyro 做一點積分修正 (skid-steer 轉彎時輪子
+一定在滑, 輪速差對不上實際轉速)。指令逾時會自動歸零。
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -24,9 +25,8 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('cmd_vel_topic', default_value='/cmd_vel'),
         DeclareLaunchArgument('imu_topic', default_value='/imu'),
-        # 建圖用的預設值刻意很慢。這台車 effort 開到 4 就有 3.6 m/s,
-        # 在 10x6 的房間裡兩秒撞牆, 掃描比對也跟不上。
-        DeclareLaunchArgument('max_linear', default_value='0.6'),
+        # 輪速上限 10 rad/s (實體車 max_rpm 100) 對應 0.50 m/s, 再高會被輪速上限縮掉。
+        DeclareLaunchArgument('max_linear', default_value='0.5'),
         DeclareLaunchArgument('max_angular', default_value='1.2'),
     ]
     return LaunchDescription(args + [

@@ -55,7 +55,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from std_srvs.srv import Trigger
 
-from .ins import (G, ImuIns, SpinDetector, StillConfirm, StillDetector, TiltTracker,
+from .ins import (G, ImuIns, LeverArm, SpinDetector, StillConfirm, StillDetector, TiltTracker,
                   quat_to_matrix, quat_to_yaw)
 
 SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -155,10 +155,19 @@ class ImuLocalizer(Node):
         # NHC 單次更新最多能把位置搬多少 (m)。負數 = 不另外設限 (只受
         # max_pos_correction 管)。見 ins.py 的 nhc。
         p('nhc_pos_cap', -1.0)
-        # base_link 的 +X 量到車頭的角度 (度)。REP-103 的車是 0, 但 car.usd 的
-        # base_link 是 +X 朝左、車頭 -Y, 所以這台車是 -90。NHC 約束的是「垂直
+        # base_link 的 +X 量到車頭的角度 (度)。kros_car.usd 照 REP-103 是 0;
+        # 舊的 car.usd 是 +X 朝左、車頭 -Y, 那台要給 -90。NHC 約束的是「垂直
         # 車頭」的那一軸 —— 給錯的話它會把前進速度當側滑歸零, 比不開還糟。
         p('forward_deg', 0.0)
+        # IMU 在 base_link 裡的位置 [x, y] (m), 見 ins.LeverArm。
+        p('imu_lever_arm', [0.125, -0.0286])
+        # **Isaac 的 IMU 不模擬安裝位置**: 它回報的是車體原點的加速度, 不是 imu_link
+        # 那一點的。2026-10-13 用三輪資料對 ground truth 擬合「IMU 等效位置」都是
+        # (+0.006~0.008, -0.001) m, 不是 USD 裡的 (0.125, -0.0286) —— 模擬裡照實際
+        # 位置去扣, 等於憑空加進 w^2 * 0.125 的假加速度 (1.5 rad/s 自旋 0.28 m/s^2)。
+        # 所以 use_sim_time 開著時預設不補償; 實體車 (use_sim_time:=false) 照常補。
+        # Isaac 哪天改成有模擬了, 把這一項設成 true。
+        p('imu_lever_arm_in_sim', False)
         p('anchor_sigma', 0.02)
         p('anchor_after', 0.5)
         p('v_max', 4.0)
@@ -215,6 +224,7 @@ class ImuLocalizer(Node):
             trust=float(g('still_speed_trust').value),
             speed_max_omega=float(g('still_speed_max_omega').value))
         self.tilt = TiltTracker(alpha=float(g('tilt_alpha').value))
+        self.lever = LeverArm(self._lever_arm())
         self.spin_det = SpinDetector(omega_th=float(g('spin_omega_min').value),
                                      omega_max=float(g('spin_omega_max').value),
                                      acc_th=float(g('spin_acc_th').value))
@@ -253,6 +263,17 @@ class ImuLocalizer(Node):
                 '傾角是估出來的, 那個估計誤差本身就是持續存在的假加速度 '
                 '(傾斜 1 度 = 0.17 m/s^2), 過程雜訊蓋不住的話 NHC 會一直被'
                 '卡方閘門擋掉。6 軸 IMU 請給 sigma_acc:=0.35。')
+
+    def _lever_arm(self):
+        """要補償的 IMU 槓桿臂 [x, y]; 模擬裡預設是 0 (見 imu_lever_arm_in_sim)。"""
+        g = self.get_parameter
+        try:
+            sim = bool(g('use_sim_time').value)
+        except Exception:          # 離線測試的假節點沒有這個參數
+            sim = False
+        if sim and not bool(g('imu_lever_arm_in_sim').value):
+            return [0.0, 0.0]
+        return [float(v) for v in g('imu_lever_arm').value]
 
     # ------------------------------------------------------------------
     def _bias_model_text(self) -> str:
@@ -336,6 +357,8 @@ class ImuLocalizer(Node):
                          msg.angular_velocity.z])
         acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y,
                         msg.linear_acceleration.z])
+        # IMU 不在旋轉中心 -> 先換算回 base_link 原點, 後面全部用換算過的
+        acc = self.lever.to_base(t, acc, float(gyro[2]))
         self.det.add(t, gyro, acc)
         still = self.det.is_still()
         dt = None if self.last_t is None else t - self.last_t

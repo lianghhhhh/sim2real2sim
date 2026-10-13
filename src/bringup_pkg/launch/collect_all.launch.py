@@ -92,7 +92,9 @@ def generate_launch_description():
         DeclareLaunchArgument('map_path', default_value='',
                               description='空 = car_loc_lidar/maps/room.yaml'),
         DeclareLaunchArgument('lidar_frame', default_value='laser_frame'),
-        DeclareLaunchArgument('lidar_z', default_value='0.20'),
+        # laser_frame 相對 base_link 的位置 (kros_car.usd); 舊的 car.usd 是 x 0 / z 0.20
+        DeclareLaunchArgument('lidar_x', default_value='0.045'),
+        DeclareLaunchArgument('lidar_z', default_value='0.236'),
         DeclareLaunchArgument('imu_initial_pose', default_value='[0.0, 0.0, 0.0]',
                               description='x, y, yaw(度)。imu_ 與 whl_ 兩條的起點, '
                                           '要對到車子的實際出生點。fusion 不需要'),
@@ -125,7 +127,8 @@ def generate_launch_description():
         package='tf2_ros', executable='static_transform_publisher',
         name='static_tf_lidar',
         condition=IfCondition(LaunchConfiguration('lidar')),
-        arguments=['--x', '0', '--y', '0', '--z', LaunchConfiguration('lidar_z'),
+        arguments=['--x', LaunchConfiguration('lidar_x'), '--y', '0',
+                   '--z', LaunchConfiguration('lidar_z'),
                    '--frame-id', 'base_link',
                    '--child-frame-id', LaunchConfiguration('lidar_frame')],
         parameters=[{'use_sim_time': use_sim_time}])

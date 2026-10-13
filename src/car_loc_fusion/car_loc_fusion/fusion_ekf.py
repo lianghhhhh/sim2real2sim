@@ -94,9 +94,18 @@ class Step:
 class AbsMeas:
     """一則絕對位姿量測 (map 座標)。"""
 
-    __slots__ = ('t', 'src', 'x', 'y', 'yaw', 'sigma', 'yaw_sigma', 'r_scale')
+    __slots__ = ('t', 'src', 'x', 'y', 'yaw', 'sigma', 'yaw_sigma', 'r_scale',
+                 'ox', 'oy')
 
-    def __init__(self, t, src, x, y, sigma, yaw=None, yaw_sigma=0.05):
+    def __init__(self, t, src, x, y, sigma, yaw=None, yaw_sigma=0.05,
+                 offset=(0.0, 0.0)):
+        # 這個來源量到的那一點在 base_link 裡的位置 (m)。量測模型是
+        #     z = p + R(yaw) @ offset
+        # 相機量的是 bbox 中心, 不是 base_link 原點: kros_car 車頭有手臂, bbox 中心
+        # 在原點前方 1.5 cm, 而且那個偏移跟著車頭轉 -> 不是常數, 單應性吸收不掉。
+        # 相機自己沒有可信的 yaw (速度方向推的), 修不了; 這裡有, 所以在這裡修。
+        self.ox = float(offset[0])
+        self.oy = float(offset[1])
         self.t = float(t)
         self.src = str(src)
         self.x = float(x)
@@ -220,6 +229,8 @@ class FusionEkf:
             # 第一則絕對量測就是初始位姿 —— 這是融合相對於方法三/四的一個實質
             # 差別: 那兩條非給 initial_pose 不可 (給錯就整段差一個常數平移),
             # 這一條自己找得到自己。
+            # (offset 在這裡不扣: 起點還沒有可信的 yaw, 而它只有公分級, 遠小於
+            #  下面給的 sigma_p, 後面幾則量測就修掉了)
             self.set_pose(m.x, m.y, m.yaw if m.yaw is not None else 0.0,
                           t=m.t, sigma_p=max(m.sigma, 0.05),
                           sigma_yaw=(m.yaw_sigma if m.yaw is not None else 1.0))
@@ -315,7 +326,15 @@ class FusionEkf:
 
         H = np.zeros((2, NX))
         H[0, 0] = H[1, 1] = 1.0
-        r = np.array([m.x - ins.x[0], m.y - ins.x[1]])
+        hx, hy = float(ins.x[0]), float(ins.x[1])
+        if m.ox or m.oy:
+            # 量到的點不在 base_link 原點 (見 AbsMeas.offset)
+            c, sn = math.cos(ins.x[IYAW]), math.sin(ins.x[IYAW])
+            hx += c * m.ox - sn * m.oy
+            hy += sn * m.ox + c * m.oy
+            H[0, IYAW] = -sn * m.ox - c * m.oy
+            H[1, IYAW] = c * m.ox - sn * m.oy
+        r = np.array([m.x - hx, m.y - hy])
         R = np.eye(2) * (m.sigma ** 2)
 
         if replay:

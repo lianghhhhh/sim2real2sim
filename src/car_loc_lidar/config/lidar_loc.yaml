@@ -13,10 +13,10 @@ lidar_localizer:
     publish_tf: true
     tf_mode: direct               # 直接發 map->base_link (這條路沒有別的里程計)
 
-    # 從 car.usd 量出來的掛載位置, 不要憑感覺改。
-    # /World/small_car/Cube/oradar_ms200 的世界高度就是 0.200 ——
-    # scripts/setup_oradar_lidar.py 每次都會把實際值印出來, 兩邊要一致。
-    lidar_translation: [0.0, 0.0, 0.20]
+    # 從 kros_car.usd 量出來的掛載位置 (laser_frame 相對 base_link), 不要憑感覺改。
+    # 舊的 car.usd 是 [0.0, 0.0, 0.20]。launch 檔的 static TF (lidar_x / lidar_z)
+    # 要跟這裡一致。
+    lidar_translation: [0.045, 0.0, 0.236]
     lidar_rpy_deg: [0.0, 0.0, 0.0]
 
     map_path: ''                  # 空 = 用 package 內附的 maps/room.yaml
@@ -89,6 +89,40 @@ lidar_localizer:
     #    投票會出錯的原因見下面 stamp_calib_omega 的說明。
     scan_stamp: end
     time_order: reverse
+    # 一圈裡每個點是什麼時候打的。
+    #   linear = 真的旋轉雷射 (實體 MS200): 時間跟著方位角連續走, 用上面兩項。
+    #   frames = Isaac 的 RTX 雷射: 一圈是 scan_frames 個算繪幀拼起來的, 同一幀的點
+    #            是同一個瞬間 (階梯); 最新一幀從 scan_seam_deg 開始, 不是 ±180 度;
+    #            而且訊息的時戳比最新一幀早 scan_lead_frames 幀。
+    #   auto   = use_sim_time 開著就是 frames, 否則 linear (實體車不用另外改)。
+    # 2026-10-13 用 ground truth 逐扇區量出來的 (kros_car.usd, 10 Hz / 60 fps),
+    # 每個扇區相對於時戳的時間, 例如某一次 Play:
+    #   [0,+60) +17 ms, [+60,+120) 0, [+120,180) -17, [-180,-120) -33, [-120,-60) -50,
+    #   [-60,0) -67                                        (= seam 0, lead 1)
+    # !! **seam / lead 每次按 Play 都可能不一樣。** 同一個 Isaac app Stop/Play 四次,
+    #    量到 seam 0 lead 1 兩次、seam 0 lead 0 兩次; scripts/isaac_headless.py 則是
+    #    seam 60 lead 0。寫死任何一組都只會在某幾次 Play 是對的 (兩輪實跑分別用
+    #    60/0 與 0/1, 1.5 rad/s 自旋的誤差都卡在 4 cm; 對的時候是 1 cm)。所以:
+    #    * seam (哪個扇區最新) 決定掃描的形狀 -> **節點開機後自己校正** (auto_scan_seam):
+    #      車子轉彎的那幾幀, 每個候選接縫各配準一次, 用殘差投票。下面的
+    #      scan_seam_deg 只是校正完成之前先用的值。
+    #    * lead 是整圈一起早或晚一幀, 不改變形狀, 只讓位姿的時戳差 17 ms (0.5 m/s 是
+    #      0.8 cm), 從掃描本身看不出來 -> 取 0.5, 不管實際是 0 還是 1 最多差半幀。
+    #    上面那組 reverse/end 是六種**線性**組合裡最不差的, 但沒有一種線性組合是對的。
+    # 想直接對 ground truth 量這一次 Play 的值: scripts/check_scan_timing.py --spin。
+    scan_time_model: auto
+    scan_frames: 6                # 算繪頻率 / 掃描頻率 = 60 / 10
+    scan_seam_deg: 0.0            # 校正完成之前先用的值
+    scan_lead_frames: 0.5
+    # 接縫自動校正 (只有 frames 模型會做)。跟下面那個投錯過的 auto_scan_stamp 不同:
+    # 這裡的候選**包含真正的答案**, 轉速有上下限, 而且贏家的殘差要低於所有候選中位數
+    # 的 0.7 倍才採用 —— 分不出來就維持 scan_seam_deg, 不會硬選一個。
+    # 結果會印在 log (「掃描接縫校正完成 ...」) 與每 2 秒的狀態列。
+    auto_scan_seam: true
+    seam_calib_scans: 40          # 累積這麼多幀轉彎的掃描才決定 (10 Hz = 轉 4 秒)
+    seam_calib_step_deg: 20.0     # 候選接縫的間距
+    seam_calib_omega_min: 0.5     # rad/s
+    seam_calib_omega_max: 4.0
     # 開著就自己把 (頭/中/尾) x (順/逆) 六種組合試一遍用殘差投票, 並印出結果。
     #
     # !! **它的結論不可以直接採信** —— 2026-09-08 它投給 forward/mid (殘差 3.79 cm
