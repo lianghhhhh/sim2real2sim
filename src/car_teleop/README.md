@@ -1,92 +1,104 @@
 # car_teleop
 
-> **2026-10-12: 改成輪速控制了。** `cmd_vel_bridge` 現在送的是 `/joint_command` 的
-> `velocity` (四輪 rad/s), 只做運動學換算加一個 gyro 的轉速修正, 預設參數是
-> `kros_car.usd` 的 (輪半徑 0.05035、等效輪距 0.95、輪速上限 10 rad/s = 0.50 m/s)。
-> 下面講 effort / PI 控制器 / 「這台車沒有阻力」的段落是舊的 `car.usd` 那台車,
-> 留著當紀錄; 目前的行為以 [cmd_vel_bridge.py](car_teleop/cmd_vel_bridge.py) 的檔頭為準。
-
-手動開 `car.usd` 的車子。**建圖的時候需要它** —— 要人開著車把房間每個角落都掃到,
-地圖才會完整。
+手動開 kros_car (模擬 `kros_car*.usd` 與實體 KROS car 都適用)。**建圖的時候需要它** ——
+要人開著車把房間每個角落都掃到, 地圖才會完整。
 
 ```bash
-# 終端 1: 速度控制層 (通常由 mapping.launch.py 自動帶起來, 不用另外跑)
+# 終端 1: 速度換算層 (mapping.launch.py 與各定位 launch 會自己帶起來, 通常不用另外跑)
 ros2 launch car_teleop teleop.launch.py
 
 # 終端 2: 鍵盤遙控 (要真的 TTY, 所以要 docker exec -it)
 ros2 run car_teleop teleop_key
 ```
 
+## 架構
+
+```
+teleop_key ──/cmd_vel (Twist: m/s, rad/s)──> cmd_vel_bridge ──/joint_command (四輪 rad/s)──> 車
+                                                    ^
+                                       /imu (只有 yaw_trim_gain > 0 才用)
+```
+
+任何會發 `geometry_msgs/Twist` 到 `/cmd_vel` 的東西都可以取代 `teleop_key` ——
+Foxglove 的 Teleop 面板、搖桿、`teleop_twist_keyboard`、nav2。
+
+### teleop_key (鍵盤)
+
 ```
   w/s 直線前進後退   a/d 原地左右轉   空白 停
   +/- 速度上限   [/] 轉向上限   t 切換按住/持續   q 離開
 ```
 
-不想用鍵盤的話, 任何會發 `geometry_msgs/Twist` 到 `/cmd_vel` 的東西都可以 ——
-Foxglove 的 Teleop 面板、搖桿、`teleop_twist_keyboard`、nav2 都行。
+* 預設速度 0.35 m/s、轉速 0.6 rad/s (`linear_speed` / `angular_speed`)。
+* 四個方向鍵互斥: `w`/`s` 會把轉向歸零, `a`/`d` 會把車速歸零 (原地轉)。
+* 預設「按住才走」: 放開超過 0.4 秒 (`hold_time`) 就停, 靠終端機的按鍵重複。
+  終端機沒有按鍵重複或 ssh 很慢的話按 `t` 切成「按一下持續走」, 空白鍵停。
+* 每秒發 20 次; 離開前補發停車。
 
----
+### cmd_vel_bridge (換算)
 
-## 為什麼不能直接發 effort
+每秒 50 次:
 
-`car.usd` 的車子是**扭矩控制**: `/joint_command` 收的是 `JointState.effort`,
-不是速度。而這台車幾乎沒有滾動阻力 —— 從你自己的 `car_run_data/sim_data.csv`
-量到:
+1. **斜率限制**: 目標車速每秒最多變 0.8 m/s (`accel_limit`), 轉速 2.5 rad/s² (`angular_accel_limit`)。
+2. **運動學換算**:
 
-| 固定 effort 3.7, 從 t+1.0s 到 t+3.0s | 車速 |
+   ```
+   左輪 = (v - w × T_eff / 2) / r        右輪 = (v + w × T_eff / 2) / r
+   [FL, FR, RL, RR] = [左, 右, 左, 右]
+   ```
+
+   r = 0.05035 m。T_eff = 0.95 m 是滑移轉向的**等效輪距**, 不是幾何輪距 0.27 m:
+   原地轉時四個輪子都在橫向滑, 車體轉得比「輪速差 / 輪距」慢很多。0.95 是模擬
+   (地面 0.5) 實測的值, 換地面會變。
+3. **輪速上限**: 超過 10 rad/s (`max_wheel_speed`, 實體車 max_rpm 100 = 10.47) 時左右等比縮小,
+   保住車速與轉速的比例。
+4. **安全**: 0.5 秒沒收到 `/cmd_vel` 就把目標歸零; 不管目標是不是 0 都持續發
+   (實體車 0.3 秒沒收到指令輪子會停, Isaac 則會一直維持最後一筆)。關掉前補送 0。
+
+鍵盤預設值對應的輪速:
+
+| 按鍵 | 四輪輪速 (rad/s) |
 | --- | --- |
-| t+1.0s | 0.87 m/s |
-| t+2.0s | 1.82 m/s |
-| t+3.0s | 2.24 m/s |
+| `w` | 全部 +6.95 (= 0.35 m/s) |
+| `s` | 全部 -6.95 |
+| `a` | 左 -5.66、右 +5.66 (要求 0.6 rad/s) |
+| `d` | 左 +5.66、右 -5.66 |
 
-**完全沒有收斂**。也就是說開迴路下:
+## 兩種模式: 固定輪速 (預設) 與 gyro 修正
 
-* 按著前進鍵 = 一路加速到撞牆 (10x6 的房間, effort 4 兩秒就到 3.6 m/s)
-* 放開按鍵 ≠ 停車, 因為沒有阻力讓它慢下來
-
-所以 `cmd_vel_bridge` 這一層是必要的: 把「我要 0.3 m/s」用 PI 翻譯成扭矩, 而且
-**指令逾時是把目標速度設成 0, 不是把 effort 設成 0** —— 控制器會主動給反向扭矩
-把車煞停。節點結束前也會先煞車再退出。
-
-## 回授用什麼
-
-| 量 | 來源 | 為什麼 |
+| | `yaw_trim_gain: 0.0` (預設) | `yaw_trim_gain: 1.0` |
 | --- | --- | --- |
-| 線速度 | `/joint_states` 的輪速 × 0.075 m | 實測沒打滑時跟真值差 0.002 m/s。撞牆/打滑時輪速會飆高, 控制器因此自動收油 —— 這是想要的行為 |
-| 角速度 | `/imu` 的 gyro z | 直接量測。skid-steer 轉彎時輪子一定在滑, 用輪速差推算不可靠 |
+| 輪速指令 | 同一個 `/cmd_vel` 永遠是同一組輪速 | 加上「要求轉速 - gyro 轉速」的積分, 最多 ±0.6 rad/s (`yaw_trim_limit`) |
+| 實際轉速 | 看地面: 同樣 0.6 rad/s, 換地板可能差兩三成 | 跟要求的一樣 |
+| 模擬 vs 實體 | 收到的指令完全一樣 | 指令會各自被 gyro 帶著變 |
+| 適合 | 人用鍵盤開 (看著畫面自己補); 建圖 | nav2 這類假設車子照指令動的程式 |
 
-兩個都是真車上也有的感測器, 沒有用到任何 ground truth。
+切換:
 
-## 從 car.usd / 你的資料量到的常數
+```bash
+ros2 launch car_teleop teleop.launch.py yaw_trim_gain:=1.0
+ros2 launch car_loc_lidar mapping.launch.py yaw_trim_gain:=1.0
+```
 
-| 項目 | 值 | 來源 |
+**為什麼預設關掉** (2026-10-14 模擬實測): 原地轉時四個輪子的載重會在兩組對角之間跳,
+車體轉速一直抖, 修正會帶著輪速指令在 5 ~ 10 rad/s 之間起伏; 車子卡住、轉不動時
+修正會一路加到輪速上限 10。對人手動開車來說, 這兩件事都比「轉速跟要求差一點」糟。
+
+摩擦力測試 (`calibrate_env_pkg/control_car_node`) 不經過這個節點, 直接送 `/joint_command`,
+不受這個設定影響。
+
+## 參數
+
+| 參數 | 預設 | 說明 |
 | --- | --- | --- |
-| 輪半徑 | 0.075 m | cylinder radius 0.5 × scale 0.15 |
-| 左右輪距 | 0.25 m | 輪心 x = ±0.125 |
-| 關節名稱 | `front_left_joint`, `front_right_joint`, `rear_left_joint`, `rear_right_joint` | USD |
-| 混控 | `[FL,FR,RL,RR] = [thr-steer, thr+steer, thr-steer, thr+steer]` | 跟 `calibrate_env_pkg/control_car_node.py` 一致 |
-| steer 正負 | steer > 0 → `wz > 0` | 實測: 左 -10 / 右 +10 → wz = +16.4 rad/s |
-| 前進方向 | 車體 **-Y** | 實測: 正 throttle → `vy` 為負 |
-| 驅動增益 | `a ≈ 0.34 × throttle`, `α ≈ 0.57 × steer` | 由 `sim_data.csv` 回歸 (R² 只有 0.17/0.02, 那份資料有大量撞牆與打滑, 所以只當標稱值) |
+| `cmd_vel_topic` / `joint_command_topic` / `imu_topic` | `/cmd_vel` / `/joint_command` / `/imu` | 實體車的 IMU 是 `/imu/data` |
+| `wheel_radius` | 0.05035 | m |
+| `effective_track` | 0.95 | m, 等效輪距 |
+| `max_wheel_speed` | 10.0 | rad/s |
+| `max_linear` / `max_angular` | 0.5 / 1.2 | m/s / rad/s; 車速超過 0.50 m/s 會被輪速上限縮掉 |
+| `accel_limit` / `angular_accel_limit` | 0.8 / 2.5 | m/s² / rad/s² |
+| `yaw_trim_gain` / `yaw_trim_limit` | 0.0 / 0.6 | 見上一節 |
+| `cmd_timeout` | 0.5 | s |
+| `control_rate` | 50 | Hz |
 
-PI 增益 (`kp_v` 3.0 / `ki_v` 3.0 / `kp_w` 2.0 / `ki_w` 2.0) 是從上面那組增益推出來的
-量級, **不是在 Isaac 裡精調過的**。覺得軟或會晃就調 `config` 或用 `--ros-args -p`。
-
-## `cmd_vel.linear.x` 的方向
-
-`car.usd` 的 `base_link` 是 x 朝左、車頭 -Y (不是 ROS 慣例)。但所有現成的遙控工具
-都把前進放在 `linear.x`, 所以這個 bridge 一律把 `linear.x` 當「車頭方向的速度」。
-要接 nav2 的時候這件事要一起處理。
-
-## 不開 Isaac 也能試
-
-**目前沒有。** 以前的 `fake_isaac` (`motion:=drive` 會訂 `/joint_command`、用上面
-那組回歸出來的模型跑物理、發 `/joint_states`) 放在 `car_localization` 裡, 已經
-跟著那個 package 刪掉了。而且它合成的是舊的 `/lidar/point_cloud`, 不是現在
-`car_loc_lidar` 吃的 `/scan`, 就算救回來也接不上建圖流程。
-
-要翻舊程式: `git show 7c984df:src/car_localization/car_localization/fake_isaac.py`。
-注意它的輪速是**理想無滑移**的, 打滑情境下測出來的手感會比實際樂觀。
-
-現在要驗遙控就直接開 Isaac; 各條定位線則各自有不需要 ROS 的離線測試
-(見根目錄 README 第 5 節)。
+舊車 `car.usd` (扭矩控制、PI 速度環) 的版本見 git 歷史。

@@ -11,13 +11,14 @@ car_viz 的 viz.launch.py)。
 
 為什麼要有這一層: 車子 (kros_car.usd / 實體 KROS car) 收的是四輪的輪速
 (/joint_command 的 velocity, rad/s)。這個節點把 /cmd_vel 的「我要幾 m/s、幾 rad/s」
-換算成左右輪速, 轉速另外用 /imu 的 gyro 做一點積分修正 (skid-steer 轉彎時輪子
-一定在滑, 輪速差對不上實際轉速)。指令逾時會自動歸零。
+換算成左右輪速, 預設是固定換算 (同一個指令永遠是同一組輪速); 給 nav2 用時加
+yaw_trim_gain:=1.0, 轉速會用 /imu 的 gyro 修正。指令逾時會自動歸零。
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -28,6 +29,8 @@ def generate_launch_description():
         # 輪速上限 10 rad/s (實體車 max_rpm 100) 對應 0.50 m/s, 再高會被輪速上限縮掉。
         DeclareLaunchArgument('max_linear', default_value='0.5'),
         DeclareLaunchArgument('max_angular', default_value='1.2'),
+        # 0 = 固定輪速 (鍵盤開車用); 1.0 = 用 gyro 修正轉速 (給 nav2 這類程式用)
+        DeclareLaunchArgument('yaw_trim_gain', default_value='0.0'),
     ]
     return LaunchDescription(args + [
         Node(package='car_teleop', executable='cmd_vel_bridge', name='cmd_vel_bridge',
@@ -38,5 +41,7 @@ def generate_launch_description():
                  'imu_topic': LaunchConfiguration('imu_topic'),
                  'max_linear': LaunchConfiguration('max_linear'),
                  'max_angular': LaunchConfiguration('max_angular'),
+                 'yaw_trim_gain': ParameterValue(LaunchConfiguration('yaw_trim_gain'),
+                                                 value_type=float),
              }]),
     ])

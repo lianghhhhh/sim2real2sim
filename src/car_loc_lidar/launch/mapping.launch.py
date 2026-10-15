@@ -46,6 +46,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -71,6 +72,8 @@ def generate_launch_description():
                               description='建圖一定要手動開一圈, 預設就把速度控制層開起來'),
         DeclareLaunchArgument('max_linear', default_value='0.6'),
         DeclareLaunchArgument('max_angular', default_value='1.2'),
+        # 0 = 固定輪速 (鍵盤開車用); 1.0 = 用 gyro 修正轉速 (給 nav2 這類程式用)
+        DeclareLaunchArgument('yaw_trim_gain', default_value='0.0'),
     ]
     use_sim_time = LaunchConfiguration('use_sim_time')
 
@@ -106,6 +109,8 @@ def generate_launch_description():
         output='screen', condition=IfCondition(LaunchConfiguration('teleop')),
         parameters=[{'use_sim_time': use_sim_time,
                      'max_linear': LaunchConfiguration('max_linear'),
-                     'max_angular': LaunchConfiguration('max_angular')}])
+                     'max_angular': LaunchConfiguration('max_angular'),
+                     'yaw_trim_gain': ParameterValue(LaunchConfiguration('yaw_trim_gain'),
+                                                     value_type=float)}])
 
     return LaunchDescription(args + [static_lidar, odom, slam, teleop])

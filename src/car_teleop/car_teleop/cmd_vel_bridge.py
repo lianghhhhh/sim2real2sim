@@ -11,9 +11,18 @@ T_eff 是 skid-steer 的**等效輪距**, 不是幾何輪距 (0.27): 轉彎時�
 滑, 車體實際轉得比「輪速差 / 輪距」慢。理想 Coulomb 摩擦下
     T_eff = 2 * (a^2 + b^2) / b = 0.577       (a 半軸距 0.144, b 半輪距 0.135)
 無頭 PhysX 實測是 0.68~1.04 (mu 大、轉得慢時比較大); 2026-10-13 kros_car.usd
-(12.5 kg, 地面 0.5) 兩輪實跑量到 0.945 / 1.055, 預設取 0.95。實際值跟地面
-有關, 所以另外用 gyro 做一個小的積分修正 (yaw_trim): angular.z 要 0.5 rad/s,
-車體就真的轉 0.5 rad/s。IMU 沒來就只用前饋。
+(12.5 kg, 地面 0.5) 兩輪實跑量到 0.945 / 1.055, 預設取 0.95。
+
+兩種模式 (`yaw_trim_gain`):
+
+  * **0 (預設): 固定輪速。** 同一組 /cmd_vel 永遠換成同一組輪速, 不看任何回授。
+    鍵盤的 w/s/a/d 各自對應一組固定的四輪輪速, 模擬與實體車收到的指令完全一樣。
+    代價是實際轉多快看地面: 同樣 0.6 rad/s, 換個地板可能差兩三成。
+    手動開車 (建圖) 用這個 —— 人看著畫面自己會補。
+  * **> 0: 用 gyro 修正轉速。** 把「要求的轉速 - gyro 量到的轉速」積分加回轉速指令,
+    angular.z 要 0.5 rad/s 車體就真的轉 0.5 rad/s。給 nav2 這類假設車子照指令動的
+    程式用。缺點 (2026-10-14 實測): 原地轉時四輪載重在對角之間跳, 車體轉速一直抖,
+    修正會帶著輪速指令起伏; 車子卡住、轉不動時修正會一路加到輪速上限。
 
 兩件跟舊版一樣的事:
   * 指令逾時 (cmd_timeout) -> 目標速度歸零。
@@ -67,8 +76,9 @@ class CmdVelBridge(Node):
         p('accel_limit', 0.8)             # m/s^2, 對「目標速度」做斜率限制
         p('angular_accel_limit', 2.5)     # rad/s^2
 
-        # 車體轉速的積分修正 (rad/s per rad): 補等效輪距給得不準的部分。0 = 關掉。
-        p('yaw_trim_gain', 1.0)
+        # 車體轉速的積分修正 (rad/s per rad): 補等效輪距給得不準的部分。
+        # 0 = 關掉 = 固定輪速 (預設, 見檔頭); 給 nav2 用時設 1.0。
+        p('yaw_trim_gain', 0.0)
         p('yaw_trim_limit', 0.6)          # rad/s, 修正量上限
 
         p('control_rate', 50.0)
@@ -108,7 +118,9 @@ class CmdVelBridge(Node):
             f'輪速換算啟動: 上限 {self.max_v} m/s / {self.max_w} rad/s, '
             f'輪速 {self.wmax:g} rad/s ({self.wmax * self.r:.2f} m/s), {1 / self.dt:.0f} Hz\n'
             f'  輪半徑 {self.r} m, 等效輪距 {self.t_eff} m (幾何 {g("wheel_track").value})\n'
-            f'  訂閱 {g("cmd_vel_topic").value}, 轉速回授 {g("imu_topic").value}')
+            f'  訂閱 {g("cmd_vel_topic").value}; '
+            + (f'轉速用 {g("imu_topic").value} 修正 (yaw_trim_gain {self.k_trim:g})'
+               if self.k_trim > 0.0 else '固定輪速 (yaw_trim_gain 0, 不看 gyro)'))
 
     # ------------------------------------------------------------------
     def _now(self) -> float:
