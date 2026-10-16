@@ -1,0 +1,4 @@
+# Only the ROS sources go into the image.
+*
+!workspaces/src
+**/__pycache__

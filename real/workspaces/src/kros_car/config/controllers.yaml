@@ -1,0 +1,78 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 50
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    base_controller:
+      type: diff_drive_controller/DiffDriveController
+
+    wheel_velocity_controller:
+      type: kros_car/WheelVelocityController
+
+    arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+# Twist commands (/base_controller/cmd_vel): teleop, mapping, calibration.
+base_controller:
+  ros__parameters:
+    left_wheel_names: ["front_left_joint", "rear_left_joint"]
+    right_wheel_names: ["front_right_joint", "rear_right_joint"]
+
+    wheel_separation: 0.274
+    wheel_separation_multiplier: 2.254
+
+
+    wheel_radius: 0.0506
+
+    publish_rate: 50.0
+    odom_frame_id: odom
+    base_frame_id: base_link
+    enable_odom_tf: false
+    cmd_vel_timeout: 0.6
+
+    linear:
+      x:
+        has_velocity_limits: true
+        max_velocity: 0.546
+        has_acceleration_limits: true
+        max_acceleration: 0.5
+        has_deceleration_limits: true
+        max_deceleration: -1.5
+    angular:
+      z:
+        has_velocity_limits: true
+        max_velocity: 3.983
+        has_acceleration_limits: true
+        max_acceleration: 1.0
+        has_deceleration_limits: true
+        max_deceleration: -3.0
+
+# Per-wheel speed commands (/joint_command, rad/s): data collection and MPC.
+# Uses the same wheels as base_controller, so only one of the two is active.
+wheel_velocity_controller:
+  ros__parameters:
+    joints:
+      - front_left_joint
+      - rear_left_joint
+      - front_right_joint
+      - rear_right_joint
+    command_topic: /joint_command
+    command_timeout: 0.3
+
+arm_controller:
+  ros__parameters:
+    fallback_controllers: [""]
+    joints:
+      - arm_1_joint
+      - arm_2_joint
+      - gripper_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    state_publish_rate: 15.0
+    action_monitor_rate: 10.0
+    allow_partial_joints_goal: false

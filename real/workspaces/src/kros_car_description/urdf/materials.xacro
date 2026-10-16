@@ -1,0 +1,16 @@
+<?xml version="1.0" ?>
+<robot name="kros_car" xmlns:xacro="http://www.ros.org/wiki/xacro" >
+
+<material name="silver">
+  <color rgba="0.700 0.700 0.700 1.000"/>
+</material>
+
+<material name="body">
+  <color rgba="0.059 0.172 0.514 1.000"/>
+</material>
+
+<material name="wheel">
+  <color rgba="0.000 0.000 0.000 1.000"/>
+</material>
+
+</robot>

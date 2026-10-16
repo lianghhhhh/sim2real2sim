@@ -1,0 +1,17 @@
+services:
+  kros_car:
+    image: kros-car-new:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    devices:
+      - "/dev/usb_wheel:/dev/usb_wheel"
+      - "/dev/usb_robot_arm:/dev/usb_robot_arm"
+    volumes:
+      - ./configs:/configs:ro
+    network_mode: host
+    ipc: host
+    shm_size: 4G
+    command: "ros2 launch kros_car bringup.launch.py"

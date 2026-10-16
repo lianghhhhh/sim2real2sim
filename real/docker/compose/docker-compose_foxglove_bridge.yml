@@ -1,0 +1,12 @@
+services:
+  foxglove_bridge:
+    image: kros-car-new:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    network_mode: host
+    ipc: host
+    shm_size: 4G
+    command: "ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765"

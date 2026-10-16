@@ -1,0 +1,49 @@
+# wildbot calibration results — single source of truth.
+# Path priority: $ROS2_CALIBRATION_YAML > ~/.ros/calibration_results.yaml.
+# Each calibration script does a partial update of one section and stamps
+# calibrated_at / calibrated_by. Edit by hand only if you know what you're doing.
+
+imu:
+  # Filled by imu_static_calibration. Units: rad/s, in imu_link frame.
+  gyro_bias: [0.0, 0.0, 0.0]
+  gyro_covariance_diag: [0.0, 0.0, 0.0]      # std^2 from 30s static
+  accel_bias_xy: [0.0, 0.0]                  # m/s^2; z handled via gravity
+  accel_covariance_diag: [0.0, 0.0, 0.0]
+  accel_gravity_magnitude: 9.80665
+
+  # Filled by imu_axis_sanity.
+  axis_sanity_passed: false
+  axis_sanity_notes: ""
+
+  # 6-axis mode (mag disabled) -> short-term yaw integration only.
+  yaw_trust: false
+
+  calibrated_at: null
+  calibrated_by: null
+
+base:
+  # Filled by wheel_linear_calibration.
+  linear_scale: 1.0                          # measured / commanded
+  wheel_radius_nominal: null                 # m (snapshot of constant when run)
+  wheel_radius_corrected: null               # m, = nominal * linear_scale
+
+  # Filled by wheel_angular_calibration. We calibrate the *multiplier* so the
+  # raw `wheel_separation` line in your controllers.yaml stays as the URDF value.
+  angular_scale: 1.0
+  wheel_separation_multiplier_nominal: null      # snapshot of constant when run
+  wheel_separation_multiplier_corrected: null    # = nominal * angular_scale
+
+  calibrated_at: null
+  calibrated_by: null
+
+gripper:
+  # Not used in this build (arm/gripper already calibrated separately).
+  servo_id: null
+  positions: []
+  linear_fit: null
+  calibrated_at: null
+  calibrated_by: null
+
+meta:
+  schema_version: 1
+  robot_name: "wildbot"

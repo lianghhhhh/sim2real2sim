@@ -1,0 +1,21 @@
+services:
+  imu:
+    image: kros-car-new:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    devices:
+      - "/dev/imu:/dev/imu"
+    network_mode: host
+    ipc: host
+    shm_size: 4G
+    command:
+    - ros2
+    - launch
+    - wildbot_imu
+    - imu.launch.py
+    - port:=/dev/imu
+    - baud:=115200
+    - frame_id:=imu_link

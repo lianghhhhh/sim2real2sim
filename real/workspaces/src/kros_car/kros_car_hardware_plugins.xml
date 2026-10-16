@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<library path="kros_car_system">
+  <class
+    name="kros_car/KrosCarSystem"
+    type="kros_car::KrosCarSystem"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>ros2_control system with direct serial I/O for KROS car wheels and arm.</description>
+  </class>
+</library>

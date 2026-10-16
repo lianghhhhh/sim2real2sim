@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<library path="kros_car_controllers">
+  <class
+    name="kros_car/WheelVelocityController"
+    type="kros_car::WheelVelocityController"
+    base_class_type="controller_interface::ControllerInterface">
+    <description>Per-wheel speed commands from a sensor_msgs/JointState topic, with a command timeout.</description>
+  </class>
+</library>

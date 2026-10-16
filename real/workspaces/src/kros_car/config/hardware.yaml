@@ -1,0 +1,47 @@
+# Hardware configuration for kros_car.
+# Copy this file to /configs/hardware.yaml to override defaults.
+
+# Wheel motor settings
+wheel_port: /dev/usb_wheel
+# Must match SERIAL_BAUDRATE in wildbot_wheelctrl.ino.
+wheel_baudrate: 460800
+wheel_motor_ids: 1,2,3,4
+wheel_motor_directions: 1,1,-1,-1
+max_rpm: 100
+# DDSM115 speed-loop acceleration time, 0.1 ms per rpm. Keep it fixed: it is
+# part of the dynamics the simulation has to reproduce.
+acceleration_act: 1
+wheel_joints: front_left_joint,rear_left_joint,front_right_joint,rear_right_joint
+# How often targets are sent to the wheel controller. It polls the motors at 50 Hz.
+wheel_command_rate_hz: 50
+# The wheel controller stops the wheels when no command arrives for this long. -1 = off.
+wheel_heartbeat_ms: 500
+# A wheel without feedback for this long is reported as stopped.
+wheel_feedback_timeout_ms: 200
+# N*m per A, used to turn motor current into joint effort. 0.75 is the
+# DDSM115 datasheet value; replace it once it has been measured.
+wheel_torque_constant: 0.75
+# Command the wheels to stop while any wheel has no fresh feedback or is not in
+# speed loop mode. Set to false only for bring-up.
+wheel_require_feedback: true
+
+# Arm servo settings
+arm_port: /dev/usb_robot_arm
+arm_baudrate: 115200
+arm_servo_ids: 1,2,3
+default_move_time_ms: 80
+arm_read_timeout_ms: 80
+arm_temp_publish_interval_cycles: 10
+# Arm targets are forwarded at this rate at most, whatever the controller rate.
+arm_command_rate_hz: 20
+arm_joints: arm_1_joint,arm_2_joint,gripper_joint
+
+# Gripper safety
+gripper_max_ticks: 1000
+gripper_stall_error_ticks: 30
+gripper_stall_trigger_ms: 500
+gripper_stall_motion_epsilon_ticks: 3
+gripper_stall_backoff_ticks: 10
+gripper_stall_release_delta_ticks: 20
+gripper_overheat_temp_c: 70
+gripper_overheat_hysteresis_c: 5

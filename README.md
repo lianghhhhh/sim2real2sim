@@ -322,9 +322,9 @@ commit `b029732` 刪掉, 要翻舊程式就 `git show 7c984df:src/<package>/...`
 
 ## kros_car.usd (實體車的模型, 2026-10 新增)
 
-`kros_car.usd` 是實體車 (KROS car) 的模型, 由 `kros_car_description/urdf/kros_car.urdf`
-匯入。房間、俯視相機跟 `car.usd` 完全一樣, 所以 `src/car_loc_lidar/maps/room.yaml` 可以沿用。
-實體車那邊的程式與介面在 `~/kros_car/kros_car_new` (見它的 README)。
+`kros_car.usd` 是實體車 (KROS car) 的模型, 由 `real/workspaces/src/kros_car_description/urdf/kros_car.urdf`
+匯入 (sim 與實體車共用這一份 URDF)。房間、俯視相機跟 `car.usd` 完全一樣, 所以 `src/car_loc_lidar/maps/room.yaml` 可以沿用。
+實體車那邊的程式與介面在 [`real/`](real/) (見它的 README)。
 
 **程式的預設值已經是這台車的 (2026-10-12)**: 車頭軸、輪半徑、雷射外參、IMU 位置、
 輪速控制。上面各節的**操作流程**還適用, 但裡面提到的 effort / 扭矩控制、`car.usd` 的

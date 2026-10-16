@@ -1,0 +1,7 @@
+.ros/
+.arduino*
+wildbot_wheelctrl/bin/
+__pycache__/
+workspaces/build/
+workspaces/install/
+workspaces/log/

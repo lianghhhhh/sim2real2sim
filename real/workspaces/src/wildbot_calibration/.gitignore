@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+develop-eggs/
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# ROS 2 / colcon (in case anyone builds in-tree)
+install/
+log/
+COLCON_IGNORE
+AMENT_IGNORE
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude per-user override (project-level settings.json is fine to commit;
+# settings.local.json is per-developer)
+.claude/settings.local.json
+
+# OS junk
+.DS_Store
+Thumbs.db
