@@ -13,11 +13,13 @@
     python3 scripts/wheel_bench.py compare car_run_data/bench_sim.csv car_run_data/bench_real.csv
     python3 scripts/wheel_bench.py compare car_run_data/bench_real.csv     # 只看一份
 
-指令序列 (預設約 3.5 分鐘, --quick 約 1.5 分鐘):
+指令序列 (預設約 3.2 分鐘, --quick 約 1.7 分鐘):
   rest        靜止, 量回授的零點與雜訊
   solo_*      一次只轉一個輪子 -> 確認輪子名稱與正負號的對應 (接錯的話後面全部白量)
   step_*      0 -> w -> 0 的階躍, 正反兩個方向 -> 延遲、上升時間、過衝、穩態誤差、空載扭矩
   reverse     +6 直接跳 -6 -> 反轉的反應
+  chg_*       非 0 -> 非 0, 不經過 0 直接換轉速 (5→10→5→2→6→1, 反方向 5→10→5→2)
+              -> 加速 / 減速是不是都是同一個斜坡 (actuator_model 這樣假設, 2026-10-20 還沒量過)
   ramp        0 -> +10 -> -10 -> 0 慢慢掃 -> 空載扭矩隨轉速的曲線 (= 馬達損耗)
   low_*       1 / 2 / 3 / 5 rpm -> 低速死區與整數 rpm 量化
   silent      送 2.4 rad/s 之後**停止發指令** -> 實體車 0.3 秒會自己停, 模擬會一直轉
@@ -73,6 +75,20 @@ def build_sequence(wmax=10.0, quick=False, timeout_test=True):
         seg('pre_reverse', 2.0, all4(6.0))
         seg('reverse', 2.0, all4(-6.0))
         seg('stop', 2.0, all4(0.0))
+    # 非 0 -> 非 0: 從一個轉速直接換到另一個, 不經過 0 (MPC 大部分時間都在做這件事)。
+    # 有加速、減速、大小不同的變化; 斜坡的話斜率跟變化大小無關, 一階衰減的話會成正比。
+    if quick:
+        chains = [(1.0, (0.5, 1.0, 0.5, 0.2))]
+    else:
+        chains = [(1.0, (0.5, 1.0, 0.5, 0.2, 0.6, 0.1)), (-1.0, (0.5, 1.0, 0.5, 0.2))]
+    for sgn, fracs in chains:
+        prev = sgn * fracs[0] * wmax
+        seg('pre_chg', hold, all4(prev))
+        for f in fracs[1:]:
+            w = sgn * f * wmax
+            seg(f'chg_{prev:+.1f}_{w:+.1f}', 2.0, all4(w))
+            prev = w
+        seg('stop', 2.0, all4(0.0))
     # 慢速掃描
     T = 10.0 if quick else 15.0
     seg('ramp', 4.0 * T,
@@ -98,6 +114,7 @@ def record(args):
     import rclpy
     from rclpy.node import Node
     from rclpy.parameter import Parameter
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import JointState
 
     seq = build_sequence(args.max_speed, args.quick, not args.no_timeout_test)
@@ -108,7 +125,11 @@ def record(args):
             super().__init__('wheel_bench',
                              parameter_overrides=[Parameter('use_sim_time', value=args.sim)])
             self.pub = self.create_publisher(JointState, args.cmd_topic, 10)
-            self.create_subscription(JointState, args.fb_topic, self.on_fb, 50)
+            # 實體車的 /wheel_feedback 是 BEST_EFFORT (SensorDataQoS), 預設的 RELIABLE 訂閱收不到;
+            # BEST_EFFORT 訂閱對 Isaac 的 RELIABLE /joint_states 也收得到。
+            self.create_subscription(
+                JointState, args.fb_topic, self.on_fb,
+                QoSProfile(depth=50, reliability=ReliabilityPolicy.BEST_EFFORT))
             self.f = open(args.out, 'w', newline='')
             self.w = csv.writer(self.f)
             self.w.writerow(['t_recv', 'stamp', 'seg', 'seg_name', 'seg_t0', 'published']
@@ -132,19 +153,21 @@ def record(args):
 
         def on_fb(self, msg):
             self.n_fb += 1
-            idx = []
             names = list(msg.name)
-            for n in JOINT_NAMES if not args.fb_names else args.fb_names:
-                idx.append(names.index(n) if n in names else None)
-            if None in idx:
-                if not self.warned:
+            if names:
+                # 依名字取。實體車某一輪這一輪沒回應時, 那一則只有三個名字 -> 那一輪記 NaN
+                # (不能退回「前四個」: /wheel_feedback 的順序是 FL RL FR RR, 會把 FR/RL 對調)。
+                want = JOINT_NAMES if not args.fb_names else args.fb_names
+                idx = [names.index(n) if n in names else None for n in want]
+                if all(k is None for k in idx) and not self.warned:
                     self.warned = True
-                    self.get_logger().warn(f'回授裡找不到 {JOINT_NAMES}, 收到的是 {names}; '
-                                           '改用前四個 (順序不對的話用 --fb-names)')
-                idx = [0, 1, 2, 3]
+                    self.get_logger().warn(f'回授裡找不到 {want}, 收到的是 {names} (用 --fb-names)')
+            else:
+                idx = [0, 1, 2, 3]          # 沒有名字的回授只能照順序
 
             def pick(arr):
-                return [float(arr[k]) if k < len(arr) else float('nan') for k in idx]
+                return [float(arr[k]) if k is not None and k < len(arr) else float('nan')
+                        for k in idx]
             st = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             name = seq[self.i][0] if 0 <= self.i < len(seq) else ('wait' if self.i < 0 else 'end')
             self.w.writerow([f'{self.now():.6f}', f'{st:.6f}', self.i, name,
@@ -310,6 +333,39 @@ def analyze(path):
         rev.append(float(tt[a[0]]) if len(a) else float('nan'))
     R['reverse_t90'] = float(np.nanmean(rev)) if rev else float('nan')
 
+    # 非 0 -> 非 0: 變化量的 10% / 50% / 90% 什麼時候到, 20%~80% 之間的平均斜率
+    chg = []
+    for nm, ix, t0 in segs('chg_'):
+        _, a, b = nm.split('_')
+        a, b = float(a), float(b)
+        pre = np.arange(max(ix[0] - 5, 0), ix[0])          # 換指令前的輪速
+        y0 = np.nanmean(V[pre], axis=0)
+        y1 = np.nanmedian(C[ix], axis=0)                    # 量化後真正送出的指令
+        tt = t[ix] - t0
+        t10, t50, t90, slope = [], [], [], []
+        for k in range(4):
+            span = y1[k] - y0[k]
+            if not np.isfinite(span) or abs(span) < 0.5:
+                continue
+            f = (V[ix, k] - y0[k]) / span
+
+            def first(level, f=f):
+                hit = np.nonzero(f >= level)[0]
+                return tt[hit[0]] if len(hit) else np.nan
+
+            p10, p20, p50, p80, p90 = (first(x) for x in (0.1, 0.2, 0.5, 0.8, 0.9))
+            t10.append(p10)
+            t50.append(p50)
+            t90.append(p90)
+            if np.isfinite(p20) and np.isfinite(p80) and p80 > p20:
+                slope.append(0.6 * abs(span) / (p80 - p20))
+        chg.append({'name': f'{a:+.1f} -> {b:+.1f}', 'up': abs(b) > abs(a),
+                    't10': float(np.nanmean(t10)) if t10 else math.nan,
+                    't50': float(np.nanmean(t50)) if t50 else math.nan,
+                    't90': float(np.nanmean(t90)) if t90 else math.nan,
+                    'slope': float(np.nanmean(slope)) if slope else math.nan})
+    R['chg'] = chg
+
     # 慢速掃描: 空載扭矩 = c0 + c1·|w| (沿轉動方向)
     rp = segs('ramp')
     if rp and R['has_effort']:
@@ -419,6 +475,32 @@ def compare(args):
         line(f'從 {w:.2f} rad/s 指令歸零到停 [s]', vals, tol=0.1,
              why='煞車快慢不同: 影響急煞 (B3) 與每段之間的停車')
     line('+6 -> -6 到 90% [s]', [R['reverse_t90'] for R in Rs], tol=0.1, why='反轉快慢不同')
+    # 4b. 非 0 -> 非 0
+    print('\n[4b] 非 0 -> 非 0 (不經過 0 直接換轉速; 時間從送出新指令算起, 斜率取變化量的 20%~80%)')
+    chg_names = []
+    for R in Rs:
+        for c in R.get('chg', []):
+            if c['name'] not in chg_names:
+                chg_names.append(c['name'])
+    if not chg_names:
+        print('  (沒有這一段: 舊版 wheel_bench 錄的)')
+    why_chg = '非 0 -> 非 0 的變化快慢不同: actuator_model 假設這裡也是 accel 的斜坡'
+    for nm in chg_names:
+        row = [next((c for c in R.get('chg', []) if c['name'] == nm), None) for R in Rs]
+        line(f'{nm} 到 90% [s]', [r['t90'] if r else math.nan for r in row], tol=0.05, why=why_chg)
+        line(f'{nm} 斜率 [rad/s²]', [r['slope'] if r else math.nan for r in row], nd=1, tol=5.0,
+             why=why_chg)
+    for k, R in enumerate(Rs):
+        if not R.get('chg'):
+            continue
+        ups = [c['slope'] for c in R['chg'] if c['up'] and math.isfinite(c['slope'])]
+        downs = [c['slope'] for c in R['chg'] if not c['up'] and math.isfinite(c['slope'])]
+        print(f'  {tag[k]}: 加速平均 {fmt(float(np.mean(ups)) if ups else math.nan, "", 1)}, '
+              f'減速平均 {fmt(float(np.mean(downs)) if downs else math.nan, "", 1)} rad/s²')
+    if chg_names:
+        print('  (看兩邊的差, 不要拿絕對值跟 30 比: 小的變化 (2~3 rad/s) 轉角佔比較大, 量出來的斜率本來就\n'
+              '   比較低。實體車跟模擬接近 = actuator_model 的假設對; 實體車的減速明顯比較快 = 要分開加速 /\n'
+              '   減速兩個斜率)')
     # 5. 慢速掃描
     print('\n[5] 慢速掃描: 空載扭矩 = c0 + c1·|w|  (這就是馬達損耗, 摩擦分析從自旋扭矩扣掉的那一項)')
     line('c0 [N·m]', [R.get('loss', (math.nan,) * 2)[0] for R in Rs], tol=0.05,

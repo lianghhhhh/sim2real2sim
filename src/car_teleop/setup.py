@@ -23,6 +23,7 @@ setup(
     extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
+            'actuator_model = car_teleop.actuator_model:main',
             'cmd_vel_bridge = car_teleop.cmd_vel_bridge:main',
             'teleop_key = car_teleop.teleop_key:main',
         ],
