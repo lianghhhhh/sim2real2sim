@@ -11,9 +11,6 @@ controller_manager:
     wheel_velocity_controller:
       type: kros_car/WheelVelocityController
 
-    arm_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
-
 # Twist commands (/base_controller/cmd_vel): teleop, mapping, calibration.
 base_controller:
   ros__parameters:
@@ -60,19 +57,3 @@ wheel_velocity_controller:
       - rear_right_joint
     command_topic: /joint_command
     command_timeout: 0.3
-
-arm_controller:
-  ros__parameters:
-    fallback_controllers: [""]
-    joints:
-      - arm_1_joint
-      - arm_2_joint
-      - gripper_joint
-    command_interfaces:
-      - position
-    state_interfaces:
-      - position
-      - velocity
-    state_publish_rate: 15.0
-    action_monitor_rate: 10.0
-    allow_partial_joints_goal: false

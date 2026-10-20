@@ -21,6 +21,7 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
   <!-- 建圖時要手動把場地開一圈; 只有 mapping.launch.py 的 teleop:=true 會用到 -->
   <exec_depend>car_teleop</exec_depend>
 

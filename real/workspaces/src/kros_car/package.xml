@@ -16,10 +16,8 @@
   <depend>controller_interface</depend>
   <depend>controller_manager</depend>
   <depend>sensor_msgs</depend>
-  <depend>std_msgs</depend>
   <depend>joint_state_broadcaster</depend>
   <depend>diff_drive_controller</depend>
-  <depend>joint_trajectory_controller</depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>
   <depend>robot_state_publisher</depend>

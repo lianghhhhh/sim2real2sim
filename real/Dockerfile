@@ -12,6 +12,12 @@ WORKDIR /workspaces
 # colcon package names; oradar_lidar is the package in src/oradar_ros.
 ARG PACKAGES="oradar_lidar wildbot_imu wildbot_calibration kros_car_description kros_car"
 
+# car_loc_lidar (../src, run through scripts/sim2real2sim.sh) needs scipy for
+# its distance field. Kept above the COPY so source changes do not redo it.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3-scipy && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY workspaces/src /tmp/src
 
 # Each source directory is replaced as a whole, and the old build output is

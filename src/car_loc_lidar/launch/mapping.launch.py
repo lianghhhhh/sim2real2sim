@@ -42,11 +42,19 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, EmitEvent, RegisterEventHandler
 from launch.conditions import IfCondition
+from launch.events import matches_action
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import LifecycleNode, Node
+from launch_ros.event_handlers import OnStateTransition
+from launch_ros.events.lifecycle import ChangeState
 from launch_ros.parameter_descriptions import ParameterValue
+from lifecycle_msgs.msg import Transition
+
+# slam_toolbox 從 Jazzy (2.8) 起是 lifecycle 節點, 開起來停在 unconfigured, 不送
+# configure / activate 就不建圖。Humble (模擬容器) 的還是一般節點。
+SLAM_IS_LIFECYCLE = os.environ.get('ROS_DISTRO', 'humble') != 'humble'
 
 
 def generate_launch_description():
@@ -98,11 +106,27 @@ def generate_launch_description():
             'cloud_topic': LaunchConfiguration('cloud_topic'),
         }])
 
-    slam = Node(
+    slam_kwargs = dict(
         package='slam_toolbox', executable='sync_slam_toolbox_node',
         name='slam_toolbox', output='screen',
         parameters=[LaunchConfiguration('slam_params_file'),
                     {'use_sim_time': use_sim_time}])
+    if SLAM_IS_LIFECYCLE:
+        slam = LifecycleNode(namespace='', **slam_kwargs)
+        slam_start = [
+            EmitEvent(event=ChangeState(
+                lifecycle_node_matcher=matches_action(slam),
+                transition_id=Transition.TRANSITION_CONFIGURE)),
+            RegisterEventHandler(OnStateTransition(
+                target_lifecycle_node=slam, start_state='configuring',
+                goal_state='inactive',
+                entities=[EmitEvent(event=ChangeState(
+                    lifecycle_node_matcher=matches_action(slam),
+                    transition_id=Transition.TRANSITION_ACTIVATE))])),
+        ]
+    else:
+        slam = Node(**slam_kwargs)
+        slam_start = []
 
     teleop = Node(
         package='car_teleop', executable='cmd_vel_bridge', name='cmd_vel_bridge',
@@ -113,4 +137,4 @@ def generate_launch_description():
                      'yaw_trim_gain': ParameterValue(LaunchConfiguration('yaw_trim_gain'),
                                                      value_type=float)}])
 
-    return LaunchDescription(args + [static_lidar, odom, slam, teleop])
+    return LaunchDescription(args + [static_lidar, odom, slam, teleop] + slam_start)

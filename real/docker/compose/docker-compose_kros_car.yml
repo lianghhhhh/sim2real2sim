@@ -8,7 +8,6 @@ services:
       - .env
     devices:
       - "/dev/usb_wheel:/dev/usb_wheel"
-      - "/dev/usb_robot_arm:/dev/usb_robot_arm"
     volumes:
       - ./configs:/configs:ro
     network_mode: host

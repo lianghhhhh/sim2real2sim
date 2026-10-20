@@ -21,7 +21,6 @@
 | C | 每 4 ms 問一顆馬達的匯流排時序沒有碰撞，回授是 50 Hz | 第 3、5 關 |
 | D | 位置和電流回授的正負號跟輪速一致 | 第 6 關 |
 | E | 主機卡死時，心跳逾時會在 0.5 秒內停輪 | 第 7 關 |
-| F | 控制迴圈改成 50 Hz 後，手臂行為不變 | 第 8 關 |
 
 測試順序是從底層往上：先只測韌體和馬達，再加上 ROS，最後才落地。每一關都通過了才進下一關。這樣出問題時，範圍只會落在新加上的那一層。
 
@@ -46,15 +45,14 @@
 ```bash
 cd tools
 sudo ./create_usb_rule.sh /dev/ttyUSB? usb_wheel          # 車輪 ESP32
-sudo ./create_usb_rule.sh /dev/ttyUSB? usb_robot_arm      # 手臂
 sudo ./create_usb_rule.sh /dev/ttyUSB? oradar             # 光達
 sudo ./create_usb_rule.sh /dev/ttyUSB? imu                # IMU
-ls -l /dev/usb_wheel /dev/usb_robot_arm /dev/oradar /dev/imu
+ls -l /dev/usb_wheel /dev/oradar /dev/imu
 ```
 
 如果車上原本就設定過，只要確認名稱對得上。
 
-**預期**：四個名稱都存在，各自指向正確的 `ttyUSB*` 或 `ttyACM*`。
+**預期**：三個名稱都存在，各自指向正確的 `ttyUSB*` 或 `ttyACM*`。
 
 **實際結果**：
 
@@ -141,10 +139,10 @@ echo '{"T":10000,"id":1}' > $W                       # 停止
 
 | 馬達 ID | 預期位置 | 實際位置 | +20 rpm 的轉向（往前 / 往後） |
 | --- | --- | --- | --- |
-| 1 | 左前 | | |
-| 2 | 左後 | | |
-| 3 | 右前 | | |
-| 4 | 右後 | | |
+| 1 | 左前 | | front |
+| 2 | 左後 | | front |
+| 3 | 右前 | | back |
+| 4 | 右後 | | back |
 
 ### 3-3 輪詢模式
 
@@ -173,7 +171,7 @@ echo '{"T":11001,"time":500}' > $W     # 恢復心跳（ROS 啟動後也會每 2
 
 ---
 
-## 6. 第 4 關：啟動 ROS（只開輪子和手臂）
+## 6. 第 4 關：啟動 ROS（只開輪子）
 
 **目的**：確認硬體介面能開啟序列埠、收到回授，並且沒有持續的錯誤。
 
@@ -184,10 +182,9 @@ echo '{"T":11001,"time":500}' > $W     # 恢復心跳（ROS 啟動後也會每 2
 ./scripts/kros_car.sh          # log 會在前景顯示，按 Ctrl+C 會關掉全部服務
 ```
 
-**預期**：log 中出現下面這三行：
+**預期**：log 中出現下面這兩行：
 
 - `Wheel serial opened: /dev/usb_wheel @ 460800`
-- `Arm serial opened: /dev/usb_robot_arm @ 115200`
 - `KrosCarSystem activated`
 
 下列訊息**不應該**持續出現：
@@ -333,28 +330,9 @@ docker unpause <kros_car 容器名稱>
 
 ---
 
-## 10. 第 8 關：手臂
+## 10. 第 8 關：手臂（已移除）
 
-**目的**：控制迴圈從 20 Hz 改成 50 Hz 後，手臂指令仍然限制在 20 Hz 送出。這一關確認手臂行為沒有改變（項目 F）。
-
-**步驟**：先送一個安全姿勢：
-
-```bash
-ros2 action send_goal /arm_controller/follow_joint_trajectory control_msgs/action/FollowJointTrajectory \
-  "{trajectory: {joint_names: ['arm_1_joint','arm_2_joint','gripper_joint'], points: [{positions: [1.0, 1.1, 2.0], time_from_start: {sec: 2}}]}}"
-```
-
-接著跑一次平常使用的抓取流程。
-
-| 檢查項目 | 預期 | 實際 |
-| --- | --- | --- |
-| 手臂移動 | 平順，到達目標位置 | |
-| action 結果 | 成功 | |
-| log | 沒有 `Arm cmd queue delay` 警告 | |
-| `/arm_joint_temperatures` | 有資料，溫度合理 | |
-| 平常的抓取流程 | 跟舊版行為一致 | |
-
-**通過**：□
+車上不再接手臂，ROS 程式也已經拿掉手臂的控制，這一關不用做。
 
 ---
 
@@ -394,9 +372,9 @@ ros2 topic hz /wheel_feedback  # 確認輪子回授仍是 50 Hz
 
 | Topic | 有資料 | 頻率 (Hz) |
 | --- | --- | --- |
-| `/scan` | | |
-| `/imu/data` | | |
-| `/wheel_feedback` | | |
+| `/scan` | | 13 |
+| `/imu/data` | | x |
+| `/wheel_feedback` | | 50 |
 
 ### 9-3 校正
 
@@ -428,7 +406,7 @@ ros2 topic hz /wheel_feedback  # 確認輪子回授仍是 50 Hz
 | 5 | 回授 topic | C | | |
 | 6 | 正負號與控制器 | D | | |
 | 7 | 心跳保護 | E | | |
-| 8 | 手臂 | F | | |
+| 8 | 手臂（已移除） | | 不適用 | |
 | 9 | 落地、感測器、校正 | | | |
 
 **實測得到的參數**

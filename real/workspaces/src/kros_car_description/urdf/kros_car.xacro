@@ -13,23 +13,7 @@
 <xacro:arg name="wheel_feedback_timeout_ms" default="200" />
 <xacro:arg name="wheel_torque_constant" default="0.75" />
 <xacro:arg name="wheel_require_feedback" default="true" />
-<xacro:arg name="arm_port" default="/dev/usb_robot_arm" />
-<xacro:arg name="arm_baudrate" default="115200" />
-<xacro:arg name="arm_servo_ids" default="1,2,3" />
-<xacro:arg name="default_move_time_ms" default="80" />
-<xacro:arg name="arm_read_timeout_ms" default="80" />
-<xacro:arg name="arm_temp_publish_interval_cycles" default="10" />
-<xacro:arg name="arm_command_rate_hz" default="20" />
-<xacro:arg name="gripper_max_ticks" default="1000" />
-<xacro:arg name="gripper_stall_error_ticks" default="30" />
-<xacro:arg name="gripper_stall_trigger_ms" default="500" />
-<xacro:arg name="gripper_stall_motion_epsilon_ticks" default="3" />
-<xacro:arg name="gripper_stall_backoff_ticks" default="10" />
-<xacro:arg name="gripper_stall_release_delta_ticks" default="20" />
-<xacro:arg name="gripper_overheat_temp_c" default="70" />
-<xacro:arg name="gripper_overheat_hysteresis_c" default="5" />
 <xacro:arg name="wheel_joints" default="front_left_joint,rear_left_joint,front_right_joint,rear_right_joint" />
-<xacro:arg name="arm_joints" default="arm_1_joint,arm_2_joint,gripper_joint" />
 <!-- base_link: x forward (the arm side), y left, z up.
      The CAD model was drawn facing -x. base_link's own mesh and inertia, and
      the joints of everything bolted to it, are therefore turned half a turn
@@ -642,12 +626,10 @@
   <limit effort="2.0" velocity="20.944"/>
 </joint>
 
-<joint name="arm_1_joint" type="revolute">
+<joint name="arm_1_joint" type="fixed">
   <origin xyz="-0.007312 -0.01975 0.027605" rpy="3.14159265 1.04719755 -3.14159265"/>
   <parent link="new_motor_v2_1"/>
   <child link="big_U_self_v2_1"/>
-  <axis xyz="0.0 -1.0 0.0"/>
-  <limit lower="0.6981" upper="3.1416" effort="3.5" velocity="4.5"/>
 </joint>
 
 <joint name="Rigid 42" type="fixed">
@@ -662,12 +644,10 @@
   <child link="new_motor_v2__1__1"/>
 </joint>
 
-<joint name="arm_2_joint" type="revolute">
+<joint name="arm_2_joint" type="fixed">
   <origin xyz="-0.012497 0.01975 -0.007504" rpy="0 0.523598776 0"/>
   <parent link="new_motor_v2__1__1"/>
   <child link="big_U_self_v2__1__1"/>
-  <axis xyz="0.0 -1.0 -0.0"/>
-  <limit lower="0.8727" upper="4.1888" effort="3.5" velocity="4.5"/>
 </joint>
 
 <joint name="Rigid 45" type="fixed">
@@ -676,23 +656,18 @@
   <child link="grap_base_v1_1"/>
 </joint>
 
-<joint name="gripper_joint" type="revolute">
+<joint name="gripper_joint" type="fixed">
   <!-- <origin xyz="-1.3e-05 0.0125 0.0355" rpy="2.87979321 -0.00072739252 9.57630656e-05"/> -->
   <origin xyz="-1.3e-05 0.0125 0.0355" rpy="0 0 0"/>
   <parent link="grap_base_v1_1"/>
   <child link="grap2_v2_1"/>
-  <axis xyz="-1.0 0.0 0.0"/>
-  <limit lower="0.0" upper="1.2217" effort="2.4" velocity="5.5"/>
 </joint>
 
-<joint name="gripper_joint_2" type="revolute">
+<joint name="gripper_joint_2" type="fixed">
   <!-- <origin xyz="-1.3e-05 -0.0125 0.0355" rpy="-2.87979321 -0.00072739252 -9.57630656e-05"/> -->
   <origin xyz="-1.3e-05 -0.0125 0.0355" rpy="0 0 0"/>
   <parent link="grap_base_v1_1"/>
   <child link="grap2_v2_Mirror__1"/>
-  <axis xyz="1.0 0.0 0.0"/>
-  <limit lower="0.0" upper="1.2217" effort="2.4" velocity="5.5"/>
-  <mimic joint="gripper_joint" multiplier="1" offset="0"/>
 </joint>
 
 <!-- ============================================================
@@ -754,23 +729,7 @@
       <param name="wheel_feedback_timeout_ms">$(arg wheel_feedback_timeout_ms)</param>
       <param name="wheel_torque_constant">$(arg wheel_torque_constant)</param>
       <param name="wheel_require_feedback">$(arg wheel_require_feedback)</param>
-      <param name="arm_port">$(arg arm_port)</param>
-      <param name="arm_baudrate">$(arg arm_baudrate)</param>
-      <param name="arm_servo_ids">$(arg arm_servo_ids)</param>
-      <param name="default_move_time_ms">$(arg default_move_time_ms)</param>
-      <param name="arm_read_timeout_ms">$(arg arm_read_timeout_ms)</param>
-      <param name="arm_temp_publish_interval_cycles">$(arg arm_temp_publish_interval_cycles)</param>
-      <param name="arm_command_rate_hz">$(arg arm_command_rate_hz)</param>
-      <param name="gripper_max_ticks">$(arg gripper_max_ticks)</param>
-      <param name="gripper_stall_error_ticks">$(arg gripper_stall_error_ticks)</param>
-      <param name="gripper_stall_trigger_ms">$(arg gripper_stall_trigger_ms)</param>
-      <param name="gripper_stall_motion_epsilon_ticks">$(arg gripper_stall_motion_epsilon_ticks)</param>
-      <param name="gripper_stall_backoff_ticks">$(arg gripper_stall_backoff_ticks)</param>
-      <param name="gripper_stall_release_delta_ticks">$(arg gripper_stall_release_delta_ticks)</param>
-      <param name="gripper_overheat_temp_c">$(arg gripper_overheat_temp_c)</param>
-      <param name="gripper_overheat_hysteresis_c">$(arg gripper_overheat_hysteresis_c)</param>
       <param name="wheel_joints">$(arg wheel_joints)</param>
-      <param name="arm_joints">$(arg arm_joints)</param>
     </hardware>
 
     <joint name="front_left_joint">
@@ -796,26 +755,6 @@
       <state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
-    </joint>
-
-    <joint name="arm_1_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="arm_2_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="gripper_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="gripper_joint_2">
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
     </joint>
   </ros2_control>
 </robot>

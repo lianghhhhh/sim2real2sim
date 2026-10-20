@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cmath>
 #include <sstream>
 
 namespace kros_car
@@ -83,19 +82,6 @@ bool KrosCarSystem::set_baud_rate(LibSerial::SerialPort & port, int baudrate)
       return false;
   }
   return true;
-}
-
-double KrosCarSystem::ticks_to_rad(int ticks)
-{
-  double deg = (static_cast<double>(ticks) / 1000.0) * 240.0;
-  return deg * M_PI / 180.0;
-}
-
-int KrosCarSystem::rad_to_ticks(double rad)
-{
-  double deg = rad * 180.0 / M_PI;
-  int ticks = static_cast<int>(std::round((deg / 240.0) * 1000.0));
-  return std::clamp(ticks, 0, 1000);
 }
 
 }  // namespace kros_car

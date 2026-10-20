@@ -33,23 +33,7 @@ HARDWARE_ARGUMENT_DEFAULTS = {
     "wheel_feedback_timeout_ms": "200",
     "wheel_torque_constant": "0.75",
     "wheel_require_feedback": "true",
-    "arm_port": "/dev/usb_robot_arm",
-    "arm_baudrate": "115200",
-    "arm_servo_ids": "1,2,3",
-    "default_move_time_ms": "80",
-    "arm_read_timeout_ms": "80",
-    "arm_temp_publish_interval_cycles": "10",
-    "arm_command_rate_hz": "20",
-    "gripper_max_ticks": "1000",
-    "gripper_stall_error_ticks": "30",
-    "gripper_stall_trigger_ms": "500",
-    "gripper_stall_motion_epsilon_ticks": "3",
-    "gripper_stall_backoff_ticks": "10",
-    "gripper_stall_release_delta_ticks": "20",
-    "gripper_overheat_temp_c": "70",
-    "gripper_overheat_hysteresis_c": "5",
     "wheel_joints": "front_left_joint,rear_left_joint,front_right_joint,rear_right_joint",
-    "arm_joints": "arm_1_joint,arm_2_joint,gripper_joint",
 }
 
 
@@ -89,7 +73,6 @@ def _load_hardware_defaults():
 
 def _launch_setup(context, *args, **kwargs):
     enable_wheel = LaunchConfiguration("enable_wheel").perform(context)
-    enable_arm = LaunchConfiguration("enable_arm").perform(context)
     wheel_controller = LaunchConfiguration("wheel_controller").perform(context)
     if wheel_controller not in WHEEL_CONTROLLERS:
         raise RuntimeError(
@@ -149,19 +132,6 @@ def _launch_setup(context, *args, **kwargs):
             )
             for name in WHEEL_CONTROLLERS
         ],
-        Node(
-            package="controller_manager",
-            executable="spawner",
-            output="screen",
-            condition=IfCondition(enable_arm),
-            arguments=[
-                "arm_controller",
-                "--controller-manager",
-                "/controller_manager",
-                "--controller-manager-timeout",
-                "120",
-            ],
-        ),
     ]
 
     return actions
@@ -183,7 +153,6 @@ def _resolve_default_config(filename):
 def generate_launch_description():
     launch_arguments = [
         DeclareLaunchArgument("enable_wheel", default_value="true"),
-        DeclareLaunchArgument("enable_arm", default_value="true"),
         DeclareLaunchArgument(
             "wheel_controller",
             default_value="base_controller",

@@ -13,14 +13,12 @@ find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(std_msgs REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBSERIAL REQUIRED libserial)
 
 # Hardware plugin
 add_library(kros_car_system SHARED
   src/kros_car_system_common.cpp
-  src/kros_car_system_protocol.cpp
   src/kros_car_system_threads.cpp
   src/kros_car_system_lifecycle.cpp
   src/kros_car_system_io.cpp
@@ -44,7 +42,6 @@ ament_target_dependencies(kros_car_system
   rclcpp
   rclcpp_lifecycle
   sensor_msgs
-  std_msgs
 )
 
 pluginlib_export_plugin_description_file(hardware_interface kros_car_hardware_plugins.xml)

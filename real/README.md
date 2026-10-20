@@ -31,7 +31,6 @@
       USB 設定名稱:
       - LiDAR: oradar
       - 車輪: usb_wheel
-      - 夾爪: usb_robot_arm
 
    ```bash
    git submodule update --init tools   # 第一次才需要
@@ -54,8 +53,8 @@
 5. 啟動：
 
    ```bash
-   ./scripts/start_all.sh          # 輪子+手臂、光達、IMU、Foxglove
-   ./scripts/kros_car.sh           # 或只開輪子+手臂
+   ./scripts/start_all.sh          # 輪子、光達、IMU、Foxglove
+   ./scripts/kros_car.sh           # 或只開輪子
    ```
 
 `start_all.sh` 不開 EKF：它會佔用 `/odom`，而 sim2real2sim 把 `/odom` 當 ground truth。
@@ -71,7 +70,7 @@
 | `/joint_command` | `sensor_msgs/JointState` | **輪速指令**，`velocity` 放 rad/s，用關節名稱對應。要持續送，停 0.3 秒輪子就停 |
 | `/base_controller/cmd_vel` | `geometry_msgs/TwistStamped` | 速度指令（遙控、建圖、校正用） |
 | `/wheel_feedback` | `sensor_msgs/JointState` | 四輪的位置 rad、輪速 rad/s、扭矩 N·m，50 Hz，時戳是 ESP32 送出的時刻。**記錄資料用這個** |
-| `/joint_states` | `sensor_msgs/JointState` | 同樣的值加上手臂，但時戳被控制迴圈量化成 20 ms |
+| `/joint_states` | `sensor_msgs/JointState` | 同樣的值，但時戳被控制迴圈量化成 20 ms |
 | `/base_controller/odom` | `nav_msgs/Odometry` | 由量到的輪子位置算的里程計 |
 | `/scan` | `sensor_msgs/LaserScan` | MS200，經過 `scan_filters.yaml` |
 | `/imu/data` | `sensor_msgs/Imu` | 6 軸 |
@@ -121,7 +120,8 @@
 | 輪速指令介面 | 只有 `cmd_vel` | 多一個 `/joint_command`，和模擬同一種訊息 |
 | 回授遺失、馬達模式不對 | 不知道 | 四輪停下並記錄原因 |
 | USB baud | 115200 | 460800 |
-| 控制迴圈 | 20 Hz | 50 Hz（手臂指令仍以 20 Hz 送出） |
+| 控制迴圈 | 20 Hz | 50 Hz |
+| 手臂和夾爪 | 由 `/arm_controller` 控制 | 移除，URDF 裡固定不動 |
 | 關節名稱 | `wheel_1_joint`… | `front_left_joint`… |
 | `calibrate.sh` | 要求一個 compose 沒建立的 docker network | 改用 host network，和其他服務一致 |
 
@@ -156,7 +156,6 @@
 4. **匯流排時序。** 每 4 ms 問一顆馬達，沿用 `stop_all_wheels()` 原本的間隔。用
    `ros2 topic hz /wheel_feedback` 看是不是 50 Hz、訊息裡是不是都有四個關節。
 5. **heartbeat。** 行駛中 `docker stop` 掉 `kros_car` 容器，輪子應該在 0.5 秒內停。
-6. **手臂。** 控制迴圈從 20 Hz 變 50 Hz，手臂指令被限制在 20 Hz 送出。跑一次平常的抓取動作確認沒變。
 
 之後要量的：
 
