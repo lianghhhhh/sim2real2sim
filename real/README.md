@@ -144,9 +144,9 @@
 
 架高、輪子離地時逐項看：
 
-1. **回授的正負號。** 位置和電流的正負號我假設和輪速一致。往前轉時，`/wheel_feedback` 四輪的
-   velocity 和 position 都應該往正的方向走；加速時 effort 為正。不對的話要改
-   `kros_car_system_threads.cpp` 的 `wheel_handle_line()`。
+1. **回授的正負號。** 2026-10-20 懸空實測（`scripts/wheel_bench.py`）：電流和輪速同號；
+   DDSM115 的位置刻度則跟輪速**相反**，已在 `wheel_protocol.hpp` 的 `kPositionSign` 修正。
+   往前轉時，`/wheel_feedback` 四輪的 velocity 和 position 都應該往正的方向走；加速時 effort 為正。
 2. **速度環的 mode 值。** 我假設馬達在速度環時回報 `mode` = 2。如果不是，log 會一直出現
    `is in mode N, switching it to speed loop` 而且輪子不動；先在 `hardware.yaml` 設
    `wheel_require_feedback: false` 確認實際的值。

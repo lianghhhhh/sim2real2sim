@@ -79,7 +79,7 @@ void KrosCarSystem::wheel_handle_line(const std::string & line)
       }
       const double direction = wheel_motor_directions_[i];
       WheelFeedback & fb = wheel_feedback_[i];
-      fb.position = direction * wheel::counts_to_rad(
+      fb.position = direction * wheel::motor_position_to_rad(
         wheel_unwrappers_[i].update(frame.pos_raw[index]));
       fb.velocity = direction * wheel::rpm_to_rad_per_s(frame.spd_rpm[index]);
       fb.effort = direction * wheel::raw_to_ampere(frame.tor_raw[index]) * wheel_torque_constant_;

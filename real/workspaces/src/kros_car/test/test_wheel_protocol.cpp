@@ -105,6 +105,15 @@ TEST(WheelProtocol, ConvertsUnits)
   EXPECT_NEAR(wheel::counts_to_rad(-wheel::kPositionModulus / 2), -M_PI, 1e-12);
 }
 
+TEST(WheelProtocol, PositionFollowsTheSignOfSpeed)
+{
+  // The DDSM115 count goes down while the motor turns with a positive speed,
+  // so a falling count must come out as a rising angle.
+  EXPECT_NEAR(wheel::motor_position_to_rad(-wheel::kPositionModulus), 2.0 * M_PI, 1e-12);
+  EXPECT_NEAR(wheel::motor_position_to_rad(wheel::kPositionModulus / 4), -0.5 * M_PI, 1e-12);
+  EXPECT_DOUBLE_EQ(wheel::motor_position_to_rad(0), 0.0);
+}
+
 TEST(WheelProtocol, DescribesErrors)
 {
   EXPECT_EQ(wheel::describe_error(0x02), "overcurrent");

@@ -24,6 +24,12 @@ constexpr double kCurrentFullScaleA = 8.0;
 // DDSM115: position 0..32767 <-> one revolution.
 constexpr int kPositionModulus = 32768;
 
+// The DDSM115 position count runs against its own speed and torque current:
+// with a positive speed the count goes down. Measured on the car with the
+// wheels off the ground (scripts/wheel_bench.py, 2026-10-20: d(position)/dt =
+// -0.99 x speed on all four motors). Speed and current need no correction.
+constexpr int kPositionSign = -1;
+
 // Error code bits of the DDSM115 feedback.
 constexpr int kErrSensor = 0x01;
 constexpr int kErrOvercurrent = 0x02;
@@ -64,6 +70,8 @@ bool is_heartbeat_stop(const std::string & line);
 double rpm_to_rad_per_s(double rpm);
 double raw_to_ampere(int raw);
 double counts_to_rad(long long counts);
+// Unwrapped position count -> rad, in the sign of the motor's speed.
+double motor_position_to_rad(long long counts);
 
 // "sensor,stall" style description of a DDSM115 error code.
 std::string describe_error(int err);

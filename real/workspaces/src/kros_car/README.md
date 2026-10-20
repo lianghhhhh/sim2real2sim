@@ -228,4 +228,4 @@ kros_car/
 - Uses the Jazzy-native `ros2_control` API (framework-managed interfaces, `set_state`/`get_command`).
 - The diff-drive controller does not publish `odom -> base_link` TF by default; external localization is expected to own that transform.
 - The `write()` method does not do serial I/O directly; it updates a shared command buffer that the wheel IO thread consumes.
-- The sign of the motor's position and torque-current feedback is assumed to follow the sign of its speed. This has not been checked on the car yet.
+- Feedback signs, measured with the wheels off the ground (2026-10-20): the torque current follows the sign of the speed, the DDSM115 position count runs against it. `wheel::kPositionSign` flips the position so that all three share the joint's sign.

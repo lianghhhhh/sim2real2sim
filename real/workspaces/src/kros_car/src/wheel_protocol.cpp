@@ -150,6 +150,11 @@ double counts_to_rad(long long counts)
   return static_cast<double>(counts) * 2.0 * kPi / static_cast<double>(kPositionModulus);
 }
 
+double motor_position_to_rad(long long counts)
+{
+  return kPositionSign * counts_to_rad(counts);
+}
+
 std::string describe_error(int err)
 {
   static const std::array<std::pair<int, const char *>, 5> kBits = {{
