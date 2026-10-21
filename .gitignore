@@ -24,3 +24,7 @@ venv/
 .idea/
 *.swp
 .DS_Store
+
+
+# ---- test data ----
+car_run_data/
