@@ -10,6 +10,7 @@ __pycache__/
 # 虛擬環境
 .venv/
 venv/
+train_venv/
 
 # ---- ROS 2 / colcon ----
 # colcon build 產生的, 全部可以重跑 `colcon build` 生回來。
