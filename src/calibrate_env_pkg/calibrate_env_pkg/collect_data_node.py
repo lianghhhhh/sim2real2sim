@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""把 ground truth 跟五條定位結果記到同一個 CSV。
+"""把 ground truth 跟六條定位結果記到同一個 CSV。
 
-一列 = 一個時刻的六個答案:
+一列 = 一個時刻的七個答案:
 
     /odom              Isaac ground truth      -> car_position_x/y, gt_yaw
     /camera_loc/odom   相機 + YOLO             -> cam_x/y/yaw
@@ -9,19 +9,24 @@
     /imu_loc/odom      純 IMU 慣性導航         -> imu_x/y/yaw
     /wheel_loc/odom    IMU + 四輪輪速航位推算  -> whl_x/y/yaw
     /fusion_loc/odom   **全部結合** (方法五)   -> fus_x/y/yaw
+    /multicam_loc/odom 8 台斜拍相機 (方法六)   -> mc_x/y/yaw, mc_ncam
 
 前四條各自獨立 —— 誰沒開就是誰那幾欄是 NaN, 其他照記。這是刻意的: 想單獨
 評估某一條時不必把另外三條也開起來。
 
-**第五條 (`fus_`) 不一樣: 它吃前兩條的輸出。** `car_loc_fusion` 訂閱
-`/camera_loc/odom` 與 `/lidar_loc/odom` 當絕對量測, 自己再吃 `/imu` 與
-`/joint_states` 做遞推。所以:
+**第五條 (`fus_`) 不一樣: 它吃別條的東西。** `car_loc_fusion` 的絕對量測是 8 台斜拍
+相機各自的 YOLO 框與 `/lidar_loc/odom`, 自己再吃 `/imu` 與 `/joint_states` 做遞推
+(**不吃 `cam_`**: 單一天花板相機現在是獨立的一條)。所以:
 
-* `fus_` 有值但 `cam_`/`lid_` 是 NaN 是**正常的** (融合節點有訂到, 只是那兩個
-  節點的 odom 沒被這裡記到 —— 不會發生, 但反過來會: 相機被擋住時 `cam_` 斷了
-  `fus_` 還在, 那正是融合的賣點)。
-* 拿 `fus_` 跟 `cam_`/`lid_` 比是**公平的** (同一份輸入), 但它們**不獨立** ——
-  不要把五條當成五個獨立樣本去做統計。
+* `fus_` 有值但 `lid_` 是 NaN 是**正常的**: LiDAR 斷了 `fus_` 還在, 那正是融合的賣點。
+* 拿 `fus_` 跟 `lid_` 比是**公平的** (同一份輸入), 但它們**不獨立** ——
+  不要把它們當成獨立樣本去做統計。
+
+**第六條 (`mc_`, car_loc_multicam) 跟 `fus_` 是同一個節點**, 只差 `fus_` 多吃 LiDAR。
+所以 `mc_` vs `fus_` 比的就是「LiDAR 值多少」, 其他完全一樣。`mc_ncam` = 最近一幀
+(0.3 s 內) 有幾台相機框到車 —— 拿它切「被擋到只剩一兩台」的片段。
+
+每台相機的原始框另存 `<csv 檔名>_bbox.csv` (見下面), 主 CSV 只放上面那幾欄。
 
 **每一欄都配一個 `_stamp` 跟 `_age`**, 不要省。原因:
 
@@ -107,14 +112,27 @@ ROS2PublishJointState), 實體車要改成 /wheel_feedback (馬達電流 x 扭�
 檔案一直開著、定期 flush (200 Hz 每則 open/close 太貴)。沒有 IMU 就是空檔 (只有
 header)。`imu_csv:=false` 可以關掉。
 
+多相機的原始框另存一個檔: `<csv 檔名>_bbox.csv`
+-------------------------------------------------
+跟 yolo_px 的理由一樣: 只有 mc_x/y 的話, 車型 (car_model.yaml) 或相機參數一改就對
+不回去了。/env_cam_i/car_bbox 每一則 (8 台 x ~15 Hz) 每個框寫一列:
+
+    stamp, recv, scenario_name, phase, cam, n_boxes, u1, v1, u2, v2, conf, cls
+
+`stamp` = 曝光時刻, 像素是 env_cameras.yaml 的解析度。**沒框到車也寫一列**
+(n_boxes = 0, 框是 NaN) —— 分得出「那台沒看到」跟「那台沒在發」。
+`car_loc_multicam/scripts/fit_car_model.py` 可以直接吃這個檔 (GT 從主 CSV 拿)。
+`bbox_csv:=false` 可以關掉。
+
 各定位線另外記 `<pre>_v` (twist.linear.x) 與 `<pre>_wz` (twist.angular.z)。
-**`fus_v` / `whl_v` 吃輪速, 打滑時是錯的** —— 別拿它量摩擦。
+**`fus_v` / `whl_v` / `mc_v` 吃輪速, 打滑時是錯的** —— 別拿它量摩擦。
 """
 import os
 import csv
 import math
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from geometry_msgs.msg import PolygonStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import String, Float32MultiArray
@@ -123,6 +141,8 @@ NAN = float('nan')
 JOINT_NAMES = ('front_left_joint', 'front_right_joint',
                'rear_left_joint', 'rear_right_joint')
 WHEEL_KEYS = ('front_left', 'front_right', 'rear_left', 'rear_right')
+# car_loc_multicam 的 env_cameras.yaml 裡 8 台相機的偵測 topic
+MULTICAM_BBOX_TOPICS = [f'/env_cam_{i}/car_bbox' for i in range(8)]
 
 
 def quat_yaw(q) -> float:
@@ -203,6 +223,8 @@ class CollectDataNode(Node):
         p('imu_odom_topic', '/imu_loc/odom')
         p('wheel_odom_topic', '/wheel_loc/odom')
         p('fusion_odom_topic', '/fusion_loc/odom')
+        p('multicam_odom_topic', '/multicam_loc/odom')
+        p('multicam_bbox_topics', MULTICAM_BBOX_TOPICS)
         p('camera_px_topic', '/camera_loc/detection_px')
         p('status_period', 10.0)
         # 主 CSV 的取樣週期 (s)。0.02 = 50 Hz, 跟 control_car_node 的控制迴圈同步;
@@ -250,8 +272,8 @@ class CollectDataNode(Node):
         # imu_ 與 whl_ 是**同一類**的東西 (都是航位推算, 都從 initial_pose 起算),
         # 差在 whl_ 多吃了 /joint_states 的四輪輪速 —— 這一組是拿來直接回答
         # 「加了輪速值多少」的, 所以兩條要**同時開**才有意義。
-        # fus_ 是方法五 (car_loc_fusion): 它吃 cam_ 與 lid_ 的輸出當絕對量測,
-        # 再加上 /imu + /joint_states 的遞推。要看它的價值就跟另外四條一起錄,
+        # fus_ 是方法五 (car_loc_fusion): 它吃 8 台相機的車框與 lid_ 的輸出當絕對量測,
+        # 再加上 /imu + /joint_states 的遞推。要看它的價值就跟另外幾條一起錄,
         # 尤其要看**相機或 LiDAR 斷掉的那幾秒** —— 平均誤差看不出融合的好處,
         # 中斷才看得出來。
         # ------------------------------------------------------------------
@@ -260,11 +282,14 @@ class CollectDataNode(Node):
         self.src_imu = Source('imu')
         self.src_whl = Source('wheel')
         self.src_fus = Source('fusion')
+        # mc_ 是方法六 (car_loc_multicam), 見檔頭
+        self.src_mc = Source('multicam')
         for name, src in (('camera_odom_topic', self.src_cam),
                           ('lidar_odom_topic', self.src_lid),
                           ('imu_odom_topic', self.src_imu),
                           ('wheel_odom_topic', self.src_whl),
-                          ('fusion_odom_topic', self.src_fus)):
+                          ('fusion_odom_topic', self.src_fus),
+                          ('multicam_odom_topic', self.src_mc)):
             self.create_subscription(
                 Odometry, topic(name),
                 lambda msg, s=src: s.update(msg, self._now()), 10)
@@ -297,6 +322,13 @@ class CollectDataNode(Node):
 
         self.filepath = os.path.join(output_dir, csv_filename)
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        # 同名的舊檔先改名留著 (不然 'w' 一開就清空, 2026-11-03 那一輪就把前一輪蓋掉了)。
+        # 新的照樣寫在原本的名字, 分析腳本的路徑不用改。
+        p('backup_existing', True)
+        # 備份檔名裡的時間用哪個時區 (容器是 UTC, 不設的話 16:39 那一輪會變成 _083907)
+        p('backup_timezone', 'Asia/Taipei')
+        if self.get_parameter('backup_existing').value:
+            self._backup_old()
         self.get_logger().info(f"Data will be logged to: {self.filepath}")
         self.count = 0
 
@@ -347,6 +379,8 @@ class CollectDataNode(Node):
             # 量到的輪子扭矩 (N·m) 與那一則回授的時戳。放在最後面: 分析腳本都是
             # 照欄名取的, 不影響舊腳本。
             header += [f'{w}_effort' for w in WHEEL_KEYS] + ['wheel_stamp']
+            # 方法六 (後來加的, 一樣放最後面)
+            header += [f'mc_{c}' for c in Source.COLUMNS] + ['mc_ncam']
             writer.writerow(header)
 
         # ---- IMU 全速率檔 ----
@@ -373,14 +407,65 @@ class CollectDataNode(Node):
             QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                        history=HistoryPolicy.KEEP_LAST, depth=50))
 
+        # ---- 多相機原始框 (見檔頭) ----
+        p('bbox_csv', True)
+        self.bbox_count = 0
+        self.bbox_seen = {}               # 相機 -> (收到時刻, 那一幀有沒有框到車)
+        self._bbox_file = None
+        if self.get_parameter('bbox_csv').value:
+            stem, _ = os.path.splitext(self.filepath)
+            self.bbox_filepath = stem + '_bbox.csv'
+            self._bbox_file = open(self.bbox_filepath, 'w', newline='')
+            self._bbox_writer = csv.writer(self._bbox_file)
+            self._bbox_writer.writerow(
+                ['stamp', 'recv', 'scenario_name', 'phase', 'cam', 'n_boxes',
+                 'u1', 'v1', 'u2', 'v2', 'conf', 'cls'])
+            self.get_logger().info(f'多相機原始框記到: {self.bbox_filepath}')
+        for t in self.get_parameter('multicam_bbox_topics').value:
+            self.create_subscription(PolygonStamped, t, self.bbox_callback, 50)
+
         self.timer = self.create_timer(
             max(float(self.get_parameter('log_period').value), 0.005), self.log_data)
         self.create_timer(
             max(float(self.get_parameter('status_period').value), 1.0),
             self.status)
 
+    def _time_tag(self, ts: float) -> str:
+        """時間戳 -> YYYYmmdd_HHMMSS (backup_timezone 的當地時間)。"""
+        import datetime
+        tz = None
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(str(self.get_parameter('backup_timezone').value))
+        except Exception:
+            # 容器裡沒有時區資料: 退回 UTC+8, 名字至少跟台灣時間一致
+            tz = datetime.timezone(datetime.timedelta(hours=8))
+        return datetime.datetime.fromtimestamp(ts, tz).strftime('%Y%m%d_%H%M%S')
+
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    def _backup_old(self):
+        """<stem>.csv / _imu / _bbox 已經存在就改名成 <stem>_<時間>[_imu|_bbox].csv。
+
+        三個檔用**同一個**時間 (主檔的修改時間): 三個檔最後寫入的時刻會差幾秒, 各取各的
+        話名字就對不起來 (estimate_friction.py 是用 <主檔>_imu.csv 去找的)。
+        """
+        stem, ext = os.path.splitext(self.filepath)
+        olds = [(sfx, stem + sfx + ext) for sfx in ('', '_imu', '_bbox')
+                if os.path.exists(stem + sfx + ext)]
+        if not olds:
+            return
+        tag = self._time_tag(os.path.getmtime(olds[0][1]))
+        k = 0
+        while any(os.path.exists(f'{stem}_{tag}{"-%d" % k if k else ""}{sfx}{ext}')
+                  for sfx, _ in olds):
+            k += 1
+        tag = f'{tag}-{k}' if k else tag
+        for suffix, old in olds:
+            new = f'{stem}_{tag}{suffix}{ext}'
+            os.replace(old, new)
+            self.get_logger().warn(f'{os.path.basename(old)} 已經存在, 舊的改名成 {os.path.basename(new)}')
 
     def joint_command_callback(self, msg):
         # 指令**變了**才更新時刻: control_car_node 每個迴圈都發一次, 記「最後一次
@@ -419,10 +504,33 @@ class CollectDataNode(Node):
             + self._by_joint(getattr(self, 'latest_joint_state', None), 'velocity')
             + self._by_joint(getattr(self, 'latest_joint_state', None), 'effort'))
 
+    def bbox_callback(self, msg):
+        # 格式見 car_loc_multicam/bbox_msg.py: 每個框兩個點 (u1, v1, conf), (u2, v2, cls),
+        # frame_id = 相機名字。沒有點 = 這台這一幀沒看到車。
+        pts = msg.polygon.points
+        boxes = [(pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y, pts[i].z, pts[i + 1].z)
+                 for i in range(0, len(pts) - 1, 2)]
+        now = self._now()
+        self.bbox_count += 1
+        self.bbox_seen[msg.header.frame_id] = (now, bool(boxes))
+        if self._bbox_file is None:
+            return
+        head = [self._stamp_sec(msg.header), now, self.latest_scenario_name,
+                self.latest_phase, msg.header.frame_id, len(boxes)]
+        for b in boxes or [(NAN,) * 6]:
+            self._bbox_writer.writerow(head + list(b))
+
+    def _mc_ncam(self, now: float) -> int:
+        """最近一幀 (0.3 s 內) 有框到車的相機數。"""
+        return sum(1 for t, hit in self.bbox_seen.values() if hit and now - t < 0.3)
+
     def destroy_node(self):
         if self._imu_file is not None:
             self._imu_file.close()
             self._imu_file = None
+        if self._bbox_file is not None:
+            self._bbox_file.close()
+            self._bbox_file = None
         return super().destroy_node()
 
     def odom_callback(self, msg):
@@ -448,27 +556,31 @@ class CollectDataNode(Node):
 
     # ------------------------------------------------------------------
     def status(self):
-        """每 10 秒回報四條線的狀況 —— 跑完才發現某一條整段是 NaN 太浪費了。
+        """每 10 秒回報各條線的狀況 —— 跑完才發現某一條整段是 NaN 太浪費了。
 
         誤差是「同一列直接相減」, 沒有做時間對齊, 所以只能當**健康檢查**看
         (常數偏移 = 起點沒對齊, 一路長大 = 飄移)。正式數字要用 _stamp 內插算。
         """
         if self._imu_file is not None:
             self._imu_file.flush()
+        if self._bbox_file is not None:
+            self._bbox_file.flush()
         now = self._now()
         imu = f'IMU {self.imu_count} 則' if self.imu_count else 'IMU=off'
+        if self.bbox_count:
+            imu += f' | 框 {self.bbox_count} 則 ({self._mc_ncam(now)} 台看到車)'
+        srcs = (self.src_cam, self.src_lid, self.src_imu, self.src_whl,
+                self.src_fus, self.src_mc)
         if not hasattr(self, 'latest_odom'):
             # 真車沒有 GT 是正常的; 只印各條線有沒有在跑
             parts = [s.name + '=' + ('off' if s.count == 0 else '%.1fs' % (now - s.recv))
-                     for s in (self.src_cam, self.src_lid, self.src_imu,
-                               self.src_whl, self.src_fus)]
+                     for s in srcs]
             self.get_logger().info(f'{self.count} 列 | 無 GT | {imu} | ' + ' '.join(parts))
             return
         gx = self.latest_odom.pose.pose.position.x
         gy = self.latest_odom.pose.pose.position.y
         parts = [imu]
-        for src in (self.src_cam, self.src_lid, self.src_imu, self.src_whl,
-                    self.src_fus):
+        for src in srcs:
             if src.count == 0:
                 parts.append(f'{src.name}=off')
                 continue
@@ -490,7 +602,7 @@ class CollectDataNode(Node):
         jc = getattr(self, 'latest_joint_command', None)
         srcs = (self.src_cam, self.src_lid, self.src_imu, self.src_whl, self.src_fus)
         if gt is None and js is None and jc is None and self.latest_imu is None \
-                and not any(s.count for s in srcs):
+                and not any(s.count for s in srcs) and not self.src_mc.count:
             return
 
         cmd = self._by_joint(jc, 'velocity')
@@ -521,6 +633,7 @@ class CollectDataNode(Node):
                 row += s.row(now)
             row += imu_cols
             row += eff + [wheel_stamp]
+            row += self.src_mc.row(now) + [self._mc_ncam(now)]
             writer.writerow(row)
             self.count += 1
 
@@ -530,7 +643,7 @@ def main(args=None):
 
     `calibrate_env_node` 那個進入點會同時啟動 ControlCarNode, 車子自己就開始
     跑摩擦力測試腳本, 而且腳本跑完整個 process 就結束 —— 想「自己用 teleop
-    開車, 一路記五種定位 + GT」的話要用這一個, 它會一直跑到 Ctrl-C:
+    開車, 一路記六種定位 + GT」的話要用這一個, 它會一直跑到 Ctrl-C:
 
         ros2 run calibrate_env_pkg collect_data_node --ros-args \
             -p output_dir:=/workspaces/car_run_data -p csv_filename:=all_loc.csv

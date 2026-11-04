@@ -3,24 +3,42 @@
 ```
 高頻 60~200 Hz   /imu + /joint_states ──> 遞推 (7 維 EKF)  ─┐  連續、不會斷
                                                             ├─> /fusion_loc/odom
-低頻 10~30 Hz    /camera_loc/odom (相機, 延遲 80 ms) ──┐    │   /fusion_loc/pose
-                 /lidar_loc/odom  (LiDAR 對地圖)     ─┴────┘   TF map->base_link
-                 絕對量測: 不漂、能自己找到自己, 但會斷
+低頻 3~15 Hz     /env_cam_0..7/car_bbox (8 台相機的車框) ─┐ │   /fusion_loc/pose
+10 Hz            /lidar_loc/odom (LiDAR 對地圖)         ─┴─┘   TF map->base_link
+                 絕對量測: 不漂、能自己找到自己, 但會斷        /fusion_loc/markers
 ```
 
-前四條路線是**互不相干**的 —— 那是為了讓它們能拿同一趟資料公平比較。
-這一條是**把它們結合起來**的那一個。
+**舊版的絕對量測是單一天花板相機 (`/camera_loc/odom`), 現在換成 `car_loc_multicam` 的
+8 台斜拍相機。** 天花板相機那條還在 (`cam_` 欄位), 只是融合不吃它了 (`camera_enabled: false`)。
 
-| | 位置 RMS | yaw | 需要起點 | 會斷嗎 |
-| --- | --- | --- | --- | --- |
-| 只有相機 (60 Hz 拿最新一則) | 5.42 cm | 15~22° | 不用 | **會** |
-| 只有 LiDAR (同上) | 6.97 cm | 2.9° | 不用 | **會** |
-| 只有航位推算 (IMU+輪速) | 7.55 cm 且**持續長大** | 0.07° | **要** | 不會 |
-| **融合** | **1.35 cm** | 0.03° | **不用** | 不會 |
+| | 位置 RMS | 中位 | p95 | 最大 | yaw p95 |
+| --- | --- | --- | --- | --- | --- |
+| 只有 LiDAR + 遞推 | 3.21 cm | 1.63 | 7.80 | 9.70 | 0.32° |
+| 只有多相機 + 遞推 (方法六) | 1.66 cm | 1.23 | 3.16 | 6.26 | 0.32° |
+| **全部** | **1.53 cm** | **1.13** | **2.91** | **5.75** | 0.32° |
 
-(離線 bench, `test/test_fusion.py [A]`。「拿最新一則」是 60 Hz 的下游 —— TF、nav、
-控制迴路 —— 真正感受到的誤差, 它包含**延遲**與**空窗**, 所以比那條路自己報的
-精度差。融合把兩者都補掉。)
+| 其中一個來源出事 | 只有那個來源 | 全部 |
+| --- | --- | --- |
+| 相機全斷 30 秒, 那段的 RMS | 10.45 cm (最大 21.4) | **2.97 cm** (最大 6.7) |
+| LiDAR 斷 30 秒 | | 1.91 cm |
+| 真車 6 軸 IMU (沒有絕對 yaw), yaw p95 | 3.79° | **1.35°** |
+
+(`test/replay_all_sensors.py`, 用 2026-11-02 那一輪 `mc_friction_1102` 的原始框 + LiDAR + IMU
++ 輪速重放真正的節點, 310 秒摩擦力腳本。同一份設定的重放 1.66 cm 對上線上錄到的 `mc_`
+1.81 cm。平均誤差多相機已經很好, **LiDAR 買到的主要是中斷時的下限與真車的 yaw**。)
+
+Isaac 端到端 (2026-11-02, 我自己的複本, ROS domain 83, `kros_car_new.usd` 只讀): 冷啟動不給
+起點, `fusion_loc.launch.py` 繞房間一圈 28.7 m, **RMS 1.94 cm, 中位 1.40, p95 4.00, 最大 7.46**,
+yaw 中位 0.05°, 常數偏移 0.19 cm, 誤差不隨車速長大, 起點由相機給, 重定位 0 次。
+`friction_test.launch.py blocks:=[1]` 全程用 `/fusion_loc/odom` 控制跑完, `fus_` RMS 1.77 cm。
+
+> 在我的複本上成立, 不是在你那台 Isaac 上量的。同一台接著跑的 `lidar:=false` 是 RMS 5.28 cm,
+> 但那一輪框只有 2609 個 (全開那輪 8664 個, 偵測率掉了, 見 car_loc_multicam「已知的限制」),
+> **所以這不是公平的 A/B**, LiDAR 值多少看上面的重放。
+
+下面 [B]~[H] 講的機制 (倒帶、閘門、逃生口、時鐘) 現在一樣在跑, 但**表裡的數字是換多相機
+之前量的** (單一天花板相機、合成資料), 看趨勢就好。多相機本身的量測模型見
+[car_loc_multicam](../car_loc_multicam/README.md)。
 
 ---
 
@@ -49,13 +67,17 @@
 ## 用法
 
 ```bash
-# 一鍵: 相機 + LiDAR + 融合一起開 (launch 會把前兩條的 publish_tf 關掉)
+# 一鍵: YOLO 偵測 + LiDAR + 融合一起開 (launch 會把 LiDAR 的 publish_tf 關掉)
 ros2 launch car_loc_fusion fusion_loc.launch.py
 ros2 launch car_loc_fusion fusion_loc.launch.py evaluate:=true
 
 # A/B
-ros2 launch car_loc_fusion fusion_loc.launch.py camera:=false   # 少一個來源
-ros2 launch car_loc_fusion fusion_loc.launch.py rewind:=false   # 關掉延遲補償
+ros2 launch car_loc_fusion fusion_loc.launch.py multicam:=false  # 少多相機
+ros2 launch car_loc_fusion fusion_loc.launch.py lidar:=false     # 少 LiDAR (= 方法六)
+ros2 launch car_loc_fusion fusion_loc.launch.py rewind:=false    # 關掉延遲補償
+
+# 框由別處發 (每台 Pi 自己跑 YOLO), 這裡不開偵測節點
+ros2 launch car_loc_fusion fusion_loc.launch.py detector:=false
 
 # 真車 (6 軸 IMU)
 ros2 launch car_loc_fusion fusion_loc.launch.py use_sim_time:=false \
@@ -63,10 +85,18 @@ ros2 launch car_loc_fusion fusion_loc.launch.py use_sim_time:=false \
     sigma_acc:=0.35
 ```
 
-跑之前三件事: **LiDAR 那條要先有地圖**、**相機那條要有 YOLO 模型**、
-**開始前讓車子停著一秒** (開機靜止校正)。
+要同時記 `fus_` 與 `mc_`: 用 `bringup_pkg` 的 `collect_all.launch.py` / `friction_test.launch.py`,
+它們已經把方法六一起開了 (`multicam_only`, 預設開), 兩條共用**同一個**偵測節點 —— 跟 `lid_`
+那一個 lidar_localizer 同時給 CSV 與融合用是同一個道理。只用這裡的 launch 的話才另開
+`multicam_loc.launch.py detector:=false publish_tf:=false`。**兩個偵測節點同時跑會出事**
+(2026-11-03 兩輪 Isaac 的相機與 LiDAR 一起斷), 偵測節點發現時會一直印紅字。
 
-> **不需要 `initial_pose`。** 第一則絕對量測就是起點。這是相對於 `car_loc_imu` /
+跑之前三件事: **stage 要有 8 台環境相機** (`kros_car_new.usd`; `kros_car_05_sim` /
+`10_real` / `sim_calibrated` 沒有, 融合會只剩 LiDAR + 遞推)、**LiDAR 那條要先有地圖**、
+**開始前讓車子停著一秒** (開機靜止校正)。新容器第一次啟動 YOLO 要暖機 ~30 秒。
+
+> **不需要 `initial_pose`。** 第一組車框就是起點 (相機遲遲不來才用 LiDAR, 見 [I])。
+> 這是相對於 `car_loc_imu` /
 > `car_loc_wheel` 的一個實質差別 —— 那兩條沒對到出生點的話整段差一個常數平移,
 > 看起來像超大漂移。真的要在沒有絕對量測的情況下跑才用
 > `wait_for_absolute:=false` + `initial_pose`。
@@ -77,7 +107,9 @@ ros2 launch car_loc_fusion fusion_loc.launch.py use_sim_time:=false \
 cd src/car_loc_fusion
 python3 test/test_fusion.py     # 融合策略的 A/B (合成資料), 下面每個數字都是它印的
 python3 test/test_node.py       # 節點: 參數接對了沒、三條訊息流交錯、車頭軸
-python3 test/replay_csv.py ../../car_run_data/sim_data.csv   # **真的 Isaac 資料**
+python3 test/test_all_sensors.py    # 多相機 + LiDAR 怎麼相處 (起點、互相救援), 約 1 分鐘
+python3 test/replay_all_sensors.py ../../car_run_data/mc_friction_1102.csv  # **真的 Isaac 資料**
+python3 test/replay_csv.py ../../car_run_data/sim_data.csv   # 舊的: 天花板相機 + LiDAR 的 pose
 ```
 
 `replay_csv.py` 吃 `collect_data_node` 錄的 CSV, 把相機與 LiDAR 那一輪真的發出來
@@ -104,15 +136,88 @@ python3 test/replay_csv.py ../../car_run_data/sim_data.csv   # **真的 Isaac �
 
 「四條路線互不相干」的規則對這一條不適用: 它就是那個結合的節點。
 
-**但它訂閱的是相機與 LiDAR 的 topic, 不是它們的內部狀態** (鬆耦合)。
-緊耦合 (把雷射點雲與 YOLO 像素直接放進同一個濾波器) 理論上更準, 但:
+**多相機的節點本體在 `car_loc_multicam`** (`MultiCamLocalizer`, 這裡 `FusionLocalizer` 的
+子類別), `fusion_loc.launch.py` 用 `fusion_localizer` 的名字開它。依賴方向是
+`car_loc_multicam -> car_loc_fusion`, 所以這裡的 package.xml 不能反過來宣告 (colcon 會判
+循環依賴), launch 是在執行時才找那個 package。方法六因此原封不動地留著, 兩條只差 LiDAR。
 
-1. **沒辦法單獨評估任何一種感測器了** —— 四條獨立路線是這個 repo 的資產。
+**LiDAR 是鬆耦合: 訂閱它的 topic, 不是內部狀態。** 緊耦合 (把雷射點雲直接放進同一個濾波器)
+理論上更準, 但:
+
+1. **沒辦法單獨評估那個感測器了** —— 獨立路線是這個 repo 的資產。
 2. **失效模式會直接傳染。** LiDAR 鎖到 180 度時, 鬆耦合看到的是「一則位置差
    10 公尺的 pose」, 一道閘門就擋掉了; 緊耦合看到的是幾百個點的殘差同時變小
    (它真的收斂到那個對稱解), 沒有東西擋得住。
 
-代價是每一條路的輸出都已經被平滑過一次, 量測不再獨立 —— 見下面 [G]。
+代價是它的輸出已經被平滑過一次, 量測不再獨立 —— 見下面 [G]。**多相機是反過來的**: 框直接
+當量測進 EKF (像素、沿視線的橢圓), 因為 `/multicam_loc/odom` 已經吃過 IMU 與輪速, 拿它當
+絕對量測等於同一份資訊算兩次。
+
+---
+
+## [I] 多相機 + LiDAR 放在一起才會出現的事
+
+平常兩個來源相安無事 (框閘門擋 0.1%, LiDAR 閘門擋 0~1 則), 座標系也對得上: 2026-11-02 那一輪
+對 GT 的常數偏移 LiDAR (+0.01, -0.13) cm、多相機 (+0.47, +0.22) cm。**問題全在其中一個錯了的
+時候。** 下面每一項都是拿真資料或 `test_all_sensors.py` 打出來的, 修之前的症狀都是
+「估計錯得離譜, 而 sigma 還很小」。
+
+**起點優先用多相機** (`init_lidar_wait: 5.0`)。LiDAR 在長方形房間可能鎖到對稱解, 而它只要
+比 YOLO 先到一步就會搶到起點 (YOLO 暖機要 ~30 秒, LiDAR 幾乎馬上有)。所以開機後 5 秒內
+只用多相機, 過了還沒有框才讓 LiDAR 給 —— 那是暖機或 stage 沒有環境相機的情況, 不能卡死。
+
+**預測錯了就不要用預測挑框** (`_assoc_lost`)。挑框是拿濾波器的預測去對, 預測差 3 m 時 8 台
+全挑不到 -> 框進不了 EKF -> 卡方閘門沒有東西可擋 -> 計時不開始 -> **逃生口永遠不會觸發**。
+連續 `abs_reject_time` 秒沒有框被採用, 就改挑信心最高的, 交給閘門判。
+
+**恢復模式下直接重跑方法 B** (`reloc_min_cameras: 2`)。強制接受是「走過去」: R 放大 9 倍, 靠
+P 長回來才走得動, 而**車子停著時 P 不會長** (開機 = 停著, 最常見的情況), 3 m 走 10 秒還差
+2.4 m。兩台以上相機同時看到車時, 用跟起點一樣的多相機反推直接換位置。一台不夠, 那可能是假框。
+
+**靜止錨點要跟著絕對量測走** (`FusionEkf._shift_anchor`)。ZUPT 的位置錨點是 60 Hz、sigma 2 cm
+的偽量測, 比任何絕對量測都強。錨點不動的話, 絕對量測修多少、下一步就被拉回多少, 同時 P 被
+壓小, 接著閘門開始擋正確的量測。這就是 2026-11-02 看到的怠速凍結 (Isaac 的車零指令時會蠕動
+-0.75 mm/s, 輪子不動所以被判靜止):
+
+| 蠕動 600 秒 (-0.75 mm/s), 離線重現 | 誤差 | 閘門擋 | 強制接受 |
+| --- | --- | --- | --- |
+| 修之前 (線上那一輪是 46 cm, 強制 6040 次) | **41 cm** | 21258 | 35456 |
+| 修之後 | **0.25 cm** | 0 | 0 |
+
+LiDAR 一開始就看得到車在動, 但修之前有沒有 LiDAR 結果都一樣 —— **多一個對的感測器救不了它,
+因為錯的不是量測, 是那個擋在量測前面的偽量測。**
+
+| LiDAR 給錯 3 m 的起點 (相機晚 25 秒才到, 之後 LiDAR 掉線) | 相機到了之後回到 20 cm 內 |
+| --- | --- |
+| 修之前 | 128 秒 (車子開起來才碰巧救回來) |
+| 修之後 | **7.4 秒** |
+
+### 2026-11-03: 相機與 LiDAR 一起斷了 51 秒
+
+253~304 s 相機的框與 LiDAR 的輸出同時停掉, `/imu`、`/joint_states`、GT 一秒都沒斷 (兩個
+都是 Isaac render 出來的感測器, 推測是 render 停了, 沒有驗證)。融合只剩遞推, 在牆邊原地轉
+180 度時車身往旁邊滑了 25 cm, 誤差到 45 cm —— **而 sigma 只有 1.5~7.7 cm**, 控制端的
+`pose_sigma_max` (50 cm) 完全沒反應, 車子照著錯的位置歸位、開跑。修了四件事:
+
+* **停車時的位置錨點不再把 P 壓小** (`WheelIns.anchor_position`)。錨點只知道「沒有動」, 不知道
+  「在哪」, 以前每一步都當成一則獨立的 2 cm 量測, 車一停 P 就縮回 1.5 cm。現在更新完把
+  位置那一塊補回錨下去時的大小; 真正的絕對量測照樣能把它壓小 (`_shift_anchor` 會一起改)。
+  附帶修掉: 融合以前根本沒有用到 `enable_zaru` / `enable_anchor`。
+* **原地轉的側向雜訊** (`sigma_cross_omega: 0.05`)。
+* **逃生口的「連續」要真的連續** (`FusionEkf._gate_reject`, `reject_gap` 1 s)。以前斷線前被擋
+  一則就開始計時, 斷完的第一則 LiDAR (錯 29 cm) 直接被強制接受 —— 那一則是鏡射解的話也一樣。
+* **`abs_age`**: 每一則 IMU 都發「上一則被採用的絕對量測是幾秒前」, `control_car_node` 超過
+  `abs_age_max` (1 s) 就停車等。**這才是真正的保險** —— 前三項之後 sigma 還是偏樂觀約 3 倍。
+  正常的時候 (兩輪, 扣掉斷線那段) 最大 0.10~0.17 s。
+
+| 11-03 那一輪重放 | 斷線段 NEES 中位 / 最大 | 斷線之後 8 秒內最大誤差 | 其他時間 RMS |
+| --- | --- | --- | --- |
+| 修之前 | 13 / **16171** | **19.9 cm** | 1.72 cm |
+| 錨點 + 側向雜訊 + LiDAR 斷線後放大 sigma (car_loc_lidar) | 9 / 59 | 3.6 cm | 1.65 cm |
+
+(誤差本身沒有變小: 斷線時本來就只能靠遞推。改的是**它知道自己不準**, 以及下游看得到。)
+另外 Isaac 按 Stop/Play 但節點沒重開時, 以前會靜默凍結 (`t < ins.t` 的 IMU 全被丟掉),
+現在偵測到 `/imu` 時間倒退就自動 `~/reset`, 連時鐘偏移一起重量。
 
 ---
 
@@ -274,6 +379,7 @@ LiDAR 跟它差 10 公尺, NIS 破表。**只有 LiDAR 的時候就完全不一�
 
 機制: 連續 `abs_reject_time` 秒沒有任何絕對量測通過閘門 -> 進入**恢復模式**,
 強制接受 (R 放大 9 倍 = 走過去而不是跳過去), 直到有一則自己通過為止。
+「連續」是指被擋的量測一則接一則 (間隔 <= 1 s); 中間沒有量測 (斷線) 就從頭算 ([I])。
 
 **一次強制接受不夠** —— 單次修正被 `abs_max_correction` (1 m) 綁住, 而它要處理
 的情況動輒好幾公尺。所以是「模式」不是「一次」。
@@ -332,8 +438,10 @@ R 放大一項就夠了 (功能留著: 真車上如果來源的平滑比模擬�
 | --- | --- |
 | `/fusion_loc/odom` | 位姿 + 速度 + 共變異數 (主要輸出) |
 | `/fusion_loc/pose` | `PoseWithCovarianceStamped` |
-| TF | `map -> base_link` (`publish_tf:=false` 可關) |
-| `~/reset` | `std_srvs/Trigger`: 重新校正零偏, 並用下一則絕對量測當起點 |
+| `/fusion_loc/markers` | 每台相機一條視線 (綠 = 採用, 紅 = 閘門擋掉) + 那台自己反推的位置 |
+| `/fusion_loc/abs_age` | `std_msgs/Float32`: 上一則被採用的絕對量測是幾秒前 ([I]) |
+| TF | `map -> base_link` (`tf_source` 決定誰發) |
+| `~/reset` | `std_srvs/Trigger`: 重新靜止校正、重新量時鐘偏移, 並用下一組車框當起點。`/imu` 時間倒退 (Isaac Stop/Play) 時會自動做 |
 
 `evaluate` 報的是**分布**與**尾巴** (RMS / p95 / 最大), 不是漂移率 —— 融合有絕對
 參考, 誤差不隨時間長大。另外三件它會單獨報:
@@ -346,14 +454,18 @@ R 放大一項就夠了 (功能留著: 真車上如果來源的平滑比模擬�
 
 | 症狀 | 通常是 |
 | --- | --- |
-| status 說「還沒有起點, 在等第一則絕對量測」 | 相機/LiDAR 那兩個節點沒開, 或 topic 名字不對。真的不想開就 `wait_for_absolute:=false` + `initial_pose` |
+| status 說「還沒有起點, 在等第一則絕對量測」 | 偵測 / LiDAR 節點沒開, 或 topic 名字不對。開機前 5 秒 LiDAR 不會給起點是正常的 ([I])。真的不想開就 `wait_for_absolute:=false` + `initial_pose` |
+| 融合有跑但 `框 0/0`, 只剩 LiDAR | stage 沒有環境相機 (只有 `kros_car_new.usd` 有), 或 YOLO 還在暖機。確定沒有的話給 `multicam:=false` 省下偵測節點的 GPU |
+| status 的「重定位」在增加 | 所有來源連續 3 秒都對不上, 用多相機換過位置了。偶爾一次是車被搬走; 一直增加先看 `lidar_sigma_max` 與兩邊的座標系 |
 | 誤差跟車速成正比, 靜止時很準 | 延遲補償沒生效。看 status 的「倒帶」次數是不是 0, 以及「太舊」是不是一直在長 (`rewind_horizon` 太小) |
 | status 的「太舊」一直增加 | 絕對量測的延遲超過 `rewind_horizon`。調大它 (代價只有記憶體與 CPU) |
 | 閘門擋掉的數量很大, 但位置看起來還行 | 遞推那一路跟絕對量測一直在吵架。最常見是 `forward_deg` 給錯, 或 `gravity_mode=complementary` 配了小的 `sigma_acc` |
-| 一直在「恢復模式」 | 某個來源持續給錯的位置。先看 `lidar_sigma_max` 有沒有開 ([D]), 再看兩條路線的地圖原點是不是差一個平移 |
+| 一直在「恢復模式」 | 某個來源持續給錯的位置。先看 `lidar_sigma_max` 有沒有開 ([D]), 再看 LiDAR 地圖原點跟相機是不是差一個平移 (重新建圖之後要確認) |
 | 位置比只用相機還差 | `rewind:=false`, 或 `abs_max_correction` 設太小 (絕對量測拉不動遞推) |
-| 誤差是一個不會變的常數 | 座標系沒對: LiDAR 地圖原點是按 Play 那一刻的位置, 相機校正的原點是單應性的原點。`evaluate` 會把常數偏移單獨報出來 |
+| 誤差是一個不會變的常數 | 座標系沒對: LiDAR 地圖原點跟 `env_cameras.yaml` 的世界座標差一個平移。`evaluate` 會把常數偏移單獨報出來 |
 | 輸出中斷 | `/imu` 沒來。絕對量測斷了不該讓輸出斷 —— 那是遞推的工作 |
+| `abs_age` 一直長 / 控制腳本說「絕對量測斷了 X s」 | 相機與 LiDAR 都沒進來。兩個一起斷通常是 Isaac 的 render 停了 (2026-11-03 那一輪 51 秒); 先看偵測節點的偵測率與 `/scan` 的頻率 |
+| log 說「/imu 時戳倒退」 | Isaac 按了 Stop 再 Play。已經自動重設, 要重新靜止校正 1 秒 |
 | **估計凍結在起點, sigma 小得離譜 (< 1 mm)** | 某個來源的時鐘跟 `/imu` 不同基準 ([H])。看啟動時的紅色警告與 status 的 `時鐘+xxx s`。舊版沒有這道偵測, 症狀就是這個 |
 | status 的「未來」不是 0 | 時戳落在濾波器前面。偶爾幾筆是正常的 (量測比最後一則 IMU 新幾毫秒); 一直在長就是時鐘沒對好 |
 | 誤差跟車速成正比, 但「倒帶」次數正常 | 來源的時戳本身就晚於真正的量測時刻。拿 CSV 掃 `delay` 找最小值 (2026-09-10 那一輪相機是 +50 ms), 填回該來源的校正檔, 或先用 `<來源>_extra_delay` |

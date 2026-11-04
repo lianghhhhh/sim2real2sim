@@ -7,12 +7,17 @@ fusion_localizer:
   ros__parameters:
     imu_topic: /imu
     joint_states_topic: /joint_states
-    # 絕對量測 = 另外兩條定位線的輸出。它們要先開起來
-    # (fusion_loc.launch.py 預設會一起開)。
+    # 絕對量測 = 8 台相機的車框 + LiDAR 那條定位線的輸出 (fusion_loc.launch.py 預設
+    # 會一起開)。框的量測雜訊 / 綁組 / 挑框的參數在 car_loc_multicam/config/multicam_loc.yaml,
+    # launch 會疊上來 —— 跟方法六同一組。
     camera_topic: /camera_loc/odom
     lidar_topic: /lidar_loc/odom
     odom_topic: /fusion_loc/odom
     pose_topic: /fusion_loc/pose
+    # 「上一則被採用的絕對量測是幾秒前」(std_msgs/Float32, 每一則 IMU 發一次)。
+    # control_car_node 用它判斷定位能不能信 (abs_age_max) —— 比 sigma 可靠, 見 README [I]。
+    abs_age_topic: /fusion_loc/abs_age
+    marker_topic: /fusion_loc/markers
     map_frame: map
     base_frame: base_link
     publish_tf: true
@@ -49,7 +54,7 @@ fusion_localizer:
     tilt_alpha: 0.02
 
     # --- 起點 -----------------------------------------------------------------
-    # **融合不需要 initial_pose。** 第一則絕對量測 (相機或 LiDAR) 就是起點 ——
+    # **融合不需要 initial_pose。** 第一組車框 (或 LiDAR, 見 init_lidar_wait) 就是起點 ——
     # 這是相對於 car_loc_imu / car_loc_wheel 的一個實質差別: 那兩條沒給起點就
     # 整段差一個常數平移, 看起來像超大漂移。
     # 真的要在沒有絕對量測的情況下跑 (例如只想看遞推), 才設 false + initial_pose。
@@ -74,6 +79,13 @@ fusion_localizer:
     sigma_acc: 0.05                  # complementary 模式要 0.35
     sigma_acc_omega: 0.15            # 過程雜訊一定要跟著角速度走 (實測差 230 倍)
     sigma_cross: 0.02
+    # 側向過程雜訊隨轉速加大的部分 (m/s 每 rad/s)。原地轉的時候車身會整個往旁邊滑,
+    # IMU 與輪速都看不到 (2026-11-03 絕對量測斷掉時, 牆邊原地轉 180 度滑了 25 cm)。
+    # 重放 (test/replay_all_sensors.py) 11-03 / 11-02 兩輪: 0 -> 0.05
+    #   RMS 1.72 -> 1.65 / 1.63 -> 1.57 cm, 斷線那段 NEES 中位 13 -> 9;
+    #   0.1 開始變差。**這一項 car_loc_wheel 沒有** (wheel_loc.yaml 沒設 = 0) ——
+    #   純航位推算的 P 大一點也修不了位置, 刻意不動方法四。
+    sigma_cross_omega: 0.05
     sigma_bg: 1.0e-4
     sigma_ba: 1.0e-3
     sigma_k: 0.0                     # 0 = 凍結輪速尺度
@@ -102,7 +114,8 @@ fusion_localizer:
     #   3.0 m/s  倒帶 4.17 cm  不倒帶 27.11 cm   (         = 23.8 cm)
     # 差距跟 v x delay 對得上 —— 這不是調參能解決的, 是時間軸的問題。
     rewind: true
-    # 視窗要蓋得住最慢那一條的延遲 + 抖動。相機 79.5 ms, 0.4 s 有五倍餘裕。
+    # 視窗要蓋得住最慢那一條的延遲 + 抖動。8 台相機共用一個偵測節點, 2026-11-02 那一輪
+    # 0.4 s 夠用 (太舊 0~2 則, 18000 個框裡)。
     # status 那行的「太舊」不是 0 就是不夠, 調大 (代價只有記憶體與 CPU:
     # 每則絕對量測要重跑 horizon x IMU 頻率 步)。
     rewind_horizon: 0.4
@@ -123,8 +136,14 @@ fusion_localizer:
     abs_reject_time: 3.0
     chi2_scale: 1.0
 
+    # 起點優先用多相機 (LiDAR 在長方形房間可能鎖到對稱解, 相機 + IMU yaw 不會)。
+    # 開機這麼久 (s) 還沒有車框才讓 LiDAR 給 —— YOLO 暖機、或 stage 根本沒有環境相機。
+    init_lidar_wait: 5.0
+
     # --- 每個來源的收件政策 (三道防線都**不看濾波器狀態**) --------------------
-    camera_enabled: true
+    # **單一天花板相機不再是這條路線的輸入**, 換成 8 台斜拍相機的框。下面這段參數只在
+    # 手動打開 camera_enabled 時才有作用 (要跟多相機比, 或 scripts/calibrate_camera_ground.py)。
+    camera_enabled: false
     # R 的下限。相機實測單軸 1.53 cm / 二維 RMS 2.09 cm, 給 3 cm 是保守的 ——
     # 它回報的共變異數是**它自己濾波器**的, 不是相對於我們狀態的獨立量測雜訊。
     camera_sigma_floor: 0.03
@@ -168,6 +187,9 @@ fusion_localizer:
     # 那時倒帶重放會自己處理延遲, 填了就是扣兩次。
     camera_extra_delay: 0.0
 
+    # 地圖原點跟相機是同一個世界座標: 2026-11-02 那一輪對 GT 的常數偏移
+    # LiDAR (+0.01, -0.13) cm / 多相機 (+0.47, +0.22) cm。重新建圖之後要再確認一次
+    # (evaluate 的「常數偏移」), 差一個平移的話兩個來源會一直吵架。
     lidar_enabled: true
     lidar_sigma_floor: 0.04          # 5 cm 地圖 -> 誤差 ~3.5 cm (0.7 x 解析度)
     # **追丟偵測用來源自己回報的 sigma, 不要自己猜。**

@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>car_loc_multicam</name>
+  <version>1.0.0</version>
+  <description>方法六: 8 台斜拍的環境相機 + IMU + 輪速。YOLO 車框 + 車的 3D 外形 (方法 B), 每台相機的框各自當成 EKF 的視線量測 (方法 C)。遞推與倒帶重放直接用 car_loc_fusion。</description>
+  <maintainer email="selenahuang0218@gmail.com">liangh</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <depend>cv_bridge</depend>
+  <depend>python3-numpy</depend>
+  <depend>python3-yaml</depend>
+  <!-- 遞推 / 倒帶重放 / 收件政策 (import, 沒有複製) -->
+  <depend>car_loc_fusion</depend>
+  <depend>car_loc_wheel</depend>
+  <!-- YOLO 包裝與 best.onnx -->
+  <depend>car_loc_camera</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

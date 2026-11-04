@@ -15,7 +15,8 @@ CSV 會長在 output_dir/csv_filename, 欄位說明看 collect_data_node 的 doc
 | `car_loc_lidar` | `lid_*` |
 | `car_loc_imu` | `imu_*` |
 | `car_loc_wheel` | `whl_*` |
-| `car_loc_fusion` | `fus_*` (它吃 cam_ 與 lid_ 的輸出當絕對量測) |
+| `car_loc_fusion` | `fus_*` (絕對量測吃 8 台相機的車框與 lid_ 的輸出) |
+| `car_loc_multicam` | `mc_*` (方法六: 同一份車框, 不吃 LiDAR) |
 
 (舊名是 `three_way_collect.launch.py` —— 那時候只有三條。)
 
@@ -42,18 +43,29 @@ CSV 會長在 output_dir/csv_filename, 欄位說明看 collect_data_node 的 doc
 4. **LiDAR 那條要先有地圖。** 還沒建的話先跑
    `ros2 launch car_loc_lidar mapping.launch.py`。地圖不存在時 lidar_localizer
    會自己退出, 其他照跑, CSV 的 lid_* 整欄 NaN —— 而 `fus_` 會少一個來源
-   (它照樣跑, 只剩相機 + 遞推)。
+   (它照樣跑, 只剩多相機 + 遞推)。
 
-5. **fusion 吃的是 camera 與 lidar 的 topic。** 把 `camera:=false` 關掉的話,
-   `fus_` 也跟著少一個來源。要比「融合 vs 單一來源」就五條全開。
+5. **fusion 吃的是 8 台相機的車框與 lidar 的 topic。** `lidar:=false` 或 `multicam:=false`
+   的話 `fus_` 跟著少一個來源; `camera:=false` 不影響它 —— 單一天花板相機現在只是
+   獨立的 `cam_` 那一條。stage 沒有環境相機 (只有 kros_car_new.usd 有) 的話 `fus_` 只剩
+   LiDAR + 遞推, 這時給 `multicam:=false` 可以省下偵測節點的 GPU。
 
-只比其中幾條就把別的關掉, 例如不想跑 YOLO (吃 GPU):
+6. **8 台相機只開一個偵測節點, `fus_` 與 `mc_` 共用。** 跟 LiDAR 一樣: `lid_` 那一個
+   lidar_localizer 同時給 CSV 記、給 fusion 吃。`mc_` (方法六) 也在這裡開
+   (`multicam_only`, 預設開), **不要再另外開 `multicam_loc.launch.py`** —— 它預設會再開
+   一個偵測節點。2026-11-03 兩輪就是這樣: 兩個 YOLO 各訂閱 8 台 RELIABLE 影像, 82~89% 的
+   影像被偵測兩次, 而且只有那兩輪 Isaac 的相機與 LiDAR 一起斷 (51 s / 130 s)。
+
+只比其中幾條就把別的關掉, 例如不想跑天花板相機那一條:
 
     ros2 launch bringup_pkg collect_all.launch.py camera:=false
+
+`mc_` 不想記 (省一點 CPU) 就 `multicam_only:=false`。
 """
 import os
 from typing import List
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -74,21 +86,33 @@ def generate_launch_description():
         get_package_share_directory('car_loc_wheel'), 'config', 'wheel_loc.yaml')
     fus_params = os.path.join(
         get_package_share_directory('car_loc_fusion'), 'config', 'fusion_loc.yaml')
+    mc_params = os.path.join(
+        get_package_share_directory('car_loc_multicam'), 'config', 'multicam_loc.yaml')
+    with open(mc_params, encoding='utf-8') as f:
+        multicam_base = yaml.safe_load(f)['multicam_fusion']['ros__parameters']
+    with open(fus_params, encoding='utf-8') as f:
+        fusion_base = yaml.safe_load(f)['fusion_localizer']['ros__parameters']
 
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
-        DeclareLaunchArgument('camera', default_value='true'),
+        DeclareLaunchArgument('camera', default_value='true',
+                              description='單一天花板相機 (cam_ 那一條), fusion 不吃它'),
+        DeclareLaunchArgument('multicam', default_value='true',
+                              description='YOLO 偵測節點 + fusion 吃 8 台相機的車框'),
         DeclareLaunchArgument('lidar', default_value='true'),
         DeclareLaunchArgument('imu', default_value='true'),
         DeclareLaunchArgument('wheel', default_value='true'),
         DeclareLaunchArgument('fusion', default_value='true',
-                              description='方法五 —— 吃 camera 與 lidar 的輸出, '
+                              description='方法五 —— 吃多相機的車框與 lidar 的輸出, '
                                           '那兩條關掉的話它就少一個來源'),
+        DeclareLaunchArgument('multicam_only', default_value='true',
+                              description='方法六 (mc_) —— 吃同一個偵測節點的框, 不吃 LiDAR。'
+                                          '不要另外開 multicam_loc.launch.py (會多一個偵測節點)'),
         DeclareLaunchArgument('teleop', default_value='true',
                               description='cmd_vel -> joint_command 的速度控制層'),
         DeclareLaunchArgument('tf_source', default_value='fusion',
                               description='誰來發 map->base_link: '
-                                          'fusion | lidar | camera | imu | wheel | none'),
+                                          'fusion | multicam | lidar | camera | imu | wheel | none'),
         DeclareLaunchArgument('map_path', default_value='',
                               description='空 = car_loc_lidar/maps/room.yaml'),
         DeclareLaunchArgument('lidar_frame', default_value='laser_frame'),
@@ -165,19 +189,58 @@ def generate_launch_description():
             'initial_pose': initial_pose,
         }])
 
-    # 方法五。它訂閱 /camera_loc/odom 與 /lidar_loc/odom, 所以要放在同一份 launch
-    # 裡才拿得到 —— 但它**不需要** initial_pose (第一則絕對量測就是起點)。
+    # 8 台相機的偵測, **只有這一個**: fusion (fus_) 與方法六 (mc_) 共用同一份框。
+    # ROI 跟著融合的輸出走; 沒開 fusion 時跟方法六的。
+    fusion_on = ["'", LaunchConfiguration('fusion'), "' == 'true'"]
+    detector = Node(
+        package='car_loc_multicam', executable='multicam_detector',
+        name='multicam_detector', output='screen',
+        condition=IfCondition(PythonExpression(
+            ["'", LaunchConfiguration('multicam'), "' == 'true' and ('",
+             LaunchConfiguration('fusion'), "' == 'true' or '",
+             LaunchConfiguration('multicam_only'), "' == 'true')"])),
+        parameters=[mc_params, {
+            'use_sim_time': use_sim_time,
+            'odom_topic': PythonExpression(
+                ["'/fusion_loc/odom' if "] + fusion_on + [" else '/multicam_loc/odom'"]),
+        }])
+
+    # **參數一律先在這裡合併成一個 dict 再交給節點**, 不要寫成 [dict, yaml 檔, 覆寫 dict]。
+    # ROS 2 套參數時是照「節點名第一次出現的順序」: 第一個是 dict (/**) 的話, 後面 yaml 檔
+    # 裡指名 fusion_localizer: 的那一段會蓋掉**所有** /** 的覆寫, 包括排在最後的那個 ——
+    # 2026-11-03 實測 tf_source:=none 時融合照發 TF, rewind:=false / gravity_mode 之類的
+    # launch 參數也都沒生效。
+    # 方法五。它訂閱 /env_cam_i/car_bbox 與 /lidar_loc/odom, 所以要放在同一份 launch
+    # 裡才拿得到 —— 但它**不需要** initial_pose (第一組車框就是起點)。
+    # 節點本體在 car_loc_multicam, 參數的疊法見 fusion_loc.launch.py。
     fusion = Node(
-        package='car_loc_fusion', executable='fusion_localizer',
+        package='car_loc_multicam', executable='multicam_fusion',
         name='fusion_localizer', output='screen',
         condition=IfCondition(LaunchConfiguration('fusion')),
-        parameters=[fus_params, {
+        parameters=[{
+            **multicam_base, **fusion_base,
             'use_sim_time': use_sim_time,
             'publish_tf': owns_tf('fusion'),
-            'camera_enabled': ParameterValue(
-                LaunchConfiguration('camera'), value_type=bool),
+            'multicam_enabled': ParameterValue(
+                LaunchConfiguration('multicam'), value_type=bool),
             'lidar_enabled': ParameterValue(
                 LaunchConfiguration('lidar'), value_type=bool),
+        }])
+
+    # 方法六 (mc_): 同一個節點類別, 只差不吃 LiDAR —— 拿 mc_ 跟 fus_ 比就是「LiDAR 值多少」。
+    # 參數疊法跟 multicam_loc.launch.py 一樣 (fusion_loc.yaml -> multicam_loc.yaml -> 這裡)。
+    multicam_only = Node(
+        package='car_loc_multicam', executable='multicam_fusion',
+        name='multicam_fusion', output='screen',
+        condition=IfCondition(PythonExpression(
+            ["'", LaunchConfiguration('multicam'), "' == 'true' and '",
+             LaunchConfiguration('multicam_only'), "' == 'true'"])),
+        parameters=[{
+            **fusion_base, **multicam_base,
+            'use_sim_time': use_sim_time,
+            'publish_tf': owns_tf('multicam'),
+            'lidar_enabled': False,
+            'publish_markers': False,
         }])
 
     # calibrate_env_node 會連 ControlCarNode 一起開 (車子自己跑摩擦力腳本, 跑完
@@ -199,4 +262,5 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}])
 
     return LaunchDescription(
-        args + [camera, static_lidar, lidar, imu, wheel, fusion, collector, teleop])
+        args + [camera, static_lidar, lidar, imu, wheel, detector, fusion, multicam_only,
+                collector, teleop])

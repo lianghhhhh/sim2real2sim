@@ -82,10 +82,14 @@ Block 3/4 只有在抓地力先到上限 (輪子打滑 / 鎖死) 時才帶摩擦
 
 安全上的差別: GT 不會斷, 感測器會。所以 sensor 模式下
   * 定位過期 (pose_timeout) 或 sigma 太大 (pose_sigma_max) -> 量測段直接中止、煞停。
+  * 絕對量測 (相機 / LiDAR) 斷太久 (abs_age_max) -> 同上。**這一條比 sigma 可靠**:
+    2026-11-03 相機與 LiDAR 一起斷了 51 秒, 融合只剩遞推, 誤差 45 cm 時 sigma 才 7.7 cm,
+    pose_sigma_max 完全沒有反應, 車子照著錯的位置歸位、開跑。
   * 牆邊餘裕再加 sigma_margin_k x 定位 sigma。
   * 歸位前先等定位回到可信 (repos_sigma_max)。
 """
 import math
+import time
 from collections import deque
 
 import rclpy
@@ -94,7 +98,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, JointState
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 
 JOINT_NAMES = ['front_left_joint', 'front_right_joint',
                'rear_left_joint', 'rear_right_joint']
@@ -413,6 +417,11 @@ class ControlCarNode(Node):
         # IMU+輪速遞推, sigma 會慢慢長大; 自旋幾秒是撐得住的, 所以門檻給寬。
         p('pose_sigma_max', 0.5)
         p('repos_sigma_max', 0.10)            # 歸位前要等 sigma 降到這裡
+        # 融合的「上一則絕對量測是幾秒前」(car_loc_fusion 發的 std_msgs/Float32)。
+        # 空 = 從位姿 topic 推: /fusion_loc/odom -> /fusion_loc/abs_age。
+        # 收不到 (舊版融合 / 別的定位來源) 就不檢查, 開始時會警告一次。
+        p('abs_age_topic', '')
+        p('abs_age_max', 1.0)                 # s, 超過就當定位不可信 (見檔頭)
         p('sigma_margin_k', 3.0)              # 牆邊餘裕 += k * sigma
         # ---- 車體 / 馬達 ----
         p('joint_command_topic', '/joint_command')
@@ -496,8 +505,15 @@ class ControlCarNode(Node):
         # phase 是給 collect_data_node 標 CSV 用的: 分析時只取 'measure'。
         self.phase_pub = self.create_publisher(String, '/test_phase', 10)
         self.create_subscription(Odometry, odom_topic, self.on_odom, ODOM_QOS)
+        self.abs_age_max = float(g('abs_age_max').value)
+        self.abs_age = None              # (值, 收到的時刻 node clock)
+        self._abs_age_warned = False
         if self.sensor:
             self.create_subscription(Imu, g('imu_topic').value, self.on_imu, ODOM_QOS)
+            age_topic = g('abs_age_topic').value or (
+                odom_topic[:-len('odom')] + 'abs_age' if odom_topic.endswith('/odom') else '')
+            if age_topic:
+                self.create_subscription(Float32, age_topic, self.on_abs_age, 10)
             gt_topic = g('gt_check_topic').value
             if gt_topic and gt_topic != odom_topic:
                 self.create_subscription(Odometry, gt_topic, self.on_gt, ODOM_QOS)
@@ -569,6 +585,10 @@ class ControlCarNode(Node):
         # (2026-10-13 實測: Play 了 1154 s 之後啟動, 0.04 秒就放棄)。
         # 所以起點等時鐘真的有值之後再定, 見 control_callback。
         self._clock_anchored = False
+        # use_sim_time 沒開但 Isaac 在發 /clock -> 整份腳本會用牆上時鐘跑 (Isaac 比實際時間慢
+        # 的話每一段都變短, 2026-11-02 那一輪 B4 歸位全部逾時、起步方向錯)。開頭幾秒檢查一次。
+        self._sim_check_until = time.monotonic() + 3.0
+        self._sim_time = bool(g('use_sim_time').value)
         self._repos_state = 'turn_to_bearing'
         self._i_w = 0.0
 
@@ -671,6 +691,21 @@ class ControlCarNode(Node):
                 my = sum(w[3] for w in self._imu_win) / n
                 self.acc_ref = (self.acc_ref[0] + 0.02 * (mx - self.acc_ref[0]),
                                 self.acc_ref[1] + 0.02 * (my - self.acc_ref[1]))
+
+    def on_abs_age(self, msg):
+        self.abs_age = (float(msg.data), self._now())
+
+    def _abs_age_now(self):
+        """絕對量測斷了多久 (s); 不知道 (沒收到這個 topic) 回 None。"""
+        if self.abs_age is None:
+            return None
+        v, t = self.abs_age
+        return v + max(self._now() - t, 0.0)
+
+    @property
+    def abs_ok(self):
+        a = self._abs_age_now()
+        return a is None or a <= self.abs_age_max
 
     def on_gt(self, msg):
         self.gt = (msg.pose.pose.position.x, msg.pose.pose.position.y,
@@ -777,7 +812,7 @@ class ControlCarNode(Node):
         if not self.pose_fresh:
             return False
         if self.sensor:
-            return self.imu_ok and self.pose_sigma <= self.pose_sigma_max
+            return self.imu_ok and self.pose_sigma <= self.pose_sigma_max and self.abs_ok
         return True
 
     def _heading(self):
@@ -846,6 +881,8 @@ class ControlCarNode(Node):
             return 'IMU 中斷'
         if self.sensor and self.pose_sigma > self.pose_sigma_max:
             return f'定位不可信 (sigma {self.pose_sigma:.2f} m > {self.pose_sigma_max:.2f})'
+        if self.sensor and not self.abs_ok:
+            return f'絕對量測斷了 {self._abs_age_now():.1f} s (相機 / LiDAR 都沒進來, 只剩遞推)'
         if self.sensor and self._loc_bad_since is not None:
             return f'定位跟 gyro 不一致 ({self._loc_bad_why})'
 
@@ -942,6 +979,20 @@ class ControlCarNode(Node):
 
     # ═══════════════════════════════════════════════════ MAIN CONTROL LOOP
     def control_callback(self):
+        if not self._sim_time and time.monotonic() < self._sim_check_until:
+            if self.count_publishers('/clock') > 0:
+                self.get_logger().error(
+                    '有人在發 /clock (Isaac 在跑), 但這個節點沒開 use_sim_time —— 整份腳本會用牆上'
+                    '時鐘跑, 段落長度、逾時、IMU 槓桿臂全部會錯。這一輪不跑。請加 '
+                    '--ros-args -p use_sim_time:=true (ros2 launch 預設就有開)')
+                self._sim_check_until = 0.0
+                del self.scenarios[:]
+                self.idx = 0
+                self.finished = True
+                self._send_wheels([0.0] * 4)
+                return
+        if self.finished and not self.scenarios:
+            return
         now = self._now()
         if not self._clock_anchored:
             if now <= 0.0:
@@ -1045,7 +1096,7 @@ class ControlCarNode(Node):
         這一段是**唯一**的閉迴路, 而且標成 phase='reposition' —— 分析時要整段
         丟掉, 否則等於把「控制器補償摩擦力」的行為混進資料裡。
         """
-        if self.sensor and not (self.pose_fresh and self.imu_ok
+        if self.sensor and not (self.pose_fresh and self.imu_ok and self.abs_ok
                                 and self.pose_sigma <= self.repos_sigma_max):
             # 自旋完 LiDAR 可能鎖到對稱解或還在重新收斂。拿不可信的位置去開車,
             # 就是朝著牆以為是空地開過去。停著等它回來 (靜止時比較好重新鎖定)。
@@ -1054,9 +1105,12 @@ class ControlCarNode(Node):
                 self._loc_wait_since = (now, elapsed)
             waited = now - self._loc_wait_since[0]
             self.scenario_start = now - self._loc_wait_since[1]    # 等待不算進歸位逾時
+            age = self._abs_age_now()
             self.get_logger().warn(
                 f'{sc["name"]}: 等定位恢復 (sigma {self.pose_sigma:.3f} m, '
-                f'位姿{"" if self.pose_fresh else "過期"}, 已等 {waited:.0f} s)',
+                f'位姿{"" if self.pose_fresh else "過期"}'
+                + ('' if age is None else f', 絕對量測 {age:.1f} s 前')
+                + f', 已等 {waited:.0f} s)',
                 throttle_duration_sec=2.0)
             if waited > LOC_WAIT_MAX:
                 self.get_logger().error(f'定位 {LOC_WAIT_MAX:.0f} s 沒恢復, 跳過這次歸位')
@@ -1146,8 +1200,12 @@ class ControlCarNode(Node):
         沒有定位還開迴路自旋, 在真車上就是撞牆。
         """
         self._publish('calibrate', sc['name'], [0.0] * 4, rate_limited=False)
+        if self.sensor and self.abs_age is None and not self._abs_age_warned and elapsed > 3.0:
+            self._abs_age_warned = True
+            self.get_logger().warn('收不到融合的 abs_age —— 不會檢查「絕對量測斷了多久」, '
+                                   '只剩 sigma 一道防線 (舊版融合? rebuild car_loc_fusion)')
         ready = self.pose_fresh and (not self.sensor or (
-            self.imu_ok and self.pose_sigma <= self.repos_sigma_max))
+            self.imu_ok and self.abs_ok and self.pose_sigma <= self.repos_sigma_max))
         if not ready:
             self._collecting = False
             self._calib_buf = []

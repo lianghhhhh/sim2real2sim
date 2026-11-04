@@ -62,3 +62,5 @@ mod('sensor_msgs.msg', Imu=_struct(header=_hdr, orientation=_quat,
     angular_velocity=_vec, linear_acceleration=_vec),
     JointState=_struct(header=_hdr, name=list, velocity=list, effort=list))
 mod('std_srvs.srv', Trigger=object)
+mod('std_msgs')
+mod('std_msgs.msg', Float32=_struct(data=0.0), String=_struct(data=''))

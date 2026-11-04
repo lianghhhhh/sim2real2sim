@@ -132,6 +132,13 @@ class LidarLocalizer(Node):
         p('min_inlier_ratio', 0.50)
         p('max_residual', 0.25)
         p('max_failures', 8)        # 連續失敗這麼多次就重新全域定位
+        # 掃描斷了超過這麼久 (s) 就不要再用等速外推當預測, 直接重新全域定位
+        # (2026-11-03: 斷 16 秒之後的那一幀配到 4~5 m 外的局部解, 回報的 sigma 卻是 1.3 mm)
+        p('scan_gap_reset', 1.0)
+        # 全域定位剛成功的這幾幀, 回報的 sigma 至少 settle_sigma (m) —— 對稱解跟真值的
+        # 殘差一樣漂亮, 剛找到的解還不能信。融合的 lidar_sigma_max (2.5 mm) 會把它們擋掉。
+        p('settle_scans', 10)
+        p('settle_sigma', 0.05)
         # 鎖死偵測 —— 鎖到 180 度對稱解時配準不會失敗, 上面那條永遠不會觸發。
         # 車子幾乎沒在轉的時候, 連續 lock_scans 幀殘差 > lock_residual 或
         # inlier < lock_inlier 就當作鎖死, 整張地圖重新全域定位。見 lidar_loc.yaml。
@@ -216,6 +223,10 @@ class LidarLocalizer(Node):
         self.min_inlier = float(g('min_inlier_ratio').value)
         self.max_residual = float(g('max_residual').value)
         self.max_failures = int(g('max_failures').value)
+        self.gap_reset = float(g('scan_gap_reset').value)
+        self.settle_scans = int(g('settle_scans').value)
+        self.settle_sigma = float(g('settle_sigma').value)
+        self.settle_left = 0
         self.lock_res = float(g('lock_residual').value)
         self.lock_inlier = float(g('lock_inlier').value)
         self.lock_omega = float(g('lock_omega').value)
@@ -392,6 +403,13 @@ class LidarLocalizer(Node):
         if self.auto_seam and self._last_scan_t is not None and t < self._last_scan_t - 1.0:
             self.get_logger().warn('掃描時戳倒退 (Isaac 重新 Play?), 接縫重新校正')
             self._seam_reset()
+        if (self.located and self.gap_reset > 0.0 and self._last_scan_t is not None
+                and t - self._last_scan_t > self.gap_reset):
+            # 斷這麼久, 等速外推的預測已經不知道錯到哪裡了 —— 拿它當起點配準, 會收斂到
+            # 一個錯的局部解, 而且殘差漂亮、sigma 很小, 下游擋不住。
+            self.get_logger().warn(
+                f'掃描斷了 {t - self._last_scan_t:.1f} s, 重新全域定位')
+            self.located = False
         self._last_scan_t = t
 
         f = self.front.process(msg, t, self.motion.vx, self.motion.vy,
@@ -442,6 +460,7 @@ class LidarLocalizer(Node):
             self.full_search = False
             self.last_ok_t = f.t
             self.last_result = r
+            self.settle_left = self.settle_scans
             self.get_logger().info(
                 f'全域定位成功 ({el:.2f} s): x={r.t[0]:+.3f} y={r.t[1]:+.3f} '
                 f'yaw={math.degrees(r.theta):+.1f}° '
@@ -637,6 +656,10 @@ class LidarLocalizer(Node):
         else:
             cov[0, 0] = cov[1, 1] = 0.25
             cov[5, 5] = 0.1
+        if self.settle_left > 0:
+            self.settle_left -= 1
+            s2 = self.settle_sigma ** 2
+            cov[0, 0], cov[1, 1] = max(cov[0, 0], s2), max(cov[1, 1], s2)
         cov[2, 2] = cov[3, 3] = cov[4, 4] = 1e-6
         od.pose.covariance = cov.ravel().tolist()
         od.twist.twist.linear.x = float(self.motion.vx)

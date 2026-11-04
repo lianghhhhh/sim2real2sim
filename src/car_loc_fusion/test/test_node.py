@@ -86,6 +86,8 @@ def make_node(**over):
     那一刻 —— 建完再改 `get_parameter().value` 只會改到沒有人再讀的那一份。
     """
     orig = _stub_ros.Node.declare_parameter
+    # 節點預設不吃天花板相機了, 但這裡拿 camera 當通用的絕對量測來源 (LiDAR 走同一段程式碼)
+    over.setdefault('camera_enabled', True)
 
     def patched(self, name, value=None):
         orig(self, name, over.get(name, value))

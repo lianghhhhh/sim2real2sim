@@ -160,6 +160,15 @@ class AbsSource:
                 self.clock_locked = True
         return t - self.clock_offset - self.extra_delay
 
+    def reset_clock(self):
+        """重新量時鐘偏移 (模擬時間倒退 = Isaac 重新 Play 之後, 舊的偏移不再成立)。"""
+        self._clock_buf.clear()
+        self.clock_offset = 0.0
+        self.clock_locked = False
+        self.clock_flagged = False
+        self.last_used = None
+        self.last_recv = None
+
     def alive(self, now: float) -> bool:
         return (self.last_recv is not None
                 and (now - self.last_recv) < self.timeout)

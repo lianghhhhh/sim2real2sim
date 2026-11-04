@@ -12,9 +12,14 @@
     ./scripts/estimate_friction.py ref.csv target.csv              # 自動用 gyro
     ./scripts/estimate_friction.py ref.csv target.csv --compare-gt  # 模擬器裡對答案
 
-sensor 模式開的定位節點: camera + lidar + fusion (fusion 吃前兩者)。imu / wheel
-兩條航位推算線預設不開 —— 控制跟分析都不用它們, 開了只是多吃 CPU; 想一起比較
-定位品質就 imu:=true wheel:=true (記得給 imu_initial_pose)。
+sensor 模式開的定位節點: 多相機偵測 + lidar + fusion (fusion 吃前兩者), 以及方法六
+(`mc_`, 跟 fusion 共用同一個偵測節點; `multicam_only:=false` 關掉)。**不要再另外開
+multicam_loc.launch.py** —— 那會多一個偵測節點 (2026-11-03 兩輪就是這樣)。camera (單一
+天花板相機) 與 imu / wheel 兩條航位推算線預設不開 —— 控制跟分析都不用它們, 開了只是多吃
+CPU / GPU; 想一起比較定位品質就 camera:=true imu:=true wheel:=true (記得給 imu_initial_pose)。
+
+stage 沒有 8 台環境相機 (目前只有 kros_car_new.usd 有) 時 fusion 只剩 LiDAR + 遞推,
+給 multicam:=false 可以省下偵測節點的 GPU。
 
 **sensor 模式在 GT 裡仍然記錄 /odom** (collect_data_node 一律訂閱), 那只是拿來對答案,
 控制完全不看。真車上沒有 /odom, 那幾欄就是 NaN。
@@ -63,7 +68,11 @@ def generate_launch_description():
                               description='實體車是 /imu/data'),
         DeclareLaunchArgument('wheel_feedback_topic', default_value='joint_states',
                               description='輪速 / 扭矩回授; 實體車是 /wheel_feedback'),
-        DeclareLaunchArgument('camera', default_value='true'),
+        DeclareLaunchArgument('camera', default_value='false',
+                              description='單一天花板相機, fusion 不吃它'),
+        DeclareLaunchArgument('multicam', default_value='true'),
+        DeclareLaunchArgument('multicam_only', default_value='true',
+                              description='同時記 mc_ (方法六, 不吃 LiDAR), 共用偵測節點'),
         DeclareLaunchArgument('lidar', default_value='true'),
         DeclareLaunchArgument('imu', default_value='false'),
         DeclareLaunchArgument('wheel', default_value='false'),
@@ -77,7 +86,8 @@ def generate_launch_description():
         condition=IfCondition(sensor),
         launch_arguments={
             'use_sim_time': lc('use_sim_time'),
-            'camera': lc('camera'), 'lidar': lc('lidar'),
+            'camera': lc('camera'), 'multicam': lc('multicam'), 'lidar': lc('lidar'),
+            'multicam_only': lc('multicam_only'),
             'imu': lc('imu'), 'wheel': lc('wheel'), 'fusion': 'true',
             'teleop': 'false', 'collector': 'false',
             'tf_source': 'fusion',

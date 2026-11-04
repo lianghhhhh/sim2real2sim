@@ -1,0 +1,85 @@
+# 方法六 (多相機斜拍 + 3D 車型 + 視線量測) 的節點參數。
+#
+# **遞推那一半 (IMU / 輪速 / 靜止校正 / 倒帶重放) 的參數不在這裡** —— launch 會先讀
+# car_loc_fusion/config/fusion_loc.yaml, 再用這個檔蓋上去。那些值改 fusion_loc.yaml
+# 就兩邊一起生效, 不會分岔。這裡只放跟方法五不一樣的、以及多相機自己的參數。
+# 方法五 (fusion_loc.launch.py) 也吃這個檔的 multicam_fusion 段, 再用 fusion_loc.yaml
+# 蓋掉 topic 與 lidar_enabled: 框的參數改這裡就兩條路線一起生效。
+# (`ros2 run car_loc_multicam multicam_fusion` 直接跑時讀不到 fusion_loc.yaml, 遞推參數
+#  用 car_loc_fusion 程式碼裡的預設值 —— 目前跟 fusion_loc.yaml 一樣。)
+multicam_fusion:
+  ros__parameters:
+    odom_topic: /multicam_loc/odom
+    pose_topic: /multicam_loc/pose
+    abs_age_topic: /multicam_loc/abs_age
+    marker_topic: /multicam_loc/markers
+    publish_tf: true
+
+    # LiDAR 與單一天花板相機這兩個來源預設關掉, 這一條才能單獨拿來跟別的方法比
+    # (多相機 + LiDAR 一起吃的是方法五: ros2 launch car_loc_fusion fusion_loc.launch.py)。
+    # 真車沒有絕對 yaw (yaw_source: gyro) 時建議把 LiDAR 打開: 起點的 yaw 就有了,
+    # 不然 initial_pose 只能從框的形狀猜, 前後 180 度分不太出來。
+    camera_enabled: false            # /camera_loc/odom (方法一, 單一天花板相機)
+    lidar_enabled: false             # /lidar_loc/odom
+
+    multicam_enabled: true           # false = 不訂閱車框 (只有方法五的 A/B 會用到)
+    cameras_file: ''                 # 空 = 本 package 的 config/env_cameras.yaml
+    car_model_file: ''               # 空 = 本 package 的 config/car_model.yaml
+
+    # --- 量測雜訊 (px) -----------------------------------------------------------
+    # 每個邊: sqrt(bbox_sigma_px^2 + (bbox_size_frac * 框的邊長)^2) * bbox_r_inflate
+    # 第一項是 YOLO 逐幀的抖動 (car_loc_camera 量到框中心 1.5 px), 第二項是「YOLO 框到
+    # 哪裡」跟凸包的系統性差 —— **這一項還沒在 Isaac 的斜拍畫面上量過**, 3% 是
+    # test/test_multicam.py 的假設。量法: 跑一段, 看 status 裡「閘門擋」的比例與
+    # evaluate 的 NEES; 擋太多 (> 5%) 或 NEES 遠大於 2 就調大。
+    bbox_sigma_px: 3.0
+    bbox_size_frac: 0.03
+    bbox_r_inflate: 1.5
+    bbox_border_px: 4.0
+    # 框也修 yaw。Isaac 裡 IMU 的絕對 yaw 壓著, 開關幾乎沒差 (test [3]);
+    # 真車只有陀螺儀時這一項才有用。
+    bbox_update_yaw: true
+
+    # --- 收件政策 (每台相機各一份) ---------------------------------------------
+    bbox_min_dt: 0.0
+    bbox_timeout: 0.5
+    bbox_clock_max_offset: 1.0
+    bbox_extra_delay: 0.0
+
+    # --- 綁組 -----------------------------------------------------------------
+    # Isaac 的 8 台相機同一幀 render, 時戳一樣 -> 綁成一組, 倒帶一次就好。
+    # 實體相機只同步時鐘不同步快門時, 每組就是一台, 照樣能用。
+    group_tol: 0.002
+    group_wait: 0.03
+
+    # --- 挑框 / 起點 -----------------------------------------------------------
+    assoc_gate: 1.5
+    init_max_rms: 15.0
+    init_min_cameras: 1
+    reloc_min_cameras: 2             # 恢復模式下幾台同時看到車才重跑方法 B 換位置
+
+    publish_markers: true
+
+multicam_detector:
+  ros__parameters:
+    cameras_file: ''
+    car_model_file: ''
+    model_path: ''                   # 空 = car_loc_camera 的 resource/best.onnx
+    imgsz: 512                       # 必須跟 best.onnx 匯出時一致
+    conf: 0.25
+    # 8 台 x 15 Hz = 每秒 120 次 YOLO。GPU 吃不消就降; 融合那邊 10 Hz 也夠。
+    max_rate: 15.0
+    roi: true
+    odom_topic: /multicam_loc/odom
+    # ROI 邊長 = 預測框的 roi_scale 倍, 至少 roi_min。**不要調小**: best.onnx 只認得
+    # 訓練時那個大小的車 (512 輸入裡 ~22 px), 裁小再放大反而認不得 (2026-10-30 實測:
+    # 320 px 裁切 8 台幾乎全滅, 18 倍 / 至少 512 px 8 台全認得, 見 detector_node.py)。
+    roi_scale: 18.0
+    roi_min: 512
+    roi_timeout: 0.5
+    full_frame_period: 1.0
+    forward_deg: 0.0
+    # 影像訂閱用 RELIABLE。BEST_EFFORT 在 Isaac(host) -> 容器 這條路上 8 台同時訂閱時
+    # 幾乎收不到 (4.75 MB 的影像少一個 UDP 片段整張作廢), 見 detector_node.py。
+    image_reliable: true
+    publish_debug: false

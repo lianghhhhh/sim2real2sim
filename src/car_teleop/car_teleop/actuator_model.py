@@ -50,10 +50,13 @@ topicName 要改成 joint_command_isaac; 沒改的話 Isaac 還是直接吃 /joi
 from __future__ import annotations
 
 import math
+import signal
+import time
 from collections import deque
 
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 
 from sensor_msgs.msg import JointState
 
@@ -206,14 +209,29 @@ class ActuatorModel(Node):
             + ' '.join(f'{v:+.2f}' for v in self.out) + '] rad/s')
 
     def brake(self):
-        """關掉之前補送幾次輪速 0 —— Isaac 會一直維持最後一筆指令。"""
+        """關掉之前補送幾次輪速 0 —— Isaac 會一直維持最後一筆指令。
+
+        中間用 sleep, 不要 spin_once: spin_once 會跑到 tick(), 把還沒衰減到 0 的輸出
+        又送一次, 最後一筆就不是 0 了。"""
         for _ in range(10):
             self._publish([0.0] * 4)
-            rclpy.spin_once(self, timeout_sec=0.02)
+            time.sleep(0.02)
+
+
+def _raise_interrupt(signum, frame):
+    # 只理第一次: launch 收到 Ctrl-C 會再轉發一次 SIGINT, 不要讓它打斷 brake()
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    # Ctrl-C 自己處理: rclpy 預設的 SIGINT handler 會先把 context 關掉, brake() 的 0
+    # 就送不出去 (Isaac 會照最後一筆一直開)。關掉它, 自己把 SIGINT / SIGTERM 變成
+    # KeyboardInterrupt (明確裝上去: 從背景啟動的行程會繼承「忽略 SIGINT」)。
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    signal.signal(signal.SIGINT, _raise_interrupt)
+    signal.signal(signal.SIGTERM, _raise_interrupt)
     node = ActuatorModel()
     try:
         rclpy.spin(node)

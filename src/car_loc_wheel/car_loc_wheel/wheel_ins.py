@@ -388,6 +388,8 @@ class WheelIns:
                  sigma_acc: float = 0.05,
                  sigma_acc_omega: float = 0.15,
                  sigma_cross: float = 0.02,    # 側向的過程雜訊 (NHC 不是完美的)
+                 # 側向過程雜訊隨轉速加大的部分 (m/s 每 rad/s), 見 predict()。0 = 不加
+                 sigma_cross_omega: float = 0.0,
                  sigma_bg: float = 1e-4,
                  sigma_ba: float = 1e-3,
                  sigma_k: float = 0.0,         # 0 = 凍結尺度 (預設; 見模組說明)
@@ -421,6 +423,7 @@ class WheelIns:
         self.sa = float(sigma_acc)
         self.sa_omega = float(sigma_acc_omega)
         self.s_cross = float(sigma_cross)
+        self.s_cross_omega = float(sigma_cross_omega)
         self.sbg = float(sigma_bg)
         self.sba = float(sigma_ba)
         self.sk = float(sigma_k)
@@ -442,6 +445,7 @@ class WheelIns:
 
         self.still_since = None
         self.anchor = None
+        self.anchor_P = None        # 錨下去那一刻的位置共變異數 (見 anchor_position)
         self.last_omega = 0.0
         self.last_acc = 0.0
         self.counts = {'wheel': 0, 'zupt': 0, 'zaru': 0, 'zaccel': 0, 'anchor': 0,
@@ -547,8 +551,12 @@ class WheelIns:
         # 側向: NHC 是結構性的, 但不是完美的 (打滑轉彎時真的會橫移, 實測
         # |wz|>3 時側向速度 p95 = 0.094 m/s)。給一個小的側向過程雜訊, 不然 P
         # 在側向會是奇異的, 之後任何量測都修不動那一維。
+        # 原地轉的時候車身整個會往旁邊滑, 而且 IMU 與輪速都看不到 (2026-11-03 那一輪,
+        # 絕對量測斷掉時在牆邊原地轉 180 度, 滑了 25 cm, 濾波器卻說 sigma 7 cm)。
+        # 所以側向雜訊要跟著 |w| 長大 (sigma_cross_omega), P 才誠實。
         lat = np.array([-sh, ch])
-        Q[0:2, 0:2] += (self.s_cross ** 2) * dt * np.outer(lat, lat)
+        q_lat = self.s_cross ** 2 + (self.s_cross_omega * abs(w)) ** 2
+        Q[0:2, 0:2] += q_lat * dt * np.outer(lat, lat)
         Q[IYAW, IYAW] = qg * dt
         Q[IBG, IBG] = self.sbg ** 2 * dt
         Q[IBA, IBA] = self.sba ** 2 * dt
@@ -732,12 +740,27 @@ class WheelIns:
                      'zaccel', gate=False)
 
     def anchor_position(self):
+        """停著的時候把位置釘在剛停下來的地方 (偽量測, 每一步一次)。
+
+        **錨點只知道「沒有動」, 不知道「在哪裡」。** 所以它可以修狀態 (擋住積分的蠕動),
+        但位置的不確定性不可以因此比剛停下來時小。以前它每一步都當成一則獨立的
+        絕對量測 (sigma 2 cm), 幾秒就把 P 壓到 ~1.5 cm —— 2026-11-03 相機與 LiDAR
+        一起斷掉時, 車停一下 P 就縮回去, 誤差 45 cm 時融合報 sigma 1.5 cm, 下游完全
+        看不出來。現在更新完把位置那一塊補回錨下去時的大小 (真正的絕對量測會把
+        anchor_P 一起改小, 見 car_loc_fusion 的 FusionEkf._shift_anchor)。
+        """
         if self.anchor is None:
             self.anchor = self.x[IP].copy()
+            self.anchor_P = self.P[IP, IP].copy()
         H = np.zeros((2, NX))
         H[0, 0] = H[1, 1] = 1.0
         self._update(H, self.anchor - self.x[IP],
                      np.eye(2) * self.anchor_sigma ** 2, 'anchor')
+        if self.anchor_P is not None:
+            # anchor_P - P_pos 是半正定 (更新只會讓 P 變小), 加回去 P 仍是半正定;
+            # 數值誤差造成的負特徵值截成 0
+            w, V = np.linalg.eigh(self.anchor_P - self.P[IP, IP])
+            self.P[IP, IP] += (V * np.clip(w, 0.0, None)) @ V.T
 
     def update_yaw(self, yaw_meas: float, sigma: float = 0.02, dt: float = 0.0):
         """IMU 的絕對 yaw (Isaac / 9 軸 IMU)。真車的 6 軸 IMU 沒有這個。"""

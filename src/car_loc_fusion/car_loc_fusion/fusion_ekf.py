@@ -75,10 +75,11 @@ class Step:
     """
 
     __slots__ = ('t', 'a_fwd', 'omega_z', 'v_wheel', 'spread', 'still',
-                 'yaw_meas', 'yaw_sigma', 'dt', 'snap')
+                 'yaw_meas', 'yaw_sigma', 'dt', 'snap', 'zaru', 'anchor')
 
     def __init__(self, t, a_fwd, omega_z, *, v_wheel=None, spread=0.0,
-                 still=False, yaw_meas=None, yaw_sigma=0.02, dt=0.0):
+                 still=False, yaw_meas=None, yaw_sigma=0.02, dt=0.0,
+                 zaru=True, anchor=True):
         self.t = float(t)
         self.a_fwd = float(a_fwd)
         self.omega_z = float(omega_z)
@@ -88,6 +89,9 @@ class Step:
         self.yaw_meas = None if yaw_meas is None else float(yaw_meas)
         self.yaw_sigma = float(yaw_sigma)
         self.dt = float(dt)
+        # 靜止時要不要做 ZARU / 位置錨定 (節點的 enable_zaru / enable_anchor)
+        self.zaru = bool(zaru)
+        self.anchor = bool(anchor)
         self.snap = None            # 套用**之前**的狀態快照 (倒帶用)
 
 
@@ -95,7 +99,7 @@ class AbsMeas:
     """一則絕對位姿量測 (map 座標)。"""
 
     __slots__ = ('t', 'src', 'x', 'y', 'yaw', 'sigma', 'yaw_sigma', 'r_scale',
-                 'ox', 'oy')
+                 'ox', 'oy', 'use_yaw')
 
     def __init__(self, t, src, x, y, sigma, yaw=None, yaw_sigma=0.05,
                  offset=(0.0, 0.0)):
@@ -116,6 +120,9 @@ class AbsMeas:
         # 這一則**當初被接受時**用的 R 放大倍率 (逃生口強制接受時是 9)。
         # 重放時必須用同一個值、而且不可以重新判閘門 —— 見 _abs_update。
         self.r_scale = 1.0
+        # 當初有沒有吃它的 yaw。重放時照做 —— 不能用「有沒有 yaw」來猜:
+        # 節點每一則都會帶 yaw, use_yaw=False 的來源 (天花板相機) 重放時會被吃進去。
+        self.use_yaw = False
 
 
 class FusionEkf:
@@ -139,17 +146,23 @@ class FusionEkf:
         # 緩衝區的筆數上限 (時間判斷之外的第二道保險)。
         # 0.4 s x 200 Hz IMU = 80 步, 512 有六倍餘裕。
         self.max_buf = 512
-        # 連續這麼久沒有任何一則絕對量測通過閘門 -> 強制接受一次 (R 放大 3 倍)。
+        # 連續這麼久沒有任何一則絕對量測通過閘門 -> 強制接受 (R 放大 9 倍 = sigma 3 倍)。
         # 理由跟 car_loc_wheel 的 wheel_reject_time 完全一樣: 一次擋掉是量測的
         # 問題, 連續好幾秒都對不上就是**濾波器自己**錯了, 而絕對量測是這裡唯一
         # 能把它拉回來的東西。沒有這個逃生口的話, 遞推一旦跑掉就再也回不來。
         self.abs_reject_time = float(abs_reject_time)
+        # 「一直被擋」的定義是**被擋的量測一則接一則**, 兩則之間隔超過這麼久就從頭算。
+        # 沒有這一條的話, 計時會把「根本沒有量測」的時間也算進去: 2026-11-03 那一輪
+        # 相機與 LiDAR 一起斷了 51 秒, 斷之前被擋的一則開始計時, 斷完之後的第一則
+        # LiDAR (錯 29 cm) 就直接被強制接受 —— 那一則如果是鏡射解 (錯 4~5 m) 也一樣。
+        self.reject_gap = 1.0
         self.chi2_scale = float(chi2_scale)
 
         self.initialized = False
         self.buf = deque()          # Step, 時間遞增
         self.abs_log = deque()      # AbsMeas (已套用的), 時間遞增
         self.reject_since = None
+        self.last_reject = None
         self.recovering = False
         self.counts = {'abs': 0, 'gate': 0, 'damped': 0, 'forced': 0,
                        'rewind': 0, 'too_old': 0, 'future': 0, 'yaw': 0,
@@ -191,6 +204,7 @@ class FusionEkf:
         self.initialized = True
         self.recovering = False
         self.reject_since = None
+        self.last_reject = None
         self.buf.clear()
         self.abs_log.clear()
 
@@ -214,12 +228,14 @@ class FusionEkf:
                 ins.still_since = st.t
             ins.zupt()
             ins.zero_accel(st.a_fwd)
-            ins.zaru(st.omega_z)
-            if st.t - ins.still_since >= ins.anchor_after:
+            if st.zaru:
+                ins.zaru(st.omega_z)
+            if st.anchor and st.t - ins.still_since >= ins.anchor_after:
                 ins.anchor_position()
         else:
             ins.still_since = None
             ins.anchor = None
+            ins.anchor_P = None
 
     # ------------------------------------------------------- 絕對量測 (主角)
     def absolute(self, m: AbsMeas, *, use_yaw: bool = False,
@@ -312,7 +328,7 @@ class FusionEkf:
                 if nxt is not None:
                     self.ins.predict(ev.t, nxt.a_fwd, nxt.omega_z)
                 res = self._abs_update(
-                    ev, use_yaw=(use_yaw if ev is m else ev.yaw is not None),
+                    ev, use_yaw=(use_yaw if ev is m else bool(getattr(ev, 'use_yaw', False))),
                     max_correction=max_correction, replay=(ev is not m))
                 if ev is m:
                     ok = res
@@ -351,7 +367,6 @@ class FusionEkf:
                 Si = np.linalg.inv(S)
             except np.linalg.LinAlgError:
                 return False
-            forced = False
         else:
             S = H @ ins.P @ H.T + R
             try:
@@ -360,8 +375,7 @@ class FusionEkf:
                 return False
             nis = float(r @ Si @ r)
             if nis <= CHI2_99[2] * self.chi2_scale:
-                self.reject_since = None
-                self.recovering = False       # 正常通過 = 濾波器跟量測和好了
+                self._gate_pass()             # 正常通過 = 濾波器跟量測和好了
             else:
                 # 逃生口。**一次強制接受不夠** —— 單次修正被 max_correction 綁住
                 # (預設 1 m), 而它要處理的情況 (綁架、遞推整個跑掉) 動輒好幾公尺。
@@ -371,14 +385,9 @@ class FusionEkf:
                 # 兩個來源的時戳如果在不同的時鐘上, 一相減就是幾百秒, 逃生口會
                 # 在第一次被擋的時候就觸發 —— 那正好是它最不該觸發的時候。
                 tnow = self.ins.t if self.ins.t is not None else m.t
-                if not self.recovering:
-                    if (self.abs_reject_time <= 0.0 or self.reject_since is None
-                            or (tnow - self.reject_since) <= self.abs_reject_time):
-                        if self.reject_since is None:
-                            self.reject_since = tnow
-                        self.counts['gate'] += 1
-                        return False
-                    self.recovering = True
+                if self._gate_reject(tnow):
+                    self.counts['gate'] += 1
+                    return False
                 m.r_scale = 9.0          # 放大 3 倍 sigma: 走過去, 不要跳過去
                 R = R * m.r_scale
                 S = H @ ins.P @ H.T + R
@@ -398,6 +407,7 @@ class FusionEkf:
         I_KH = np.eye(NX) - K @ H
         ins.P = I_KH @ ins.P @ I_KH.T + K @ R @ K.T      # Joseph form
         ins.P = 0.5 * (ins.P + ins.P.T)
+        self._shift_anchor(dx)
 
         if use_yaw and m.yaw is not None:
             Hy = np.zeros((1, NX))
@@ -409,17 +419,57 @@ class FusionEkf:
 
         if not replay:
             self.counts['abs'] += 1
+            m.use_yaw = bool(use_yaw)
         self.last_abs_t = m.t
         self.abs_log.append(m)
         return True
 
+    # ------------------------------------------------------------------ 閘門
+    def _gate_pass(self):
+        self.reject_since = None
+        self.last_reject = None
+        self.recovering = False
+
+    def _gate_reject(self, tnow: float) -> bool:
+        """一則被卡方閘門擋下來。回傳 True = 真的擋掉; False = 逃生口, 要強制接受。
+
+        「連續 abs_reject_time 秒都被擋」才觸發, 而且「連續」是指被擋的量測一則接一則
+        (間隔不超過 reject_gap)。中間斷掉 (沒有量測) 就從頭算 —— 見 __init__ 的說明。
+        """
+        if self.recovering:
+            return False
+        if (self.reject_since is None or self.last_reject is None
+                or tnow - self.last_reject > self.reject_gap):
+            self.reject_since = tnow
+        self.last_reject = tnow
+        if self.abs_reject_time > 0.0 and tnow - self.reject_since > self.abs_reject_time:
+            self.recovering = True
+            return False
+        return True
+
     # ------------------------------------------------------------------ 內部
+    def _shift_anchor(self, dx):
+        """靜止時的位置錨點要跟著絕對量測的修正走。
+
+        錨點是 WheelIns 的偽量測 (60 Hz, sigma 2 cm), 比任何絕對量測都強。它不動的話,
+        絕對量測修多少、下一步就被拉回多少, 而 P 還一路被壓小 -> 接著閘門開始擋正確的
+        量測。兩個症狀是同一件事: 車子停著時給錯起點回不來, 以及 Isaac 怠速蠕動
+        (-0.75 mm/s) 時估計凍在原地 (2026-11-02: 強制接受 6040 次只動了 1 cm)。
+        錨點在快照裡, 倒帶重放時這裡會照原樣再走一次。
+        """
+        if self.ins.anchor is not None:
+            self.ins.anchor = self.ins.anchor + dx[IP]
+            # 這是真正的絕對資訊: 錨點的不確定性也跟著縮 (不然下一步錨點又把 P 補回去)
+            if self.ins.anchor_P is not None:
+                self.ins.anchor_P = self.ins.P[IP, IP].copy()
+
     def _snapshot(self):
         ins = self.ins
         return (ins.x.copy(), ins.P.copy(), ins.t, ins.still_since,
                 None if ins.anchor is None else ins.anchor.copy(),
                 ins.reject_since, ins.last_omega, ins.last_acc,
-                dict(ins.counts))
+                dict(ins.counts),
+                None if ins.anchor_P is None else ins.anchor_P.copy())
 
     def _restore(self, snap):
         if snap is None:
@@ -430,6 +480,7 @@ class FusionEkf:
             snap[0].copy(), snap[1].copy(), snap[2], snap[3],
             None if snap[4] is None else snap[4].copy(),
             snap[5], snap[6], snap[7], dict(snap[8]))
+        ins.anchor_P = None if snap[9] is None else snap[9].copy()
         ins.counts = counts
 
     def _trim(self, now: float):

@@ -66,6 +66,15 @@ skid-steer 原地轉時四輪都在滑, 每輪摩擦力大小 mu*N, 穩態時
        0.10~0.15, 隨 mu 與轉速變 (mu 大 -> 轉得慢)。所以它不能當對照組, 只印出來
        參考, 順便給出等效輪距 T_eff = 2r / gain (cmd_vel_bridge 的 effective_track)。
 
+  !! B1 的「低轉速狀態」: 同樣的輪速指令、同樣的實際輪速, 車體卻只轉正常的 1/3 ~ 2/3,
+     扭矩也低 ~9%。2026-11-02/03 在 w=5.97 rad/s 那一檔出現 (6 趟裡 3 趟 / 4 趟,
+     另一輪 0 趟), USD 沒改, 原因還不知道。這幾趟的扭矩量到的不是「同一種滑動」,
+     混進來會讓比值偏低 2~3% (0.99 -> 0.97)。所以預設**排除**: 這一趟的 車體轉速/輪速
+     低於**同一檔**典型值 (第 75 百分位) 的 LOW_SPIN_FRAC 倍就不用, 報告會列出來。
+     要同一檔比: 車體轉速/輪速 本來就隨輪速變 (2.4 rad/s ~0.10, 6 rad/s ~0.12),
+     跟整輪比會把低檔的正常趟次誤判掉。同一檔超過一半是低轉速的話就抓不到。
+     --keep-low-spin 可以留著 (拿來看它造成多少差)。
+
   [副] B3 cruise_torque   等速直行的扭矩 = 滾動阻力 + 馬達損耗, 跟地面摩擦
        係數無關。模擬裡接近 0 (0.015 N·m)。上面說的損耗就是從這裡來的。
 
@@ -132,6 +141,9 @@ CRUISE_TAIL = 1.0                        # B3 直行段取最後幾秒當穩態
 SPIN_ONSET_W = 0.05                      # B2 車體轉速超過這個值算「開始轉」 [rad/s]
 SAT_TORQUE_FRAC = 0.95                   # 扭矩 >= 這個比例 x 上限 -> 飽和
 SAT_TRACK_ERR = 0.10                     # 輪速比指令低這麼多 -> 飽和 (追不上)
+# B1 低轉速狀態 (見檔頭): 車體轉速/輪速 < 這個比例 x 同一檔的第 75 百分位 -> 排除。
+# 四輪實測 (同一檔的比例): 正常的趟次 >= 0.71, 低轉速的 0.33~0.61 -> 取中間。
+LOW_SPIN_FRAC = 0.65
 MAX_SAT_FRAC = 0.3                       # 自旋 trial 超過這個比例飽和 -> 那個環境的主特徵不能用
 
 
@@ -448,11 +460,12 @@ def spin_onset(t, w, th=SPIN_ONSET_W, hold=3):
 # ═══════════════════════════════════════════════════════════════════════
 #  逐 trial 抽特徵
 # ═══════════════════════════════════════════════════════════════════════
-def extract(tr, r_wheel, motor, loss_correction=True):
+def extract(tr, r_wheel, motor, loss_correction=True, keep_low_spin=False):
     segs = segments(tr)
     F = {k: [] for k in FEATURES}
     # B1 每個 trial 一列: (輪速指令, 扣掉損耗的扭矩, 車體轉速, 實際輪速, 是否飽和, 原始扭矩)
     F['_spin_rows'] = []
+    F['_spin_rows_low'] = []          # 低轉速狀態, 沒用 (見檔頭)
     # 損耗要等 B3 跑完才知道, 所以先記「原始扭矩 + 當時的輪速」, 最後一起扣
     raw = {'spin': [], 'ramp': [], 'breakaway': [], 'cruise': []}
     n_spin = n_no_effort = 0
@@ -502,9 +515,7 @@ def extract(tr, r_wheel, motor, loss_correction=True):
             # 上限用**實際輪速**查: 馬達轉得愈快出得了的扭矩愈少 (見 Motor)。
             sat = bool(float(s['tq_max'].median()) >= SAT_TORQUE_FRAC * motor.limit(wheel)
                        or (cmd > 0.5 and wheel < (1.0 - SAT_TRACK_ERR) * cmd))
-            raw['spin'].append((cmd, tq, w_body, wheel, sat))
-            if wheel > 0.5:
-                F['spin_yaw_gain'].append(w_body / wheel)
+            raw['spin'].append((cmd, tq, w_body, wheel, sat, name))
 
         elif b == 'B2 spin_ramp':
             w = g['w'].to_numpy()
@@ -573,10 +584,29 @@ def extract(tr, r_wheel, motor, loss_correction=True):
 
     # ── 扣掉馬達自己的損耗 (B3 量到的), 剩下的才是輪胎的摩擦力 ──
     loss = fit_loss(raw['cruise']) if loss_correction else None
-    for cmd, tq, w_body, wheel, sat in raw['spin']:
+    by_level = {}
+    for r in raw['spin']:
+        if r[3] > 0.5:
+            by_level.setdefault(round(r[0], 2), []).append(r[2] / r[3])
+    g_all = [g for v in by_level.values() for g in v]
+    low_spin = []
+    for cmd, tq, w_body, wheel, sat, name in raw['spin']:
         net = tq - loss_at(loss, wheel)
+        row = (cmd, net, w_body, wheel, sat, tq)
+        lv = by_level.get(round(cmd, 2), [])
+        ref = lv if len(lv) >= 3 else g_all
+        g_ref = float(np.percentile(ref, 75)) if ref else float('nan')
+        if (wheel > 0.5 and np.isfinite(g_ref) and g_ref > 1e-6
+                and w_body / wheel < LOW_SPIN_FRAC * g_ref):
+            low_spin.append({'name': name, 'cmd': cmd, 'w_body': w_body,
+                             'gain_frac': w_body / wheel / g_ref, 'torque': tq})
+            if not keep_low_spin:
+                F['_spin_rows_low'].append(row)
+                continue
         F['spin_torque'].append(net)
-        F['_spin_rows'].append((cmd, net, w_body, wheel, sat, tq))
+        F['_spin_rows'].append(row)
+        if wheel > 0.5:
+            F['spin_yaw_gain'].append(w_body / wheel)
     F['ramp_torque'] = [tq - loss_at(loss, wh) for tq, wh in raw['ramp']]
     F['breakaway_torque'] = [tq - loss_at(loss, wh) for tq, wh in raw['breakaway']]
 
@@ -584,6 +614,8 @@ def extract(tr, r_wheel, motor, loss_correction=True):
     spin_w = [r[3] for r in rows]
     F['_meta'] = {
         'excluded': excluded,
+        'low_spin': low_spin,
+        'low_spin_kept': bool(keep_low_spin),
         'spin_trials': n_spin,
         'no_effort': n_no_effort,
         'saturated': sum(1 for r in rows if r[4]),
@@ -890,7 +922,7 @@ def use_clean_levels(Fr, Ft):
     def keep(F):
         rows = [r for r in F['_spin_rows'] if round(r[0], 2) not in bad]
         G = dict(F)
-        G['_spin_rows_all'] = F['_spin_rows']
+        G['_spin_rows_all'] = F.get('_spin_rows_all', F['_spin_rows'])
         G['_spin_rows'] = rows
         G['spin_torque'] = [r[1] for r in rows]
         G['spin_yaw_gain'] = [r[2] / r[3] for r in rows if r[3] > 0.5]
@@ -944,6 +976,11 @@ def report(ref_path, tgt_path, res, combined, Fr, Ft, args):
         if m['excluded']:
             p(f'! {tag}排除 {len(m["excluded"])} 趟不是直線的 B3/B4: '
               + ', '.join(m['excluded'][:4]) + (' ...' if len(m['excluded']) > 4 else ''))
+        if m['low_spin']:
+            p(f'! {tag} B1 有 {len(m["low_spin"])} 趟是低轉速狀態 (車體轉速只有典型值的 '
+              + ', '.join(f'{x["gain_frac"]:.0%}' for x in m['low_spin']) + ') —— '
+              + ('留著 (--keep-low-spin)' if m['low_spin_kept'] else '已排除, 見檔頭')
+              + ': ' + ', '.join(x['name'].replace('B1 spin_hold ', '') for x in m['low_spin']))
         if m['spin_trials'] and m['no_effort'] == m['spin_trials']:
             problems.append(f'{tag}沒有扭矩回授 (*_effort 全是 NaN)。模擬: /joint_states 有沒有 effort? '
                             '實體車: collect_data_node 要給 wheel_feedback_topic:=/wheel_feedback')
@@ -1140,6 +1177,8 @@ def main():
     ap.add_argument('--max-sigma', type=float, default=None,
                     help='感測器 _sigma 上限 (lid 預設 0.0025, 其他不濾)')
     ap.add_argument('--max-age', type=float, default=0.3, help='感測器 _age 上限 [s]')
+    ap.add_argument('--keep-low-spin', action='store_true',
+                    help='B1 低轉速狀態的趟次也用 (預設排除, 見檔頭)')
     ap.add_argument('--tol', type=float, default=0.05,
                     help='比值在 1±tol 之內算「差不多」')
     ap.add_argument('--boot', type=int, default=1000, help='bootstrap 次數')
@@ -1208,7 +1247,8 @@ def main():
         motor = Motor(args.torque_limit, args.no_load_speed, args.rated_speed,
                       args.rated_torque)
         return {p: extract(load(p, source), args.wheel_radius, motor,
-                           loss_correction=not args.no_loss_correction)
+                           loss_correction=not args.no_loss_correction,
+                           keep_low_spin=args.keep_low_spin)
                 for p in paths}
 
     feats = run(args.source)
@@ -1256,7 +1296,9 @@ def main():
         results[tp] = {'summary': out, 'combined': combined, 'features': res,
                        'ground_friction': ground, 'loc_quality': lq, 'motor': motor,
                        'excluded': {'ref': Fr['_meta']['excluded'],
-                                    'target': Ft['_meta']['excluded']}}
+                                    'target': Ft['_meta']['excluded']},
+                       'low_spin': {'ref': Fr['_meta']['low_spin'],
+                                    'target': Ft['_meta']['low_spin']}}
     if args.json:
         with open(args.json, 'w') as f:
             json.dump({'ref': args.ref, 'source': args.source, 'results': results}, f,

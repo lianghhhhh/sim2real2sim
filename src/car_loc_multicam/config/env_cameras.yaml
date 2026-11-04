@@ -1,0 +1,79 @@
+# 由 scripts/export_from_usd.py 從 kros_car_new.usd 匯出, 別手改 —— 相機動了就重跑。
+# 內參是 render 解析度 width x height 下的值 (Isaac 的 USD 相機是方形像素, fy = fx)。
+# 外參 usd_quat_wxyz = USD 相機 (-Z 朝前, +Y 朝上) 的世界姿態; camera_model.py 會轉成 OpenCV。
+# 實體相機改用 rvec / tvec (solvePnP 的輸出), 見 README「實體相機」。
+width: 1456
+height: 1088
+cameras:
+  - name: env_cam_0
+    image_topic: /env_cam_0/rgb
+    detection_topic: /env_cam_0/car_bbox
+    fx: 808.5000
+    fy: 808.5000
+    cx: 728.0000
+    cy: 544.0000
+    position: [4.7300, 0.0000, 2.7500]
+    usd_quat_wxyz: [0.580287795, 0.404061969, 0.404061969, 0.580287795]
+  - name: env_cam_1
+    image_topic: /env_cam_1/rgb
+    detection_topic: /env_cam_1/car_bbox
+    fx: 808.5000
+    fy: 808.5000
+    cx: 728.0000
+    cy: 544.0000
+    position: [4.7300, 3.1900, 2.7500]
+    usd_quat_wxyz: [0.377631483, 0.278922949, 0.524577772, 0.710221524]
+  - name: env_cam_2
+    image_topic: /env_cam_2/rgb
+    detection_topic: /env_cam_2/car_bbox
+    fx: 808.5000
+    fy: 808.5000
+    cx: 728.0000
+    cy: 544.0000
+    position: [0.0000, 3.1900, 2.7500]
+    usd_quat_wxyz: [0.000000000, 0.000000000, -0.509792355, -0.860297480]
+  - name: env_cam_3
+    image_topic: /env_cam_3/rgb
+    detection_topic: /env_cam_3/car_bbox
+    fx: 808.5000
+    fy: 808.5000
+    cx: 728.0000
+    cy: 544.0000
+    position: [-4.7300, 3.1900, 2.7500]
+    usd_quat_wxyz: [0.377631483, 0.278922949, -0.524577772, -0.710221524]
+  - name: env_cam_4
+    image_topic: /env_cam_4/rgb
+    detection_topic: /env_cam_4/car_bbox
+    fx: 808.5000
+    fy: 808.5000
+    cx: 728.0000
+    cy: 544.0000
+    position: [-4.7300, 0.0000, 2.7500]
+    usd_quat_wxyz: [0.580287795, 0.404061969, -0.404061969, -0.580287795]
+  - name: env_cam_5
+    image_topic: /env_cam_5/rgb
+    detection_topic: /env_cam_5/car_bbox
+    fx: 808.5000
+    fy: 808.5000
+    cx: 728.0000
+    cy: 544.0000
+    position: [-4.7300, -3.1900, 2.7500]
+    usd_quat_wxyz: [0.710221524, 0.524577772, -0.278922949, -0.377631483]
+  - name: env_cam_6
+    image_topic: /env_cam_6/rgb
+    detection_topic: /env_cam_6/car_bbox
+    fx: 808.5000
+    fy: 808.5000
+    cx: 728.0000
+    cy: 544.0000
+    position: [0.0000, -3.1900, 2.7500]
+    usd_quat_wxyz: [0.860297480, 0.509792355, 0.000000000, 0.000000000]
+  - name: env_cam_7
+    image_topic: /env_cam_7/rgb
+    detection_topic: /env_cam_7/car_bbox
+    fx: 808.5000
+    fy: 808.5000
+    cx: 728.0000
+    cy: 544.0000
+    position: [4.7300, -3.1900, 2.7500]
+    usd_quat_wxyz: [0.710221524, 0.524577772, 0.278922949, 0.377631483]

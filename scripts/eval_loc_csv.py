@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""拿 collect_data_node 記的 CSV 算五條定位線的誤差。不需要 ROS。
+"""拿 collect_data_node 記的 CSV 算六條定位線的誤差。不需要 ROS。
 
     ./scripts/eval_loc_csv.py                       # 預設 car_run_data/sim_data.csv
     ./scripts/eval_loc_csv.py path/to/run.csv
@@ -20,7 +20,7 @@
 
 所以: `lid` 用 sigma 門檻與追丟率; `cam` 依**車速**分組看 yaw; `imu`/`whl` 看
 漂移率; `fus` 看「估計走過的路徑長 vs ground truth 走過的距離」(它的失效模式是
-**凍結**, 不是變不準)。細節見 SIGMA_GATE_APPLIES 那一段的註解。
+**凍結**, 不是變不準; `mc` 同一套)。細節見 SIGMA_GATE_APPLIES 那一段的註解。
 
 為什麼要過濾, 以及為什麼是這兩個條件
 ------------------------------------
@@ -61,7 +61,8 @@ except ImportError:
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CSV = os.path.join(REPO, 'car_run_data', 'sim_data.csv')
 SOURCES = (('lid', 'LiDAR'), ('cam', '相機'), ('imu', 'IMU'),
-           ('whl', 'IMU+輪速'), ('fus', '融合 (方法五)'))
+           ('whl', 'IMU+輪速'), ('fus', '融合 (方法五)'),
+           ('mc', '多相機 (方法六)'))
 
 # 每一條路線要用**不一樣的**判讀方式。用同一套會得到完全錯誤的結論:
 #
@@ -74,11 +75,18 @@ SOURCES = (('lid', 'LiDAR'), ('cam', '相機'), ('imu', 'IMU'),
 #   imu/whl  航位推算, 沒有絕對參考 -> 看漂移率
 #   fus  絕對定位, 但它的失效模式是**凍結** (P 被壓垮之後所有量測都被擋掉) ->
 #        看「估計走過的路徑長 vs ground truth 走過的距離」
+#   mc   跟 fus 同一個濾波器 (car_loc_multicam 繼承 FusionLocalizer), 一樣看凍結
 SIGMA_GATE_APPLIES = ('lid',)
 
 
 def wrap_deg(a):
     return np.degrees(np.arctan2(np.sin(a), np.cos(a)))
+
+
+def gt_path(df):
+    """ground truth 走過的距離 (m)。沒有 GT 的列跳過, 不然一個 NaN 整個加總就是 NaN。"""
+    g = df[['car_position_x', 'car_position_y']].dropna().values
+    return float(np.hypot(*np.diff(g, axis=0).T).sum())
 
 
 def prep(df, pre):
@@ -120,7 +128,8 @@ def main():
     if not os.path.isfile(a.csv):
         sys.exit(f'找不到 {a.csv}')
     df = pd.read_csv(a.csv)
-    df['t'] = df.odom_stamp - df.odom_stamp.iloc[0]
+    # 開頭幾列可能還沒收到 /odom (collect_data_node 不等 GT 就開始記) -> 取第一個有值的
+    df['t'] = df.odom_stamp - df.odom_stamp.dropna().iloc[0]
     df['w'] = df.car_angular_velocity_z.abs()
     print(f'{a.csv}')
     print(f'  {len(df)} 列, {df.t.max():.1f} s, '
@@ -137,7 +146,7 @@ def main():
     if off:
         print(f'  沒開的來源 (整欄 NaN, 略過): {", ".join(off)}')
     if not live:
-        sys.exit('四條定位線都沒有資料 —— 是不是只跑了 collect_data_node?')
+        sys.exit('所有定位線都沒有資料 —— 是不是只跑了 collect_data_node?')
 
     for pre, name in SOURCES:
         if pre not in live:
@@ -169,8 +178,7 @@ def main():
             # 航位推算沒有絕對參考, 所以下面那些「追丟 / sigma 門檻」的概念
             # 對它們不成立: sigma 是單調長大的共變異數, 不是「這一幀不可信」的
             # 指標, 拿它當門檻只是在切「跑了多久」。看它們要看漂移率。
-            gt_d = float(np.hypot(np.diff(df.car_position_x),
-                                  np.diff(df.car_position_y)).sum())
+            gt_d = gt_path(df)
             print(f'  ground truth 走了 {gt_d:.1f} m -> 漂移率 '
                   f'(最大誤差/距離) {100 * df[pre + "_e"].max() / max(gt_d, 1e-6):.2f}%'
                   f', 結束時 {100 * df[pre + "_e"].iloc[-1] / max(gt_d, 1e-6):.2f}%')
@@ -207,15 +215,14 @@ def main():
                   '(見 car_loc_camera/config/camera_ground.yaml)。')
             continue
 
-        if pre == 'fus':
+        if pre in ('fus', 'mc'):
             # 融合的失效模式是**凍結**: 某個來源的時鐘偏掉 -> 緩衝區清不掉 ->
             # 整段歷史被重複套用 -> P 被壓垮 -> 之後所有量測都被閘門擋掉。
             # 那時候位置誤差大得很難看, 但真正的證據是「它根本沒有動過」。
             # 有 NaN 的列要跳過 —— sum() 遇到一個 NaN 整個結果就是 NaN
-            xy = df[['fus_x', 'fus_y']].dropna()
-            path = float(np.hypot(np.diff(xy.fus_x), np.diff(xy.fus_y)).sum())
-            gt_d = float(np.hypot(np.diff(df.car_position_x),
-                                  np.diff(df.car_position_y)).sum())
+            xy = df[[pre + '_x', pre + '_y']].dropna().values
+            path = float(np.hypot(*np.diff(xy, axis=0).T).sum())
+            gt_d = gt_path(df)
             print(f'  估計走過的路徑長 {path:.2f} m vs ground truth {gt_d:.1f} m'
                   f'  (比值 {path / max(gt_d, 1e-6):.3f})')
             if gt_d > 5.0 and path < 0.2 * gt_d:
@@ -223,7 +230,7 @@ def main():
                 print('     某個來源的時鐘偏掉 (看上面的時戳警告), 而且要確認')
                 print('     car_loc_fusion 有 rebuild —— 舊版沒有時鐘偵測。')
                 print(f'     另一個證據: 濾波器自己報的 sigma 中位數是 '
-                      f'{f.fus_sigma.median() * 1000:.2f} mm (< 1 mm 就是它'
+                      f'{f[pre + "_sigma"].median() * 1000:.2f} mm (< 1 mm 就是它'
                       f'「非常確定」自己停在原地)。')
             continue
 

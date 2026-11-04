@@ -14,6 +14,7 @@
   <exec_depend>car_loc_imu</exec_depend>
   <exec_depend>car_loc_wheel</exec_depend>
   <exec_depend>car_loc_fusion</exec_depend>
+  <exec_depend>car_loc_multicam</exec_depend>
   <exec_depend>car_teleop</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
 

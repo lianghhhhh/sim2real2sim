@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""方法五: 把現有的所有感測器結合起來定位。
+"""方法五的骨架: IMU + 輪速遞推, 絕對位姿修正。
 
     /imu          ─┐
     /joint_states ─┴─> 遞推 (60~200 Hz, 連續、不會斷)  ──┐
                                                           ├─> 7 維 EKF ─> /fusion_loc/odom
-    /camera_loc/odom (相機+YOLO, 30 Hz, 延遲 80 ms) ──┐   │              /fusion_loc/pose
-    /lidar_loc/odom  (LiDAR 對地圖, 10 Hz)          ─┴───┘              TF map->base_link
+    /lidar_loc/odom (LiDAR 對地圖, 10 Hz) ────────────────┤              /fusion_loc/pose
+    /env_cam_i/car_bbox (8 台斜拍相機) ───────────────────┘              TF map->base_link
                      絕對量測 (不漂, 但會斷)
 
-這個節點**訂閱另外兩條定位線的輸出**, 不自己跑 YOLO 也不自己做掃描配準。
-所以跑之前那兩條要先開起來 (launch 檔會一起開)。
+**方法五實際跑的是這個類別的子類別 `car_loc_multicam.fusion_node.MultiCamLocalizer`**,
+它多吃 8 台相機的框 (`fusion_loc.launch.py` 開的就是它)。這裡只放不分相機種類的部分,
+所以單獨 `ros2 run car_loc_fusion fusion_localizer` 只有 LiDAR + IMU + 輪速。
 
-為什麼是「訂閱它們的輸出」而不是「自己吃原始感測器」
-----------------------------------------------------
-鬆耦合 (loosely coupled)。緊耦合 (把雷射點雲與 YOLO 像素直接放進同一個濾波器)
+`/camera_loc/odom` (方法一的單一天花板相機) 不再是輸入: `camera_enabled` 預設關掉,
+程式碼留著是因為 `AbsMeas` 那條路 LiDAR 也在走, 而且離線測試拿它當通用的絕對量測來源。
+
+為什麼 LiDAR 是「訂閱它的輸出」而不是「自己吃原始感測器」
+--------------------------------------------------------
+鬆耦合 (loosely coupled)。緊耦合 (把雷射點雲直接放進同一個濾波器)
 理論上更準, 但它有兩個在這個 repo 裡很貴的代價:
 
 1. **沒辦法單獨評估任何一種感測器了。** 四條獨立的路線是這個 repo 的資產,
@@ -43,6 +47,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, JointState
+from std_msgs.msg import Float32
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
@@ -55,6 +60,9 @@ from .sources import AbsSource
 
 QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                  history=HistoryPolicy.KEEP_LAST, depth=50)
+
+# /imu 的時戳比上一則舊超過這麼多 (s) = 模擬時間倒退 (Isaac 按了 Stop 再 Play)
+TIME_JUMP_BACK = 1.0
 
 
 def stamp_sec(s) -> float:
@@ -74,6 +82,9 @@ class FusionLocalizer(Node):
         p('lidar_topic', '/lidar_loc/odom')
         p('odom_topic', '/fusion_loc/odom')
         p('pose_topic', '/fusion_loc/pose')
+        # 「上一則被採用的絕對量測是幾秒前」(std_msgs/Float32)。控制端拿它判斷定位能不能信:
+        # 絕對量測全斷的時候只剩遞推, 而遞推的 sigma 不一定誠實 (見 README [I])。
+        p('abs_age_topic', '/fusion_loc/abs_age')
         p('map_frame', 'map')
         p('base_frame', 'base_link')
         p('publish_tf', True)
@@ -116,6 +127,7 @@ class FusionLocalizer(Node):
         p('sigma_acc', 0.05)
         p('sigma_acc_omega', 0.15)
         p('sigma_cross', 0.02)
+        p('sigma_cross_omega', 0.0)      # 側向雜訊隨轉速加大的部分, 見 fusion_loc.yaml
         p('sigma_bg', 1.0e-4)
         p('sigma_ba', 1.0e-3)
         p('sigma_k', 0.0)
@@ -148,7 +160,8 @@ class FusionLocalizer(Node):
         p('chi2_scale', 1.0)
 
         # 每個來源的收件政策 —— 三道防線都**不看濾波器狀態**, 見 sources.py
-        p('camera_enabled', True)
+        # 單一天花板相機不再是方法五的輸入 (換成多相機, 見 car_loc_multicam)
+        p('camera_enabled', False)
         p('camera_sigma_floor', 0.03)    # 相機 2.1 cm (單軸) 的保守下限
         p('camera_sigma_max', 0.0)       # 相機沒有「鎖到對稱解」這種失效模式
         p('camera_r_inflate', 1.5)
@@ -268,6 +281,7 @@ class FusionLocalizer(Node):
         self.pub_odom = self.create_publisher(Odometry, g('odom_topic').value, 10)
         self.pub_pose = self.create_publisher(
             PoseWithCovarianceStamped, g('pose_topic').value, 10)
+        self.pub_age = self.create_publisher(Float32, g('abs_age_topic').value, 10)
         self.tf = TransformBroadcaster(self) if g('publish_tf').value else None
 
         self.create_subscription(Imu, g('imu_topic').value, self.on_imu, QOS)
@@ -281,9 +295,9 @@ class FusionLocalizer(Node):
         self.create_timer(max(float(g('status_period').value), 0.5), self.status)
 
         self.get_logger().info(
-            '方法五 (全感測器融合) 啟動 —— 遞推吃 /imu + /joint_states, '
-            f"絕對量測吃 {g('camera_topic').value} 與 {g('lidar_topic').value}。"
-            '那兩條要另外開起來 (fusion_loc.launch.py 會一起開)。')
+            '方法五 (全感測器融合) 啟動 —— 遞推吃 /imu + /joint_states, 絕對量測吃 '
+            + ' 與 '.join(g(f'{k}_topic').value for k, s in self.src.items() if s.enabled)
+            + ' (fusion_loc.launch.py 會把來源一起開)。')
 
     def _lever_arm(self):
         """要補償的 IMU 槓桿臂 [x, y]; 模擬裡預設是 0 (見 imu_lever_arm_in_sim)。"""
@@ -312,6 +326,7 @@ class FusionLocalizer(Node):
             sigma_acc=float(g('sigma_acc').value),
             sigma_acc_omega=float(g('sigma_acc_omega').value),
             sigma_cross=float(g('sigma_cross').value),
+            sigma_cross_omega=float(g('sigma_cross_omega').value),
             sigma_bg=float(g('sigma_bg').value),
             sigma_ba=float(g('sigma_ba').value),
             sigma_k=float(g('sigma_k').value),
@@ -327,15 +342,35 @@ class FusionLocalizer(Node):
             v_max=float(g('v_max').value),
             max_pos_correction=float(g('max_pos_correction').value))
 
-    def on_reset(self, req, res):
+    def _reset_state(self):
+        """回到剛開機的狀態: 重新靜止校正、重新量時鐘偏移、等下一則絕對量測當起點。
+
+        ~/reset 與「模擬時間倒退」都走這裡。以前 ~/reset 沒有清 t0, 開機超過
+        calib_timeout 秒之後重設, 第一則 IMU 就判逾時、零偏當 0 開始推; 也沒清時鐘偏移,
+        Isaac 重新 Play 之後舊的偏移還在。
+        """
+        g = self.get_parameter
         self.ekf = self._make_ekf()
         self.started = self.calib_done = False
         self.calib_buf.clear()
-        self.calib_start = None
+        self.calib_start = self.t0 = None
+        self.last_t = None
+        self.pending_wheel = None
+        self.t_wheel = -1e9
         self.travelled = 0.0
         self._last_pos = None
+        self.det = WheelStillDetector(wheel_th=float(g('still_wheel').value),
+                                      gyro_th=float(g('still_gyro').value),
+                                      window=float(g('still_window').value))
+        self.tilt = TiltTracker(alpha=float(g('tilt_alpha').value))
+        self.lever = LeverArm(self._lever_arm())
         for s in self.src.values():
-            s.last_used = None
+            s.reset_clock()
+        self._clock_warned.clear()
+        self._init_clock_warned.clear()
+
+    def on_reset(self, req, res):
+        self._reset_state()
         res.success = True
         res.message = '已重設 —— 會重新做靜止校正, 並用下一則絕對量測當起點'
         self.get_logger().warn(res.message)
@@ -368,6 +403,13 @@ class FusionLocalizer(Node):
     def on_imu(self, msg: Imu):
         t = stamp_sec(msg.header.stamp)
         self.n_imu += 1
+        if self.last_t is not None and t < self.last_t - TIME_JUMP_BACK:
+            # Isaac 按了 Stop 再 Play。不處理的話 WheelIns 會把 t < ins.t 的每一則都丟掉,
+            # 估計凍在原地、sigma 不長大, 但照樣在發 (下游完全看不出來)。
+            self.get_logger().warn(
+                f'/imu 時戳倒退 ({self.last_t:.1f} -> {t:.1f} s, Isaac 重新 Play?) '
+                '—— 整個重設: 重新靜止校正、重新量時鐘、等下一則絕對量測當起點')
+            self._reset_state()
         gyro = np.array([msg.angular_velocity.x, msg.angular_velocity.y,
                          msg.angular_velocity.z])
         acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y,
@@ -410,7 +452,8 @@ class FusionLocalizer(Node):
                            v_wheel=v_wheel, spread=(spread or 0.0),
                            still=(still and self.en['zupt']),
                            yaw_meas=yaw_meas, yaw_sigma=self.imu_yaw_sigma,
-                           dt=(dt or 0.0)))
+                           dt=(dt or 0.0), zaru=self.en['zaru'],
+                           anchor=self.en['anchor']))
 
         if self.en['wheel'] and t - self.t_wheel > self.wheel_timeout:
             if not self.wheel_warned:
@@ -478,6 +521,8 @@ class FusionLocalizer(Node):
         if first and not self.started:
             # 還在做靜止校正 —— 先不要用, 不然零偏還沒量完就開始跑
             return
+        if first and not self._may_seed(which):
+            return
         if (first and not s.clock_locked and ref_t is not None
                 and abs(t - ref_t) > s.clock_max_offset):
             # 時鐘偏移還沒量完, 這一則又跟 IMU 時鐘差一大截 -> 不能拿來當起點。
@@ -497,6 +542,10 @@ class FusionLocalizer(Node):
                     '—— 融合不需要 initial_pose, 這是它相對於純航位推算的差別。')
         else:
             s.counts['gate'] += 1
+
+    def _may_seed(self, which: str) -> bool:
+        """這個來源可不可以當起點。子類別有更可靠的起點來源時覆寫。"""
+        return True
 
     # ------------------------------------------------------------------
     def _forward_accel(self, msg, gyro, acc, dt, still) -> float:
@@ -566,8 +615,8 @@ class FusionLocalizer(Node):
         self.calib_done = self.started = True
         if self.wait_for_absolute:
             self.get_logger().info(
-                '等第一則絕對量測當起點 (相機或 LiDAR)。'
-                '真的沒有那兩條的話用 wait_for_absolute:=false + initial_pose。')
+                '等第一則絕對量測當起點 (多相機或 LiDAR)。'
+                '真的都沒有的話用 wait_for_absolute:=false + initial_pose。')
             return
         ip = self.initial_pose
         yaw = math.radians(ip[2])
@@ -606,6 +655,11 @@ class FusionLocalizer(Node):
         pc.pose.covariance = od.pose.covariance
         self.pub_pose.publish(pc)
 
+        age = Float32()
+        la, ti = self.ekf.last_abs_t, self.ekf.ins.t
+        age.data = float(ti - la) if (la is not None and ti is not None) else 1e9
+        self.pub_age.publish(age)
+
         if self.tf is not None:
             tfm = TransformStamped()
             tfm.header.stamp = msg.header.stamp
@@ -627,7 +681,7 @@ class FusionLocalizer(Node):
         if not self.ekf.initialized:
             self.get_logger().warn(
                 f'還沒有起點 —— 在等第一則絕對量測。來源: {srcs} '
-                '(兩條都沒有的話, 是那兩個節點沒開, 或 topic 名字不對)')
+                '(都沒有的話, 是來源的節點沒開, 或 topic 名字不對)')
             return
         c = self.ekf.ins.counts
         self.get_logger().info(

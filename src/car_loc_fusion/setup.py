@@ -19,7 +19,7 @@ setup(
     zip_safe=True,
     maintainer='liangh',
     maintainer_email='selenahuang0218@gmail.com',
-    description='方法五: 結合所有感測器 (相機 + LiDAR + IMU + 輪速) 的融合定位',
+    description='方法五: 結合所有感測器 (多相機 + LiDAR + IMU + 輪速) 的融合定位',
     license='MIT',
     extras_require={'test': ['pytest']},
     entry_points={

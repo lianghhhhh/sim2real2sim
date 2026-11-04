@@ -45,6 +45,14 @@ lidar_localizer:
     min_inlier_ratio: 0.50
     max_residual: 0.25
     max_failures: 8
+    # 掃描斷了超過這麼久 (s) 就重新全域定位, 不拿等速外推當預測。2026-11-03 Isaac 的
+    # render 斷了 51 秒, 中間零星幾幀配到 4~5 m 外的局部解, sigma 卻只有 1.3 mm。
+    scan_gap_reset: 1.0
+    # 全域定位剛成功的這幾幀 (10 Hz -> 1 s), 回報的位置 sigma 至少 settle_sigma (m)。
+    # 對稱解的殘差跟真值一樣漂亮, 剛找到的解還不能信; 融合 (lidar_sigma_max 2.5 mm)
+    # 與 eval_loc_csv.py (sigma < 2.5 mm) 都會把這幾幀當成「追丟」。
+    settle_scans: 10
+    settle_sigma: 0.05
 
     # 鎖死偵測: 追丟之後鎖到 180 度對稱解, 殘差 3~7 cm / inlier 52~77% 還是過得了
     # 上面那兩個門檻, 永遠不會連續失敗 max_failures 次 -> 永遠不會重定位。
