@@ -18,10 +18,10 @@ base_controller:
     right_wheel_names: ["front_right_joint", "rear_right_joint"]
 
     wheel_separation: 0.274
-    wheel_separation_multiplier: 2.254
+    wheel_separation_multiplier: 2.153867
 
 
-    wheel_radius: 0.0506
+    wheel_radius: 0.051356
 
     publish_rate: 50.0
     odom_frame_id: odom

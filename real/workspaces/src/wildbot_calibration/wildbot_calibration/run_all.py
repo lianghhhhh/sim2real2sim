@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
+import signal
+import subprocess
 import sys
 
 from wildbot_calibration.common import prompts
 from wildbot_calibration.common import yaml_store
-
-from wildbot_calibration import imu_axis_sanity
-from wildbot_calibration import imu_static_calibration
-from wildbot_calibration import wheel_linear_calibration
-from wildbot_calibration import wheel_angular_calibration
-from wildbot_calibration import imu_accel_two_face
 
 
 # Order rationale:
@@ -21,12 +17,30 @@ from wildbot_calibration import imu_accel_two_face
 #  4. wheel_angular — uses IMU yaw integration (needs step 2)
 #  5. accel_two_face — order-independent, last
 STEPS = [
-    ("imu_axis_sanity", imu_axis_sanity.main),
-    ("imu_static_calibration", imu_static_calibration.main),
-    ("wheel_linear_calibration", wheel_linear_calibration.main),
-    ("wheel_angular_calibration", wheel_angular_calibration.main),
-    ("imu_accel_two_face", imu_accel_two_face.main),
+    "imu_axis_sanity",
+    "imu_static_calibration",
+    "wheel_linear_calibration",
+    "wheel_angular_calibration",
+    "imu_accel_two_face",
 ]
+
+
+def _run_step(name: str) -> int:
+    """Run one step in a fresh interpreter and return its exit code.
+
+    rclpy keeps process-global state (default context, global executor) that a
+    Ctrl+C-triggered shutdown leaves half torn down, and MotionPublisher adds
+    signal/atexit hooks per run. A separate process per step keeps every step
+    starting from a clean rclpy.init().
+    """
+    proc = subprocess.Popen([sys.executable, "-m", f"wildbot_calibration.{name}"])
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            # Ctrl+C also reaches the step itself, which brakes and exits;
+            # keep waiting for it instead of abandoning a moving robot.
+            continue
 
 
 def _prompt_run_or_skip(name: str, idx: int, total: int) -> bool:
@@ -86,7 +100,7 @@ def main() -> None:
     print()
 
     total = len(STEPS)
-    for idx, (name, fn) in enumerate(STEPS, start=1):
+    for idx, name in enumerate(STEPS, start=1):
         try:
             run = _prompt_run_or_skip(name, idx, total)
         except KeyboardInterrupt:
@@ -102,16 +116,13 @@ def main() -> None:
                     print("  結束 wizard。")
                     break
             continue
-        try:
-            fn()
-        except KeyboardInterrupt:
+        rc = _run_step(name)
+        if rc in (130, -signal.SIGINT):
             print(f"\n  {name} 被中斷。")
             if not prompts.confirm("  繼續下一步驟?", default=False):
                 break
-        except SystemExit:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            print(f"  ✗ {name} 拋出例外:{exc}")
+        elif rc != 0:
+            print(f"  ✗ {name} 異常結束(exit code {rc}),錯誤訊息見上方。")
             if not prompts.confirm("  忽略並繼續?", default=False):
                 break
         else:

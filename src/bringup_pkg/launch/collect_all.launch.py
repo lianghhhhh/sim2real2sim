@@ -127,10 +127,35 @@ def generate_launch_description():
                                           '會關掉 (calibrate_env_node 自己帶一個)'),
         DeclareLaunchArgument('output_dir', default_value='/workspaces/car_run_data'),
         DeclareLaunchArgument('csv_filename', default_value='all_loc.csv'),
+        # ---- 感測器 topic 與 IMU 模式 (imu_ / whl_ / fus_ 三條與 collector 共用) ----
+        # 預設值跟 imu_loc.yaml / wheel_loc.yaml / fusion_loc.yaml 一樣 (模擬)。
+        # 實體車: imu_topic:=/imu/data joint_states_topic:=/wheel_feedback
+        #         gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35
+        DeclareLaunchArgument('imu_topic', default_value='/imu',
+                              description='實體車是 /imu/data'),
+        DeclareLaunchArgument('joint_states_topic', default_value='/joint_states',
+                              description='輪速 / 扭矩回授; 實體車用 /wheel_feedback'),
+        DeclareLaunchArgument('gravity_mode', default_value='orientation',
+                              description='實體車 6 軸 IMU 用 complementary'),
+        DeclareLaunchArgument('yaw_source', default_value='imu_orientation',
+                              description='實體車用 gyro'),
+        DeclareLaunchArgument('fusion_sigma_acc', default_value='0.05',
+                              description='fus_ 的加速度過程雜訊; complementary 模式要 0.35'),
+        DeclareLaunchArgument('wheel_scale', default_value='1.0',
+                              description='whl_ / fus_ 的有效輪半徑比例 (實體輪徑 / 0.05035)'),
     ]
     use_sim_time = LaunchConfiguration('use_sim_time')
     initial_pose = ParameterValue(
         LaunchConfiguration('imu_initial_pose'), value_type=List[float])
+    imu_mode = {
+        'imu_topic': LaunchConfiguration('imu_topic'),
+        'gravity_mode': LaunchConfiguration('gravity_mode'),
+        'yaw_source': LaunchConfiguration('yaw_source'),
+    }
+    wheel_input = {
+        'joint_states_topic': LaunchConfiguration('joint_states_topic'),
+        'wheel_scale': ParameterValue(LaunchConfiguration('wheel_scale'), value_type=float),
+    }
 
     def owns_tf(who):
         # 字串比較要在 launch 展開之後才做得到, 所以包成 PythonExpression。
@@ -175,6 +200,7 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'publish_tf': owns_tf('imu'),
             'initial_pose': initial_pose,
+            **imu_mode,
         }])
 
     # imu_ 與 whl_ 要**同時開**才有意義 —— 這一組是拿來直接回答「加了輪速值多少」
@@ -187,6 +213,7 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'publish_tf': owns_tf('wheel'),
             'initial_pose': initial_pose,
+            **imu_mode, **wheel_input,
         }])
 
     # 8 台相機的偵測, **只有這一個**: fusion (fus_) 與方法六 (mc_) 共用同一份框。
@@ -221,6 +248,9 @@ def generate_launch_description():
             **multicam_base, **fusion_base,
             'use_sim_time': use_sim_time,
             'publish_tf': owns_tf('fusion'),
+            **imu_mode, **wheel_input,
+            'sigma_acc': ParameterValue(
+                LaunchConfiguration('fusion_sigma_acc'), value_type=float),
             'multicam_enabled': ParameterValue(
                 LaunchConfiguration('multicam'), value_type=bool),
             'lidar_enabled': ParameterValue(
@@ -239,6 +269,9 @@ def generate_launch_description():
             **fusion_base, **multicam_base,
             'use_sim_time': use_sim_time,
             'publish_tf': owns_tf('multicam'),
+            **imu_mode, **wheel_input,
+            'sigma_acc': ParameterValue(
+                LaunchConfiguration('fusion_sigma_acc'), value_type=float),
             'lidar_enabled': False,
             'publish_markers': False,
         }])
@@ -253,6 +286,8 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'output_dir': LaunchConfiguration('output_dir'),
             'csv_filename': LaunchConfiguration('csv_filename'),
+            'imu_topic': LaunchConfiguration('imu_topic'),
+            'wheel_feedback_topic': LaunchConfiguration('joint_states_topic'),
         }])
 
     # 鍵盤那一端要另開 terminal: ros2 run car_teleop teleop_key

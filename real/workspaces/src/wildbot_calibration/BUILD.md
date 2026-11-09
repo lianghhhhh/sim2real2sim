@@ -77,19 +77,18 @@ ros2 launch wildbot_calibration run_all.launch.py
 | `IMU_TOPIC` | `/imu/data` | `wildbot_imu/src/wildbot_imu_node.cpp:70` |
 | `BASE_FRAME` | `base_link` | `kros_car/config/controllers.yaml:27` |
 | `IMU_FRAME` | `imu_link` | `wildbot_imu/launch/imu.launch.py:29` |
-| `WHEEL_RADIUS_NOMINAL` | `0.05035` m | `kros_car/config/controllers.yaml:23` |
-| `WHEEL_SEPARATION_MULTIPLIER_NOMINAL` | `2.21` | `kros_car/config/controllers.yaml:20` |
+| `wheel_radius`、`wheel_separation_multiplier` | 執行時讀取 | `/base_controller/get_parameters`(controller 當下實際使用的值) |
 | `NUM_REVOLUTIONS` | `5` | `wildbot_calibration` 自訂(可改) |
 
-**如果你日後改了 controller 設定 / 換了 IMU driver,請去對應腳本檔案頂端常數區塊更新,然後重新 `colcon build`。**
+**輪徑 / 輪距 multiplier 在執行時從 controller 讀取,改 `controllers.yaml` 不需要動腳本。換 topic 或 IMU driver 時,才需要去腳本頂端常數區塊更新,然後重新 `colcon build`。**
 
 ### 為什麼校正 multiplier 而不是 wheel_separation 本身?
 
 `kros_car/config/controllers.yaml` 同時設了:
 - `wheel_separation: 0.274` (URDF 物理值)
-- `wheel_separation_multiplier: 2.21` (校正用 trim)
+- `wheel_separation_multiplier` (校正用 trim)
 
-`diff_drive_controller` 真正使用的 effective separation 是 `0.274 × 2.21 = 0.60554 m`。本 package 把 multiplier 視為要校正的旋鈕,base 值保持不動。
+`diff_drive_controller` 真正使用的 effective separation 是 `wheel_separation × wheel_separation_multiplier`。本 package 把 multiplier 視為要校正的旋鈕,base 值保持不動。
 
 ## 結果輸出
 

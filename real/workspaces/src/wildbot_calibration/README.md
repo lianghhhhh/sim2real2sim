@@ -44,7 +44,7 @@ imu:
 
 base:
   linear_scale                        # measured / commanded
-  wheel_radius_nominal, wheel_radius_corrected
+  wheel_radius_nominal, wheel_radius_corrected   # nominal = 校正時 controller 使用的值
   angular_scale
   wheel_separation_multiplier_nominal, wheel_separation_multiplier_corrected
   calibrated_at, calibrated_by
@@ -70,7 +70,7 @@ ros2 launch wildbot_calibration run_all.launch.py
 
 ## 設計原則
 
-- **Topic / nominal value 寫死在源碼**,不做 launch argument、不做 ROS parameter、不做 runtime controller config 解析。每個腳本檔案頂端有「discovered constants」區塊,**註解標明來源檔案/行號**,改 controller 設定要回頭改常數重新 build。
+- **Topic 寫死在源碼**,不做 launch argument、不做 ROS parameter。例外:`wheel_radius` / `wheel_separation_multiplier` 執行時從 `/base_controller` 讀取,校正比例才會乘在 controller 實際使用的值上;角度校正會自動併入尚未套用的輪徑修正。每個腳本檔案頂端有「discovered constants」區塊,**註解標明來源檔案/行號**。
 - **單一 YAML source of truth**。`wheel_radius` / `wheel_separation_multiplier` 不會自動修改 `kros_car/config/controllers.yaml`,由使用者依 summary 提示手動更新後重 build。IMU bias / covariance 供 IMU driver 自行讀取。
 - **安全機制**:任何送 cmd_vel 的腳本都裝 atexit + SIGINT/SIGTERM brake,Ctrl+C 後仍會 publish 零 Twist ≥10 次。動作前要 confirm 兩次(含「場地夠嗎」)。
 - **SI 單位儲存**(rad/s、m/s²、m、s)。Summary 換算 deg / mm 給人看。
@@ -86,8 +86,7 @@ ros2 launch wildbot_calibration run_all.launch.py
 | `IMU_TOPIC` | `/imu/data` | `wildbot_imu/src/wildbot_imu_node.cpp:70` |
 | `BASE_FRAME` | `base_link` | `kros_car/config/controllers.yaml:27` |
 | `IMU_FRAME` | `imu_link` | `wildbot_imu/launch/imu.launch.py:29` |
-| `WHEEL_RADIUS_NOMINAL` | `0.05035` m | `kros_car/config/controllers.yaml:23` |
-| `WHEEL_SEPARATION_MULTIPLIER_NOMINAL` | `2.21` | `kros_car/config/controllers.yaml:20` |
+| `wheel_radius`、`wheel_separation_multiplier` | 執行時讀取 | `/base_controller/get_parameters`(controller 當下實際使用的值) |
 | `NUM_REVOLUTIONS` | `5` | 自訂(`wheel_angular_calibration.py`) |
 
 角度校正調整的是 `wheel_separation_multiplier`,不是 base `wheel_separation`,讓 URDF 物理量保持乾淨。

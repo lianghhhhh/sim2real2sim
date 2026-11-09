@@ -13,6 +13,7 @@ from nav_msgs.msg import Odometry
 
 from wildbot_calibration.common import prompts
 from wildbot_calibration.common import yaml_store
+from wildbot_calibration.common.controller_params import get_controller_params
 from wildbot_calibration.common.motion import MotionPublisher
 
 
@@ -26,13 +27,13 @@ from wildbot_calibration.common.motion import MotionPublisher
 #                 (kros_car README.md:45 + L165-167 example)
 #     - odom:    /base_controller/odom (controller default; README.md:46)
 #     - base_frame: config/controllers.yaml:27 "base_link"
-#     - wheel_radius: config/controllers.yaml:23  0.05035 m
+#     - wheel_radius: read live from /base_controller (the value the
+#       controller drove with), not hard-coded.
 # ============================================================
 CMD_VEL_TOPIC = "/base_controller/cmd_vel"
 CMD_VEL_MSG_TYPE = "geometry_msgs/TwistStamped"
 ODOM_TOPIC = "/base_controller/odom"
 BASE_FRAME = "base_link"
-WHEEL_RADIUS_NOMINAL = 0.05035   # meters
 
 DRIVE_LINEAR = 0.1               # m/s
 DRIVE_DURATION = 20.0            # s -> theoretical 2.0 m
@@ -81,12 +82,17 @@ def main() -> None:
     node = _OdomTracker()
     motion = MotionPublisher(node, CMD_VEL_TOPIC, CMD_VEL_MSG_TYPE, BASE_FRAME)
     try:
+        params = get_controller_params(node, ["wheel_radius"])
+        if params is None:
+            return
+        wheel_radius_used = params["wheel_radius"]
+
         prompts.header("輪徑(線性)校正")
         print(f"  將以 {DRIVE_LINEAR:.2f} m/s 直線前進 {DRIVE_DURATION:.0f} 秒,理論 {TARGET_DISTANCE:.2f} m。")
         print("  你會用捲尺實測,我用實測 / 理論算出 wheel_radius 校正係數。")
         print(f"  ⚠️  需要至少 {TARGET_DISTANCE + 1.0:.1f} 公尺以上的直線空間。")
         print(f"  cmd_vel topic = {CMD_VEL_TOPIC} ({CMD_VEL_MSG_TYPE})")
-        print(f"  wheel_radius (nominal) = {WHEEL_RADIUS_NOMINAL} m")
+        print(f"  wheel_radius (controller 目前使用) = {wheel_radius_used} m")
         print()
 
         if not prompts.confirm("  準備好開始?", default=False):
@@ -127,12 +133,12 @@ def main() -> None:
             return
 
         linear_scale = measured / TARGET_DISTANCE
-        wheel_radius_corrected = WHEEL_RADIUS_NOMINAL * linear_scale
-        change_pct = (wheel_radius_corrected - WHEEL_RADIUS_NOMINAL) / WHEEL_RADIUS_NOMINAL * 100.0
+        wheel_radius_corrected = wheel_radius_used * linear_scale
+        change_pct = (linear_scale - 1.0) * 100.0
 
         prompts.header("Summary")
         print(f"  實測 / 理論 = {measured:.4f} / {TARGET_DISTANCE:.4f} = {linear_scale:.6f}")
-        print(f"  wheel_radius:  {WHEEL_RADIUS_NOMINAL:.6f}  ->  {wheel_radius_corrected:.6f} m")
+        print(f"  wheel_radius:  {wheel_radius_used:.6f}  ->  {wheel_radius_corrected:.6f} m")
         print(f"                  (變化 {change_pct:+.2f}%)")
         print()
         if not prompts.confirm("  寫入 YAML?", default=True):
@@ -143,15 +149,18 @@ def main() -> None:
             "base",
             {
                 "linear_scale": float(linear_scale),
-                "wheel_radius_nominal": float(WHEEL_RADIUS_NOMINAL),
+                # "nominal" = the value the controller drove with during this run.
+                "wheel_radius_nominal": float(wheel_radius_used),
                 "wheel_radius_corrected": float(wheel_radius_corrected),
             },
         )
         print(f"  YAML 已更新:{path}")
         print()
         print("  📝 提示:請手動將 controllers.yaml 中的 base_controller.wheel_radius 改成:")
-        print(f"            {WHEEL_RADIUS_NOMINAL}  ->  {wheel_radius_corrected:.6f}")
-        print("     (路徑:kros_car/config/controllers.yaml,line 23)")
+        print(f"            {wheel_radius_used}  ->  {wheel_radius_corrected:.6f}")
+        print("     (路徑:docker/compose/configs/controllers.yaml,改完 docker compose restart kros_car)")
+        print("     若接著跑 wheel_angular_calibration(controller 尚未重啟),")
+        print("     它會自動把這次的輪徑修正一起算進 wheel_separation_multiplier。")
     except KeyboardInterrupt:
         print("\n  使用者中斷,已嘗試煞車。")
     finally:
@@ -159,8 +168,9 @@ def main() -> None:
         try:
             node.destroy_node()
         finally:
-            if rclpy.ok():
-                rclpy.shutdown()
+            # try_shutdown() also clears a context already shut down by Ctrl+C,
+            # so the wizard can rclpy.init() again for the next step.
+            rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

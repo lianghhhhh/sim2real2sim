@@ -9,13 +9,18 @@
 # /s2r/src, so a map saved under /s2r/src/car_loc_lidar/maps stays in the repo.
 # The build output lives in the container and is gone when the first shell exits.
 #
-# PACKAGES selects what to build (default: car_teleop car_loc_lidar).
+# PACKAGES selects what to build. The default is everything the car can use:
+# teleop, the LiDAR / IMU / wheel / fusion localization, and the friction test
+# (calibrate_env_pkg + bringup_pkg). car_loc_multicam is in it because the
+# fusion node lives there, and car_loc_camera because bringup_pkg depends on it;
+# their camera nodes stay off on the car (no environment cameras). car_viz is
+# left out: foxglove_bridge.sh does its job.
 set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S2R_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 NAME=s2r_real
-PACKAGES="${PACKAGES:-car_teleop car_loc_lidar}"
+PACKAGES="${PACKAGES:-car_teleop car_loc_lidar car_loc_imu car_loc_wheel car_loc_fusion car_loc_multicam car_loc_camera calibrate_env_pkg bringup_pkg}"
 
 if docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
     exec docker exec -it "$NAME" bash --rcfile /s2r/.bashrc

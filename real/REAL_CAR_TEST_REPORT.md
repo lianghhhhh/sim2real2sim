@@ -44,6 +44,8 @@
 
 ```bash
 cd tools
+ll /dev/tty* # 查詢 usb 名字
+ll /dev/ #檢查設定完的名稱
 sudo ./create_usb_rule.sh /dev/ttyUSB? usb_wheel          # 車輪 ESP32
 sudo ./create_usb_rule.sh /dev/ttyUSB? oradar             # 光達
 sudo ./create_usb_rule.sh /dev/ttyUSB? imu                # IMU
@@ -372,8 +374,8 @@ ros2 topic hz /wheel_feedback  # 確認輪子回授仍是 50 Hz
 
 | Topic | 有資料 | 頻率 (Hz) |
 | --- | --- | --- |
-| `/scan` | | 13 |
-| `/imu/data` | | x |
+| `/scan` | | 14 |
+| `/imu/data` | | 20 |
 | `/wheel_feedback` | | 50 |
 
 ### 9-3 校正

@@ -13,6 +13,7 @@ from sensor_msgs.msg import Imu
 
 from wildbot_calibration.common import prompts
 from wildbot_calibration.common import yaml_store
+from wildbot_calibration.common.controller_params import get_controller_params
 from wildbot_calibration.common.motion import MotionPublisher
 
 
@@ -23,11 +24,14 @@ from wildbot_calibration.common.motion import MotionPublisher
 #                config/controllers.yaml:8 + README.md:45
 #     - base_frame: config/controllers.yaml:27 "base_link"
 #     - wheel_separation: 0.274 m  (config/controllers.yaml:19)
-#     - wheel_separation_multiplier: 2.21  (config/controllers.yaml:20)
-#       Effective separation = 0.274 * 2.21 = 0.60554 m.
+#     - wheel_separation_multiplier / wheel_radius: read live from
+#       /base_controller (the values the controller turned with).
 #       Per user direction (2026-05-15), we calibrate the *multiplier* and leave
-#       the base wheel_separation alone. So WHEEL_SEPARATION_MULTIPLIER_NOMINAL
-#       is the value to scale; the corrected value goes back into the same line.
+#       the base wheel_separation alone; the corrected value goes back into
+#       the same line.
+#       Yaw rate depends on wheel_radius / effective separation, so a pending
+#       wheel_radius correction (linear calibration done, controller not yet
+#       restarted) is folded into the multiplier too.
 #   Source: wildbot_imu at ../wildbot_imu/
 #     - IMU topic: /imu/data  (src/wildbot_imu_node.cpp:70)
 # ============================================================
@@ -35,13 +39,29 @@ CMD_VEL_TOPIC = "/base_controller/cmd_vel"
 CMD_VEL_MSG_TYPE = "geometry_msgs/TwistStamped"
 IMU_TOPIC = "/imu/data"
 BASE_FRAME = "base_link"
-WHEEL_SEPARATION_MULTIPLIER_NOMINAL = 2.21
 NUM_REVOLUTIONS = 5
 
 DRIVE_ANGULAR = 0.5              # rad/s
 DRIVE_DURATION = NUM_REVOLUTIONS * (2.0 * math.pi) / DRIVE_ANGULAR
 TARGET_DEGREES = NUM_REVOLUTIONS * 360.0
 IMU_TIMEOUT = 5.0
+RADIUS_MATCH_TOL = 1e-6          # relative
+
+
+def _pending_radius_factor(wheel_radius_used: float) -> float:
+    """r_corrected / r_used if a linear calibration ran against this same radius.
+
+    After the controller is restarted with the corrected radius, the stored
+    nominal no longer matches what it uses, so the factor drops back to 1.
+    """
+    base = yaml_store.get_section("base")
+    r_nominal = base.get("wheel_radius_nominal")
+    r_corrected = base.get("wheel_radius_corrected")
+    if r_nominal is None or r_corrected is None:
+        return 1.0
+    if abs(float(r_nominal) - wheel_radius_used) > RADIUS_MATCH_TOL * wheel_radius_used:
+        return 1.0
+    return float(r_corrected) / wheel_radius_used
 
 
 class _YawIntegrator(Node):
@@ -107,13 +127,23 @@ def main() -> None:
     node = _YawIntegrator()
     motion = MotionPublisher(node, CMD_VEL_TOPIC, CMD_VEL_MSG_TYPE, BASE_FRAME)
     try:
+        params = get_controller_params(node, ["wheel_separation_multiplier", "wheel_radius"])
+        if params is None:
+            return
+        multiplier_used = params["wheel_separation_multiplier"]
+        wheel_radius_used = params["wheel_radius"]
+        radius_factor = _pending_radius_factor(wheel_radius_used)
+
         prompts.header("輪距(角度)校正")
         print(f"  將以 {DRIVE_ANGULAR:.2f} rad/s 原地左轉 {NUM_REVOLUTIONS} 圈,約 {DRIVE_DURATION:.1f} 秒。")
         print("  使用 IMU yaw 累積值自動量轉了幾度,不需要人眼判斷。")
         if NUM_REVOLUTIONS < 5:
             print("  ⚠️  圈數 < 5,精度會明顯下降(IMU bias 影響相對變大)。")
         print(f"  cmd_vel = {CMD_VEL_TOPIC}, imu = {IMU_TOPIC}")
-        print(f"  wheel_separation_multiplier (nominal) = {WHEEL_SEPARATION_MULTIPLIER_NOMINAL}")
+        print(f"  controller 目前使用: wheel_separation_multiplier = {multiplier_used}, "
+              f"wheel_radius = {wheel_radius_used}")
+        if radius_factor != 1.0:
+            print(f"  偵測到尚未套用的輪徑校正(×{radius_factor:.6f}),會一併算進 multiplier。")
         print()
 
         existing_imu = yaml_store.get_section("imu")
@@ -160,19 +190,19 @@ def main() -> None:
             return
 
         angular_scale = target_degrees / measured_degrees
-        multiplier_corrected = WHEEL_SEPARATION_MULTIPLIER_NOMINAL * angular_scale
-        change_pct = (
-            (multiplier_corrected - WHEEL_SEPARATION_MULTIPLIER_NOMINAL)
-            / WHEEL_SEPARATION_MULTIPLIER_NOMINAL
-            * 100.0
-        )
+        multiplier_corrected = multiplier_used * angular_scale * radius_factor
+        change_pct = (multiplier_corrected / multiplier_used - 1.0) * 100.0
 
         prompts.header("Summary")
         print(f"  目標旋轉 = {target_degrees:.1f}° ({NUM_REVOLUTIONS} 圈)")
         print(f"  IMU 實測 = {measured_degrees:.2f}°  (誤差 {error_degrees:+.2f}°)")
         print(f"  angular_scale = target / measured = {angular_scale:.6f}")
+        if radius_factor != 1.0:
+            print(f"  輪徑修正係數 = {radius_factor:.6f}")
         print(f"  wheel_separation_multiplier:")
-        print(f"    {WHEEL_SEPARATION_MULTIPLIER_NOMINAL:.6f}  ->  {multiplier_corrected:.6f}")
+        print(f"    {multiplier_used:.6f} × {angular_scale:.6f}"
+              + (f" × {radius_factor:.6f}" if radius_factor != 1.0 else "")
+              + f"  ->  {multiplier_corrected:.6f}")
         print(f"    (變化 {change_pct:+.2f}%)")
         print()
         if not prompts.confirm("  寫入 YAML?", default=True):
@@ -183,7 +213,8 @@ def main() -> None:
             "base",
             {
                 "angular_scale": float(angular_scale),
-                "wheel_separation_multiplier_nominal": float(WHEEL_SEPARATION_MULTIPLIER_NOMINAL),
+                # "nominal" = the value the controller turned with during this run.
+                "wheel_separation_multiplier_nominal": float(multiplier_used),
                 "wheel_separation_multiplier_corrected": float(multiplier_corrected),
             },
         )
@@ -191,8 +222,11 @@ def main() -> None:
         print()
         print("  📝 提示:請手動將 controllers.yaml 中的")
         print("     base_controller.wheel_separation_multiplier 改成:")
-        print(f"            {WHEEL_SEPARATION_MULTIPLIER_NOMINAL}  ->  {multiplier_corrected:.6f}")
-        print("     (路徑:kros_car/config/controllers.yaml,line 20)")
+        print(f"            {multiplier_used}  ->  {multiplier_corrected:.6f}")
+        if radius_factor != 1.0:
+            print("     並記得 wheel_radius 也要一起改成 base.wheel_radius_corrected,")
+            print("     這個 multiplier 是以新輪徑為前提算的。")
+        print("     (路徑:docker/compose/configs/controllers.yaml,改完 docker compose restart kros_car)")
     except KeyboardInterrupt:
         print("\n  使用者中斷,已嘗試煞車。")
     finally:
@@ -200,8 +234,9 @@ def main() -> None:
         try:
             node.destroy_node()
         finally:
-            if rclpy.ok():
-                rclpy.shutdown()
+            # try_shutdown() also clears a context already shut down by Ctrl+C,
+            # so the wizard can rclpy.init() again for the next step.
+            rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

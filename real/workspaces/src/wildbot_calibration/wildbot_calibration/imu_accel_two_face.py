@@ -173,8 +173,9 @@ def main() -> None:
         try:
             node.destroy_node()
         finally:
-            if rclpy.ok():
-                rclpy.shutdown()
+            # try_shutdown() also clears a context already shut down by Ctrl+C,
+            # so the wizard can rclpy.init() again for the next step.
+            rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

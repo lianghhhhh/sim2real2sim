@@ -24,10 +24,15 @@ stage 沒有 8 台環境相機 (目前只有 kros_car_new.usd 有) 時 fusion �
 **sensor 模式在 GT 裡仍然記錄 /odom** (collect_data_node 一律訂閱), 那只是拿來對答案,
 控制完全不看。真車上沒有 /odom, 那幾欄就是 NaN。
 
-實體車 (topic 名稱不一樣, 輪速上限也要跟模擬那一輪相同):
+實體車 (topic、IMU 模式、地圖與圍籬都不一樣, 輪速上限要跟模擬那一輪相同;
+完整步驟見 real/REAL_CAR_TELEOP_LIDAR_GUIDE.md):
 
-    ros2 launch bringup_pkg friction_test.launch.py use_sim_time:=false \
-        wheel_feedback_topic:=/wheel_feedback imu_topic:=/imu/data csv_filename:=real.csv
+    ros2 launch bringup_pkg friction_test.launch.py use_sim_time:=false multicam:=false \
+        wheel_feedback_topic:=/wheel_feedback imu_topic:=/imu/data \
+        gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35 wheel_scale:=1.015 \
+        map_path:=/s2r/src/car_loc_lidar/maps/lab.yaml \
+        room_x_min:=... room_x_max:=... room_y_min:=... room_y_max:=... \
+        output_dir:=/s2r/car_run_data csv_filename:=real.csv
 
 輪速有兩個設定, **要比較的兩個環境兩個都必須一樣**:
   * `spin_wheel_speed` (預設 6 rad/s): B1 / B2 自旋與 B3 直行量測用的輪速。馬達出得了的
@@ -77,6 +82,20 @@ def generate_launch_description():
         DeclareLaunchArgument('imu', default_value='false'),
         DeclareLaunchArgument('wheel', default_value='false'),
         DeclareLaunchArgument('imu_initial_pose', default_value='[0.0, 0.0, 0.0]'),
+        DeclareLaunchArgument('map_path', default_value='',
+                              description='LiDAR 定位的地圖; 空 = car_loc_lidar/maps/room.yaml (模擬房間)'),
+        # 定位節點的 IMU 模式 (見 collect_all.launch.py)。實體車:
+        #   gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35
+        DeclareLaunchArgument('gravity_mode', default_value='orientation'),
+        DeclareLaunchArgument('yaw_source', default_value='imu_orientation'),
+        DeclareLaunchArgument('fusion_sigma_acc', default_value='0.05'),
+        DeclareLaunchArgument('wheel_scale', default_value='1.0',
+                              description='定位用的有效輪半徑比例 (實體輪徑 / 0.05035)'),
+        # 圍籬: 車子到得了的內牆範圍 (map 座標, m)。預設是模擬房間 —— 實體場地一定要改。
+        DeclareLaunchArgument('room_x_min', default_value='-4.58'),
+        DeclareLaunchArgument('room_x_max', default_value='4.58'),
+        DeclareLaunchArgument('room_y_min', default_value='-2.58'),
+        DeclareLaunchArgument('room_y_max', default_value='2.58'),
     ]
     sensor = PythonExpression(["'", lc('state_source'), "' == 'sensor'"])
 
@@ -92,6 +111,13 @@ def generate_launch_description():
             'teleop': 'false', 'collector': 'false',
             'tf_source': 'fusion',
             'imu_initial_pose': lc('imu_initial_pose'),
+            'map_path': lc('map_path'),
+            'imu_topic': lc('imu_topic'),
+            'joint_states_topic': lc('wheel_feedback_topic'),
+            'gravity_mode': lc('gravity_mode'),
+            'yaw_source': lc('yaw_source'),
+            'fusion_sigma_acc': lc('fusion_sigma_acc'),
+            'wheel_scale': lc('wheel_scale'),
         }.items())
 
     test = Node(
@@ -109,6 +135,10 @@ def generate_launch_description():
             'spin_max_w': ParameterValue(lc('spin_max_w'), value_type=float),
             'imu_topic': lc('imu_topic'),
             'wheel_feedback_topic': lc('wheel_feedback_topic'),
+            'room_x_min': ParameterValue(lc('room_x_min'), value_type=float),
+            'room_x_max': ParameterValue(lc('room_x_max'), value_type=float),
+            'room_y_min': ParameterValue(lc('room_y_min'), value_type=float),
+            'room_y_max': ParameterValue(lc('room_y_max'), value_type=float),
         }])
 
     return LaunchDescription(args + [localization, test])

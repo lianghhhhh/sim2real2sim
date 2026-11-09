@@ -182,13 +182,19 @@ class StillDetector:
     在模擬裡則要靠 Isaac 的物理雜訊 (所以模擬裡門檻要調緊一點)。
     """
 
+    # 「視窗夠滿」用**時間**判斷, 不用固定筆數。以前寫死 min_samples=8, 那是照
+    # 60 Hz 想的 (0.3 s 有 18 筆); 真車的 IMU 是 20 Hz, 0.3 s 視窗最多 6~7 筆,
+    # 永遠湊不到 8 筆 -> is_still() 永遠 False -> 開機校正永遠失敗、ZUPT/ZARU
+    # 一次都沒觸發, 車子停著位置也一直飄 (2026-11-05 實車)。
+    # 現在: 至少 min_samples 筆 (變異數要幾筆才有意義), 而且涵蓋 cover x window 的時間。
     def __init__(self, gyro_th=0.03, acc_th=0.25, var_th=0.05, window=0.30,
-                 min_samples=8):
+                 min_samples=4, cover=0.75):
         self.gyro_th = float(gyro_th)
         self.acc_th = float(acc_th)
         self.var_th = float(var_th)
         self.window = float(window)
         self.min_samples = int(min_samples)
+        self.cover = float(cover)
         self.buf = []               # (t, |gyro|, |acc|, acc_xyz)
 
     def add(self, t, gyro, acc):
@@ -199,7 +205,8 @@ class StillDetector:
 
     @property
     def ready(self) -> bool:
-        return len(self.buf) >= self.min_samples
+        return (len(self.buf) >= self.min_samples
+                and self.buf[-1][0] - self.buf[0][0] >= self.cover * self.window)
 
     def is_still(self) -> bool:
         if not self.ready:
@@ -347,7 +354,7 @@ class SpinDetector:
     """
 
     def __init__(self, omega_th=0.5, omega_max=6.0, acc_th=0.2, window=0.30,
-                 min_samples=8):
+                 min_samples=4, cover=0.75):   # 同 StillDetector: 用時間判斷, 20 Hz 也能用
         self.omega_th = float(omega_th)
         # 上限: 超過這個角速度就不做。60 Hz 下 6 rad/s 已經是一步轉 5.7 度,
         # 再快的話遞推、離散化、加速度雜訊全部一起崩 (實測 |wz|>12 時加速度
@@ -358,6 +365,7 @@ class SpinDetector:
         self.acc_th = float(acc_th)
         self.window = float(window)
         self.min_samples = int(min_samples)
+        self.cover = float(cover)
         self.buf = []               # (t, |omega|, |acc_xy|)
 
     def add(self, t, omega_z, acc_xy):
@@ -367,7 +375,8 @@ class SpinDetector:
             self.buf.pop(0)
 
     def is_spinning_in_place(self) -> bool:
-        if len(self.buf) < self.min_samples:
+        if (len(self.buf) < self.min_samples
+                or self.buf[-1][0] - self.buf[0][0] < self.cover * self.window):
             return False
         wn = np.array([b[1] for b in self.buf])
         av = np.stack([b[2] for b in self.buf])
