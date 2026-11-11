@@ -86,7 +86,7 @@ class WheelLocalizer(Node):
 
         # --- 車體 -----------------------------------------------------------------
         p('wheel_names', list(WHEELS))
-        p('wheel_radius', 0.05035)    # kros_car.usd: 輪子碰撞圓柱的半徑
+        p('wheel_radius', 0.051356)   # 實體車 2026-11-09 校正值 = kros_car.usd 輪子碰撞圓柱的半徑
         # v_true = wheel_scale * wheel_radius * omega。
         # 尺度誤差是**系統性**的 (走 100 m 就是幾公尺, 停車不會讓它消失)。
         # 它**跟牽引狀態有關, 不是幾何常數**: 有扭矩時輪胎一定有縱向滑移, 輪子

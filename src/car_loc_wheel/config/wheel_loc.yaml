@@ -14,7 +14,7 @@ wheel_localizer:
                   rear_left_joint, rear_right_joint]
     # 順序必須是 [FL, FR, RL, RR] —— 打滑偵測靠「同側前後輪」配對, 配錯對就失效。
 
-    wheel_radius: 0.05035      # kros_car.usd: 輪子碰撞圓柱的半徑
+    wheel_radius: 0.051356     # 實體車 2026-11-09 校正值 = kros_car.usd 輪子碰撞圓柱的半徑
     # v_true = wheel_scale * wheel_radius * omega。尺度誤差是**系統性**的
     # (走 100 m 就是幾公尺, 停車不會讓它消失), 而且跟牽引狀態有關, 不是幾何常數。
     # **這台車 (kros_car, 輪速控制) 還沒量過, 1.0 是幾何值。** 舊的 car.usd 在

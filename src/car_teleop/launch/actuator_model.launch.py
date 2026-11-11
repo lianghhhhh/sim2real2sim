@@ -20,9 +20,9 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('input_topic', default_value='/joint_command'),
         DeclareLaunchArgument('output_topic', default_value='/joint_command_isaac'),
-        DeclareLaunchArgument('delay', default_value='0.035'),
+        DeclareLaunchArgument('delay', default_value='0.05'),
         DeclareLaunchArgument('accel', default_value='30.0'),
-        DeclareLaunchArgument('stop_tau', default_value='0.08'),
+        DeclareLaunchArgument('stop_tau', default_value='0.09'),
         DeclareLaunchArgument('smooth_tau', default_value='0.04'),
         DeclareLaunchArgument('enabled', default_value='true'),
     ]

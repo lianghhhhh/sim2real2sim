@@ -91,7 +91,7 @@ class FusionLocalizer(Node):
 
         # --- 車體 (跟 car_loc_wheel 同一組, 值也要一樣) ----------------------
         p('wheel_names', list(WHEELS))
-        p('wheel_radius', 0.05035)       # kros_car.usd
+        p('wheel_radius', 0.051356)      # 實體車 2026-11-09 = kros_car.usd
         p('wheel_scale', 1.0)
         p('forward_deg', 0.0)            # kros_car 照 REP-103; 舊的 car.usd 是 -90
         # IMU 在 base_link 裡的位置 [x, y] (m), 見 car_loc_wheel 的 LeverArm

@@ -55,15 +55,15 @@ cd ~/sim2real2sim/real
 
 ### 2-3 IMU 和輪子的校正
 
-跑一次 `./scripts/calibrate.sh`（見測試報告第 9-3 節）。2026-11-04 的結果：
+跑一次 `./scripts/calibrate.sh`（見測試報告第 9-3 節）。2026-11-09 的結果：
 
 | 項目 | 結果 | 在這份手冊裡怎麼用 |
 | --- | --- | --- |
 | IMU 軸向 | 前後、左轉、抬頭四項都 PASS | x 朝車頭，`forward_deg` 維持 0 |
-| `wheel_radius` | 0.0506 → **0.0511** m（已寫進 `docker/compose/configs/controllers.yaml`） | 定位節點的 `wheel_radius` 是 0.05035，所以要給 `wheel_scale:=1.015`（0.0511 / 0.05035） |
-| `wheel_separation_multiplier` | 2.254 → **2.197** | 只影響 `base_controller`，跟這份手冊無關 |
+| `wheel_radius` | 0.0506 → 0.0511（11-04）→ **0.051356** m（已寫進 `docker/compose/configs/controllers.yaml`） | `src` 的節點（`cmd_vel_bridge`、定位、`control_car_node`）和 `kros_car.usd` 都改成 0.051356，`wheel_scale` 用預設的 1.0 |
+| `wheel_separation_multiplier` | 2.254 → 2.197（11-04）→ **2.153867** | 只影響 `base_controller`。等效輪距 = 0.274 × 2.153867 = 0.590 m，拿來驗收模擬的轉彎（`scripts/measure_track.py`） |
 
-重新校正、輪徑變了的話，`wheel_scale` 也要跟著改。
+重新校正、輪徑變了的話，要嘛把 `src` 節點的 `wheel_radius` 和 `kros_car.usd` 一起改，要嘛給 `wheel_scale:=新輪徑 / 0.051356`。
 
 ---
 
@@ -157,7 +157,7 @@ ros2 run car_teleop teleop_key
 
 通過後再放到地上，在空曠的地方用低速開一小段。
 
-- `cmd_vel_bridge` 的輪徑是 0.05035，實體車是 0.0511，所以實際車速會比指令快大約 1.5%。遙控時不用管這個差距。
+- `cmd_vel_bridge` 的輪徑跟實體車一樣是 0.051356（2026-11-09），車速和指令一致。
 - 預設 `yaw_trim_gain:=0`，不會用到 IMU。想讓它用陀螺儀修正轉速（給 nav2 這類程式用），就加 `imu_topic:=/imu/data yaw_trim_gain:=1.0`。
 
 **注意**：`cmd_vel_bridge` 同時只能有一個在跑，不然兩個會搶著發 `/joint_command`。後面的 `mapping.launch.py`，以及加了 `teleop:=true` 的 launch，都已經自帶一個。跑它們之前要先把這裡的 `teleop.launch.py` 關掉。
@@ -289,7 +289,7 @@ cd /s2r/car_run_data && ros2 bag record -o lidar_0101 /scan /wheel_feedback /imu
 | `gravity_mode` | `complementary` | 改用陀螺儀積分，再在靜止時用加速度校正 |
 | `yaw_source` | `gyro` | 沒有絕對 yaw |
 | `joint_states_topic` | `/wheel_feedback` | `/wheel_feedback` 的時戳是 ESP32 送出的時刻，`/joint_states` 的時戳被控制迴圈量化成 20 ms |
-| `wheel_scale` | `1.015` | 實體輪徑 0.0511 / 節點設定的 0.05035（見 2-3） |
+| `wheel_scale` | 不用給（預設 1.0） | 節點的 `wheel_radius` 已經是實體輪徑 0.051356（見 2-3） |
 | `sigma_acc`（只有融合） | `0.35` | complementary 模式下的加速度過程雜訊（`fusion_loc.yaml` 的註解） |
 
 **開始之前先讓車子停幾秒**，節點要在這段時間量陀螺儀零偏。一啟動就開走，漂移會大很多。
@@ -304,12 +304,12 @@ ros2 launch car_loc_imu imu_loc.launch.py use_sim_time:=false \
 # 方法四 —— IMU + 輪速
 ros2 launch car_loc_wheel wheel_loc.launch.py use_sim_time:=false \
     imu_topic:=/imu/data gravity_mode:=complementary yaw_source:=gyro \
-    joint_states_topic:=/wheel_feedback wheel_scale:=1.015
+    joint_states_topic:=/wheel_feedback
 
 # 方法五 —— 融合：LiDAR + IMU + 輪速（沒有環境相機，所以 multicam:=false）
 ros2 launch car_loc_fusion fusion_loc.launch.py use_sim_time:=false multicam:=false teleop:=true \
     imu_topic:=/imu/data gravity_mode:=complementary yaw_source:=gyro sigma_acc:=0.35 \
-    joint_states_topic:=/wheel_feedback wheel_scale:=1.015 \
+    joint_states_topic:=/wheel_feedback \
     map_path:=/s2r/src/car_loc_lidar/maps/lab.yaml
 ```
 
@@ -333,7 +333,7 @@ ros2 launch car_loc_fusion fusion_loc.launch.py use_sim_time:=false multicam:=fa
 ros2 launch bringup_pkg collect_all.launch.py use_sim_time:=false \
     camera:=false multicam:=false multicam_only:=false \
     imu_topic:=/imu/data joint_states_topic:=/wheel_feedback \
-    gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35 wheel_scale:=1.015 \
+    gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35 \
     map_path:=/s2r/src/car_loc_lidar/maps/lab.yaml \
     output_dir:=/s2r/car_run_data csv_filename:=real_all_0101.csv
 
@@ -370,7 +370,7 @@ ros2 run car_teleop teleop_key
 ```bash
 ros2 launch bringup_pkg friction_test.launch.py use_sim_time:=false multicam:=false \
     wheel_feedback_topic:=/wheel_feedback imu_topic:=/imu/data \
-    gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35 wheel_scale:=1.015 \
+    gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35 \
     map_path:=/s2r/src/car_loc_lidar/maps/lab.yaml \
     room_x_min:=-2.0 room_x_max:=2.0 room_y_min:=-1.5 room_y_max:=1.5 \
     blocks:="[1]" output_dir:=/s2r/car_run_data csv_filename:=real_0101.csv

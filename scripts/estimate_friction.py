@@ -1162,7 +1162,7 @@ def main():
     ap.add_argument('--forward-axis-deg', type=float, default=0.0,
                     help='車頭相對 base_link 的角度, 跟 control_car_node 的參數一致 '
                          '(kros_car 是 0; 舊的 car.usd 是 -90)')
-    ap.add_argument('--wheel-radius', type=float, default=0.05035,
+    ap.add_argument('--wheel-radius', type=float, default=0.051356,
                     help='輪半徑 [m] (算 slip ratio 與等效輪距用)')
     ap.add_argument('--torque-limit', type=float, default=2.0,
                     help='馬達堵轉扭矩 [N·m]。自旋扭矩貼著上限 = 飽和, 那一趟量到的不是摩擦')

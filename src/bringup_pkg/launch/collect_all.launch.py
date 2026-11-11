@@ -142,7 +142,7 @@ def generate_launch_description():
         DeclareLaunchArgument('fusion_sigma_acc', default_value='0.05',
                               description='fus_ 的加速度過程雜訊; complementary 模式要 0.35'),
         DeclareLaunchArgument('wheel_scale', default_value='1.0',
-                              description='whl_ / fus_ 的有效輪半徑比例 (實體輪徑 / 0.05035)'),
+                              description='whl_ / fus_ 的有效輪半徑比例 (實際輪徑 / 節點的 wheel_radius 0.051356)'),
     ]
     use_sim_time = LaunchConfiguration('use_sim_time')
     initial_pose = ParameterValue(

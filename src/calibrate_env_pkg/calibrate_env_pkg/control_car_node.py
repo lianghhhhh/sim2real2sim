@@ -107,7 +107,7 @@ ODOM_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST, depth=10)
 
 # ── 車體幾何 (kros_car.usd 量出來的; 都有對應的參數可以蓋掉) ───────────
-WHEEL_RADIUS = 0.05035       # m
+WHEEL_RADIUS = 0.051356      # m, 實體車 2026-11-09 校正值 (USD 也改成這個)
 HALF_TRACK = 0.135           # m, 輪胎接地中心到車體中線 (輪距 0.27)
 HALF_WHEELBASE = 0.144       # m (軸距 0.288)
 # skid-steer 原地轉的「等效輪距」: Omega = r*(w_R - w_L) / T_eff。四輪都在橫向滑,

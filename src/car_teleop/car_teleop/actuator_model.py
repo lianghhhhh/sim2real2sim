@@ -30,8 +30,15 @@ Isaac 的輪子是理想的速度驅動: 指令下去 1 幀就到速。實體車
 誤差 0.116 rad/s; 加 0.04 s 低通時 delay 0.06 / tau 0.08, 誤差 0.107, 停車的
 圓角幾乎完全對上。這是「實體車的總延遲」; Isaac 本身還有一兩幀的延遲, 而且每個
 環境不一樣 (docker 複製環境跟使用者的 GUI 差 ~0.05 s), 所以預設的 delay 是在
-使用者的 Isaac 裡校的 (0.035; docker 複製環境是 0.05), 換環境要用 wheel_bench +
-scripts/plot_wheel_bench.py 重對一次。Isaac 每次 Play 的延遲會差 ±0.01~0.015 s, 調到 0.01 s 就夠了。
+使用者的 Isaac 裡校的, 換環境要用 wheel_bench + scripts/plot_wheel_bench.py 重對
+一次。Isaac 每次 Play 的延遲會差 ±0.01~0.015 s, 調到 0.01 s 就夠了。
+
+2026-11-06 換了一台實體車重校 (car_run_data/bench_real.csv、bench_real_2.csv,
+scripts/fit_actuator.py): 兩次擬合都是 delay 0.06 / accel 30 / stop_tau 0.09 /
+smooth_tau 0.03, 跟舊車一樣。原本的 delay 0.035 是對著一張模擬畫晚了 ~0.007 s 的
+圖校的 (plot_wheel_bench 當時用中位數對齊, 已修), 實際上模擬早 ~0.02 s; 改成
+delay 0.05 / stop_tau 0.09 之後, 起步、反轉、停車都在一幀 (0.017 s) 以內, 落在兩次
+實體車之間。docker 複製環境舊的值是 0.05 (比 GUI 多 0.015), 用新的對齊方式還沒重校。
 實體車的 ESP32 每 20 ms 才送一次指令, 所以實體車自己每一次的延遲就會差 0-20 ms,
 兩條線不可能每一段都疊在一起, 只能平均對齊。
 
@@ -82,9 +89,9 @@ class ActuatorModel(Node):
         p('output_topic', '/joint_command_isaac')
         # 從 car_run_data/bench_real.csv 擬合、再在 Isaac 裡校過的 (見檔頭)。
         # 改了之後用 wheel_bench 重跑一次對照。
-        p('delay', 0.035)                 # s (使用者的 Isaac, 2026-10-20 校; docker 複製環境是 0.05)
+        p('delay', 0.05)                  # s (使用者的 Isaac, 2026-11-06 校)
         p('accel', 30.0)                  # rad/s^2, 目標 != 0 時的斜率上限
-        p('stop_tau', 0.08)               # s, 目標 == 0 時的衰減時間常數
+        p('stop_tau', 0.09)               # s, 目標 == 0 時的衰減時間常數
         p('smooth_tau', 0.04)             # s, 輸出的一階低通 (圓角), 0 = 不加
         p('stop_epsilon', 0.02)           # rad/s, 衰減到這以下直接歸零
         p('rpm_step', 1.0)                # 目標量化 (rpm), 0 = 不量化

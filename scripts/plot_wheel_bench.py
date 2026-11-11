@@ -15,8 +15,11 @@
 **時間軸**: 模擬的資料用 Isaac 那一幀自己的時間 (stamp), 不用 wheel_bench 收到
 的時間 (t_recv)。模擬時 ROS 時鐘跟著 /clock 每 1/60 s 才跳一次, 兩次之間收到的
 回授會拿到同一個 t_recv, 畫出來像鋸齒 (2026-10-20 的資料約 1/4 的列重複)。stamp
-跟 wheel_bench 的時鐘是同一個來源, 只差一個固定的落後, 用中位數扣掉就能跟送指令
-的時間 (seg_t0) 對齊。實體車的 stamp 是另一台電腦的時鐘, 所以照舊用 t_recv
+跟 wheel_bench 的時鐘是同一個來源, 只差一個固定的落後, 扣掉就能跟送指令的時間
+(seg_t0) 對齊。落後用**平均**估, 不用中位數: t_recv - stamp 只會是整數幀, 真正的
+落後約 2.5 幀時一半是 2 幀、一半是 3 幀, 中位數會在 33 / 50 ms 之間跳, 整條模擬
+就早或晚一幀 (2026-11-06 的資料就是這樣); 平均是 40-42 ms, 每次都穩定。
+實體車的 stamp 是另一台電腦的時鐘, 所以照舊用 t_recv
 (牆上時鐘, 本來就連續)。判斷方式: t_recv - stamp 的中位數小於 1 秒 = 同一個時鐘。
 """
 import argparse
@@ -62,9 +65,12 @@ def load(path):
     """讀 CSV, 加上 t (對齊 seg_t0 的時間)、v / c (四輪平均的輪速 / 指令)。"""
     d = pd.read_csv(path)
     d = d[d.seg >= 0].copy()
-    off = float((d.t_recv - d.stamp).median())
+    lag = (d.t_recv - d.stamp).to_numpy()
+    off = float(np.median(lag))
     if abs(off) < 1.0:
-        d['t'] = d.stamp + off          # 模擬: 同一個時鐘, 用 stamp
+        # 模擬: 同一個時鐘, 用 stamp。落後取中位數 ±0.05 s 內的平均 (偶爾卡一下的不算)
+        off = float(lag[np.abs(lag - off) < 0.05].mean())
+        d['t'] = d.stamp + off
         src = f'stamp (已扣掉 ROS 時鐘比 Isaac 慢的 {-off * 1000:.0f} ms; 這不是延遲)'
     else:
         d['t'] = d.t_recv               # 實體車: 不同時鐘, 用收到的時間

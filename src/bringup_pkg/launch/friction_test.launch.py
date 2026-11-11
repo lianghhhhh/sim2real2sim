@@ -29,7 +29,7 @@ stage 沒有 8 台環境相機 (目前只有 kros_car_new.usd 有) 時 fusion �
 
     ros2 launch bringup_pkg friction_test.launch.py use_sim_time:=false multicam:=false \
         wheel_feedback_topic:=/wheel_feedback imu_topic:=/imu/data \
-        gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35 wheel_scale:=1.015 \
+        gravity_mode:=complementary yaw_source:=gyro fusion_sigma_acc:=0.35 \
         map_path:=/s2r/src/car_loc_lidar/maps/lab.yaml \
         room_x_min:=... room_x_max:=... room_y_min:=... room_y_max:=... \
         output_dir:=/s2r/car_run_data csv_filename:=real.csv
@@ -90,7 +90,7 @@ def generate_launch_description():
         DeclareLaunchArgument('yaw_source', default_value='imu_orientation'),
         DeclareLaunchArgument('fusion_sigma_acc', default_value='0.05'),
         DeclareLaunchArgument('wheel_scale', default_value='1.0',
-                              description='定位用的有效輪半徑比例 (實體輪徑 / 0.05035)'),
+                              description='定位用的有效輪半徑比例 (實際輪徑 / 節點的 wheel_radius 0.051356)'),
         # 圍籬: 車子到得了的內牆範圍 (map 座標, m)。預設是模擬房間 —— 實體場地一定要改。
         DeclareLaunchArgument('room_x_min', default_value='-4.58'),
         DeclareLaunchArgument('room_x_max', default_value='4.58'),

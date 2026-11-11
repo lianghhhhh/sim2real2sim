@@ -62,7 +62,7 @@ class CmdVelBridge(Node):
         p('imu_topic', '/imu')
 
         # 從 kros_car.usd 量出來的
-        p('wheel_radius', 0.05035)
+        p('wheel_radius', 0.051356)       # 2026-11-09 實體車校正值, kros_car.usd 也改成這個
         p('wheel_track', 0.27)            # 幾何輪距 (接地中心 ±0.135), 只拿來印
         # 等效輪距, 見檔頭。scripts/estimate_friction.py 的 B1 會印實測值。
         p('effective_track', 0.95)

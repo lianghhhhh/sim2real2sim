@@ -47,7 +47,7 @@ Foxglove 的 Teleop 面板、搖桿、`teleop_twist_keyboard`、nav2。
    [FL, FR, RL, RR] = [左, 右, 左, 右]
    ```
 
-   r = 0.05035 m。T_eff = 0.95 m 是滑移轉向的**等效輪距**, 不是幾何輪距 0.27 m:
+   r = 0.051356 m。T_eff = 0.95 m 是滑移轉向的**等效輪距**, 不是幾何輪距 0.27 m:
    原地轉時四個輪子都在橫向滑, 車體轉得比「輪速差 / 輪距」慢很多。0.95 是模擬
    (地面 0.5) 實測的值, 換地面會變。
 3. **輪速上限**: 超過 10 rad/s (`max_wheel_speed`, 實體車 max_rpm 100 = 10.47) 時左右等比縮小,
@@ -92,7 +92,7 @@ ros2 launch car_loc_lidar mapping.launch.py yaw_trim_gain:=1.0
 | 參數 | 預設 | 說明 |
 | --- | --- | --- |
 | `cmd_vel_topic` / `joint_command_topic` / `imu_topic` | `/cmd_vel` / `/joint_command` / `/imu` | 實體車的 IMU 是 `/imu/data` |
-| `wheel_radius` | 0.05035 | m |
+| `wheel_radius` | 0.051356 | m (2026-11-09 實體車校正值; kros_car.usd 的碰撞圓柱同一個值) |
 | `effective_track` | 0.95 | m, 等效輪距 |
 | `max_wheel_speed` | 10.0 | rad/s |
 | `max_linear` / `max_angular` | 0.5 / 1.2 | m/s / rad/s; 車速超過 0.50 m/s 會被輪速上限縮掉 |
