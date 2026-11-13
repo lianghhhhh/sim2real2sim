@@ -6,10 +6,19 @@
 #    2. 迴圈:  用目前的摩擦係數量 sim
 #              -> scripts/friction_calib_step.py 比對 sim 與 real
 #              -> 兩邊量不出差別就停; 否則換算出新的摩擦係數, 再量一輪 sim
-#    3. 把收斂的摩擦係數另存成新的 USD (不動原本的 kros_car_05_sim.usd)
+#    3. 收斂之後: tire 模式把 μ 寫到 car_run_data/<run>/calibrated_tire.json;
+#                 physx 模式把地面摩擦另存成新的 USD (不動原本的 USD)
+#
+#  兩種摩擦模型 (--friction-model):
+#    tire  (預設) 自訂輪胎摩擦 scripts/isaac_tire_friction.py。Isaac 每次載入 USD 之後、
+#          Play 之前自動執行那支腳本, 再設 μ。sim 從 --sim-tire-mu 開始迭代, real 用
+#          --real-tire-mu (sim-to-sim 驗證時的「真值」)。地面材質的摩擦係數沒有作用。
+#    physx 舊流程: 改 USD 地面材質的 static / dynamic friction (PhysX 的接地摩擦,
+#          做不出邊走邊轉, 見 isaac_tire_friction.py 檔頭)
 #
 #  車子是輪速控制 (kros_car*.usd): 摩擦力從「等速原地轉時的輪子扭矩」量,
 #  見 src/calibrate_env_pkg/calibrate_env_pkg/control_car_node.py 檔頭。
+#  kros_car*.usd 吃 joint_command_isaac, friction_test.launch.py 會一起開 actuator_model。
 #
 #  每一輪的 CSV、比對結果 JSON、history.json 都在 car_run_data/<run 名稱>/。
 #  Isaac 端是 load_isaac_usd.py 的工作佇列模式 (見那支檔案的說明)。
@@ -21,9 +30,19 @@ set -e
 # ─────────────────────────────────────────────────────────────
 ISAAC_SIM_PATH="${ISAAC_SIM_PATH:-/home/liang/isaac-sim/isaac-sim.streaming.sh}"   # 請改成你的路徑
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIM_USD_PATH="$REPO_DIR/kros_car_10_real.usd"
-REAL_USD_PATH="$REPO_DIR/kros_car_05_sim.usd"
-CALIBRATED_USD="$REPO_DIR/kros_car_sim_calibrated.usd"
+SIM_USD_PATH="$REPO_DIR/kros_car_sim.usd"
+REAL_USD_PATH="$REPO_DIR/kros_car_real.usd"
+CALIBRATED_USD="$REPO_DIR/kros_car_sim_calibrated.usd"   # 只有 physx 模式會另存
+
+# ---- 摩擦模型 ----
+FRICTION_MODEL="tire"   # tire = 自訂輪胎摩擦 (預設) | physx = USD 地面材質
+TIRE_SCRIPT="$REPO_DIR/scripts/isaac_tire_friction.py"
+SIM_TIRE_MU=0.5         # tire: sim 第 0 輪的 μ
+REAL_TIRE_MU=1.0        # tire: 當作 real 的 μ (sim-to-sim 的真值)。2026-11-11 測: 0.5 -> 0.993, 兩輪收斂
+                        #   自訂摩擦的 μ 就是有效值, 這台車量得到的上限約 1.2 (spin 6) ~ 1.4 (spin 3);
+                        #   2.0 會馬達飽和 (18 趟自旋 12 趟飽和, 校正直接 failed)
+TIRE_LAT_RATIO=1.0      # tire: 側向 ÷ 縱向 μ, sim 與 real 一樣 (不校正)
+TIRE_FRONT_SHARE=""     # tire: 前輪載重比例, 空 = 依 USD 重心 (sim 與 real 一樣)
 RUN_NAME="calib_$(date +%Y%m%d_%H%M%S)"
 # 測試腳本用什麼狀態控制車子: sensor = 融合定位 + IMU (接近真車, 會一起開定位節點)
 #                            gt     = Isaac /odom (舊流程)
@@ -80,18 +99,25 @@ usage() {
 場景
   --sim-usd PATH          要校正的 sim USD            (預設 $SIM_USD_PATH)
   --real-usd PATH         當作 real 的 USD            (預設 $REAL_USD_PATH)
-  --out-usd PATH          校正後另存的 USD            (預設 $CALIBRATED_USD)
+  --out-usd PATH          physx 模式校正後另存的 USD  (預設 $CALIBRATED_USD)
+
+摩擦模型
+  --friction-model M      tire | physx                (預設 $FRICTION_MODEL)
+  --sim-tire-mu MU        tire: sim 第 0 輪的 μ       (預設 $SIM_TIRE_MU)
+  --real-tire-mu MU       tire: real 的 μ (真值)      (預設 $REAL_TIRE_MU)
+  --tire-lat-ratio K      tire: 側向 / 縱向, 兩邊一樣 (預設 $TIRE_LAT_RATIO)
+  --tire-front-share F    tire: 前輪載重比例, 兩邊一樣 (預設 依 USD 重心)
   --reuse-real CSV        沿用量好的 real CSV (同目錄要有 *_imu.csv), 不重量 real
   --run-name NAME         輸出到 car_run_data/NAME/   (預設 calib_<時間>)
 
 校正
   --max-iter N            最多量幾輪 sim              (預設 $MAX_ITER)
-  --init-static MU        sim 第 0 輪的 staticFriction (預設 USD 原本的值)
-  --init-dynamic MU       sim 第 0 輪的 dynamicFriction
-  --tol T                 收斂容許誤差 (地面 mu)      (預設 $TOL)
+  --init-static MU        physx: sim 第 0 輪的 staticFriction (預設 USD 原本的值)
+  --init-dynamic MU       physx: sim 第 0 輪的 dynamicFriction
+  --tol T                 收斂容許誤差 (mu)           (預設 $TOL)
   --gain G                更新步長                    (預設 $GAIN)
-  --wheel-mu MU           輪子材質 mu                 (預設 $WHEEL_MU)
-  --combine MODE          average|min|multiply|max    (預設 $COMBINE)
+  --wheel-mu MU           physx: 輪子材質 mu          (預設 $WHEEL_MU)
+  --combine MODE          physx: average|min|multiply|max (預設 $COMBINE)
   --spin-wheel-speed W    自旋量測的輪速 rad/s; 報馬達飽和時調低 (預設 $SPIN_WHEEL_SPEED)
 
 其他
@@ -101,8 +127,9 @@ usage() {
   --skip-isaac-launch     Isaac 已經開著 (用 load_isaac_usd.py), 不要再開
 
 範例
-  $0                                        # real 量一次, sim 從 USD 原本的值開始迭代
-  $0 --reuse-real car_run_data/real_data.csv --init-dynamic 1.0 --init-static 1.0
+  $0                                        # 自訂摩擦: real μ $REAL_TIRE_MU, sim 從 μ $SIM_TIRE_MU 開始
+  $0 --real-tire-mu 1.2 --spin-wheel-speed 3   # 接近上限時自旋輪速調低
+  $0 --friction-model physx --sim-usd kros_car_10_real.usd --real-usd kros_car_05_sim.usd
 EOF
     exit 1
 }
@@ -110,6 +137,11 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sim-usd)          SIM_USD_PATH="$2"; shift 2 ;;
+        --friction-model)   FRICTION_MODEL="$2"; shift 2 ;;
+        --sim-tire-mu)      SIM_TIRE_MU="$2"; shift 2 ;;
+        --real-tire-mu)     REAL_TIRE_MU="$2"; shift 2 ;;
+        --tire-lat-ratio)   TIRE_LAT_RATIO="$2"; shift 2 ;;
+        --tire-front-share) TIRE_FRONT_SHARE="$2"; shift 2 ;;
         --real-usd)         REAL_USD_PATH="$2"; shift 2 ;;
         --out-usd)          CALIBRATED_USD="$2"; shift 2 ;;
         --reuse-real)       REUSE_REAL="$2"; shift 2 ;;
@@ -135,11 +167,48 @@ done
 [[ -n "$INIT_STATIC" && -z "$INIT_DYNAMIC" ]] && INIT_DYNAMIC="$INIT_STATIC"
 [[ -n "$INIT_DYNAMIC" && -z "$INIT_STATIC" ]] && INIT_STATIC="$INIT_DYNAMIC"
 
+case "$FRICTION_MODEL" in
+    tire)
+        [[ -f "$TIRE_SCRIPT" ]] || { echo "錯誤：找不到 $TIRE_SCRIPT"; exit 1; }
+        if [[ -n "$INIT_STATIC$INIT_DYNAMIC" ]]; then
+            echo "錯誤：tire 模式用 --sim-tire-mu 給起始值 (--init-static/--init-dynamic 是 physx 的地面材質)"; exit 1
+        fi
+        # tire 只有一個 μ: friction_calib_step 的 static / dynamic 都傳它 (tied),
+        # 有效 μ 就是腳本的 μ (--combine direct, 輪子材質不參與)
+        INIT_STATIC="$SIM_TIRE_MU"; INIT_DYNAMIC="$SIM_TIRE_MU"
+        STATIC_MODE="tied"; COMBINE="direct"; WHEEL_MU=0
+        ;;
+    physx) ;;
+    *) echo "錯誤：--friction-model 只能是 tire 或 physx"; exit 1 ;;
+esac
+for f in "$SIM_USD_PATH" "$REAL_USD_PATH"; do
+    [[ -n "$REUSE_REAL" && "$f" == "$REAL_USD_PATH" ]] && continue
+    [[ -f "$f" ]] || { echo "錯誤：找不到 USD $f"; exit 1; }
+done
+
 # host 上的輸出目錄 <-> container 裡的同一個目錄 (car_run_data 掛在 /workspaces/car_run_data)
 HOST_RUN_DIR="$REPO_DIR/car_run_data/$RUN_NAME"
 CONT_RUN_DIR="/workspaces/car_run_data/$RUN_NAME"
 HISTORY="$HOST_RUN_DIR/history.json"
 mkdir -p "$HOST_RUN_DIR"
+
+# 這一次的設定 (sim-to-sim 驗證時事後對答案用: real 的真值記在這裡)
+"$PYTHON" - "$HOST_RUN_DIR/run_config.json" <<PY
+import json, sys
+fs = "$TIRE_FRONT_SHARE"
+cfg = {"friction_model": "$FRICTION_MODEL", "sim_usd": "$SIM_USD_PATH", "real_usd": "$REAL_USD_PATH",
+       "reuse_real": "$REUSE_REAL" or None, "spin_wheel_speed": float("$SPIN_WHEEL_SPEED"),
+       "state_source": "$STATE_SOURCE", "tol": float("$TOL"), "gain": float("$GAIN"),
+       "max_iter": int("$MAX_ITER")}
+if cfg["friction_model"] == "tire":
+    cfg["tire"] = {"script": "$TIRE_SCRIPT", "sim_init_mu": float("$SIM_TIRE_MU"),
+                   "real_mu": None if cfg["reuse_real"] else float("$REAL_TIRE_MU"),
+                   "lat_ratio": float("$TIRE_LAT_RATIO"), "front_share": float(fs) if fs else None}
+else:
+    cfg["physx"] = {"init_static": "$INIT_STATIC" or None, "init_dynamic": "$INIT_DYNAMIC" or None,
+                    "wheel_mu": float("$WHEEL_MU"), "combine": "$COMBINE", "static_mode": "$STATIC_MODE"}
+json.dump(cfg, open(sys.argv[1], "w"), indent=2, ensure_ascii=False)
+PY
 
 "$PYTHON" -c "import numpy, pandas" 2>/dev/null || {
     echo "錯誤：$PYTHON 沒有 numpy / pandas (分析要用)。用 PYTHON=/path/to/python3 $0 指定。"
@@ -217,20 +286,25 @@ if (( ! SKIP_ISAAC_LAUNCH )); then
 fi
 
 JOB_ID=0
-# isaac_job <run|save> <usd> <static|""> <dynamic|""> [save_as]
-# 成功後設定 REPLY_STATIC / REPLY_DYNAMIC = Isaac 回報實際生效的地面摩擦係數
+# isaac_job <run|save> <usd> <static|""> <dynamic|""> <tire_mu|""> [save_as]
+# 成功後設定 REPLY_STATIC / REPLY_DYNAMIC = Isaac 回報實際生效的地面摩擦係數,
+# REPLY_TIRE_MU = 自訂輪胎摩擦實際生效的 μ (tire_mu 空 = 不開自訂摩擦, 回報 None)
 isaac_job() {
-    local action="$1" usd="$2" st="$3" dy="$4" save_as="${5:-}"
+    local action="$1" usd="$2" st="$3" dy="$4" tmu="$5" save_as="${6:-}"
     JOB_ID=$((JOB_ID + 1))
     rm -f "$READY_FLAG"
-    "$PYTHON" - "$JOB_FILE" "$JOB_ID" "$action" "$usd" "$st" "$dy" "$save_as" "$GROUND_PRIM" <<'PY'
+    "$PYTHON" - "$JOB_FILE" "$JOB_ID" "$action" "$usd" "$st" "$dy" "$save_as" "$GROUND_PRIM" \
+        "$tmu" "$TIRE_SCRIPT" "$TIRE_LAT_RATIO" "$TIRE_FRONT_SHARE" <<'PY'
 import json, os, sys
-path, jid, action, usd, st, dy, save_as, prim = sys.argv[1:9]
+path, jid, action, usd, st, dy, save_as, prim, tmu, script, lat, fs = sys.argv[1:13]
 job = {"id": int(jid), "action": action, "usd": usd}
 if st or dy:
     job["friction"] = {"prim": prim,
                        "static": float(st) if st else None,
                        "dynamic": float(dy) if dy else None}
+if tmu:
+    job["tire"] = {"script": script, "mu": float(tmu), "lat_ratio": float(lat),
+                   "front_share": float(fs) if fs else None}
 if save_as:
     job["save_as"] = save_as
 with open(path + ".tmp", "w") as f:
@@ -249,11 +323,11 @@ if r.get("id") != int(sys.argv[2]):
 elif not r.get("ok"):
     print("ERROR " + str(r.get("error")))
 else:
-    print(f"OK {r.get('static')} {r.get('dynamic')}")
+    print(f"OK {r.get('static')} {r.get('dynamic')} {r.get('tire_mu')}")
 PY
 )
             case "$reply" in
-                OK*)    read -r _ REPLY_STATIC REPLY_DYNAMIC <<< "$reply"
+                OK*)    read -r _ REPLY_STATIC REPLY_DYNAMIC REPLY_TIRE_MU <<< "$reply"
                         rm -f "$READY_FLAG"; return 0 ;;
                 ERROR*) echo "錯誤：Isaac 工作失敗: ${reply#ERROR }"; rm -f "$READY_FLAG"; return 1 ;;
             esac
@@ -313,8 +387,13 @@ if [[ -n "$REUSE_REAL" ]]; then
         || echo "警告：找不到 ${REUSE_REAL%.csv}_imu.csv, 分析會退回 GT / 位姿 (準度較差)"
 else
     echo -e "\n=== Real: $REAL_USD_PATH ==="
-    isaac_job run "$REAL_USD_PATH" "" ""
-    echo "Real USD 地面摩擦 (只是記錄, 校正不會用到): static $REPLY_STATIC, dynamic $REPLY_DYNAMIC"
+    if [[ "$FRICTION_MODEL" == "tire" ]]; then
+        isaac_job run "$REAL_USD_PATH" "" "" "$REAL_TIRE_MU"
+        echo "Real 自訂輪胎摩擦 μ $REPLY_TIRE_MU (真值, 只是記錄, 校正不會用到)"
+    else
+        isaac_job run "$REAL_USD_PATH" "" "" ""
+        echo "Real USD 地面摩擦 (只是記錄, 校正不會用到): static $REPLY_STATIC, dynamic $REPLY_DYNAMIC"
+    fi
     measure real_data.csv
     isaac_stop
 fi
@@ -336,13 +415,24 @@ while (( ROUND < MAX_ROUNDS )); do
     CSV="sim_iter${ITER}.csv"
     (( RETRY > 0 )) && CSV="sim_iter${ITER}_retry${RETRY}.csv"
 
-    echo -e "\n=== Sim 第 ${ITER} 輪$( (( RETRY > 0 )) && echo " (重量 $RETRY)"): " \
-            "static ${CUR_STATIC:-<USD 原值>}, dynamic ${CUR_DYNAMIC:-<USD 原值>} ==="
-    isaac_job run "$SIM_USD_PATH" "$CUR_STATIC" "$CUR_DYNAMIC"
-    CUR_STATIC="$REPLY_STATIC"; CUR_DYNAMIC="$REPLY_DYNAMIC"
-    echo "Isaac 回報實際生效: static $CUR_STATIC, dynamic $CUR_DYNAMIC"
+    if [[ "$FRICTION_MODEL" == "tire" ]]; then
+        echo -e "\n=== Sim 第 ${ITER} 輪$( (( RETRY > 0 )) && echo " (重量 $RETRY)"): 自訂輪胎摩擦 μ $CUR_DYNAMIC ==="
+        isaac_job run "$SIM_USD_PATH" "" "" "$CUR_DYNAMIC"
+        CUR_STATIC="$REPLY_TIRE_MU"; CUR_DYNAMIC="$REPLY_TIRE_MU"
+        echo "Isaac 回報實際生效: 自訂輪胎摩擦 μ $CUR_DYNAMIC"
+    else
+        echo -e "\n=== Sim 第 ${ITER} 輪$( (( RETRY > 0 )) && echo " (重量 $RETRY)"): " \
+                "static ${CUR_STATIC:-<USD 原值>}, dynamic ${CUR_DYNAMIC:-<USD 原值>} ==="
+        isaac_job run "$SIM_USD_PATH" "$CUR_STATIC" "$CUR_DYNAMIC" ""
+        CUR_STATIC="$REPLY_STATIC"; CUR_DYNAMIC="$REPLY_DYNAMIC"
+        echo "Isaac 回報實際生效: static $CUR_STATIC, dynamic $CUR_DYNAMIC"
+    fi
     if ! [[ "$CUR_STATIC" =~ ^[0-9.eE+-]+$ && "$CUR_DYNAMIC" =~ ^[0-9.eE+-]+$ ]]; then
-        echo "錯誤：讀不到 $GROUND_PRIM 的摩擦係數 (USD 沒設?)，用 --init-static / --init-dynamic 指定。"
+        if [[ "$FRICTION_MODEL" == "tire" ]]; then
+            echo "錯誤：Isaac 沒有回報自訂摩擦的 μ (load_isaac_usd.py 是舊版? 看 $SIM_LOG)"
+        else
+            echo "錯誤：讀不到 $GROUND_PRIM 的摩擦係數 (USD 沒設?)，用 --init-static / --init-dynamic 指定。"
+        fi
         isaac_stop; STATUS="failed"; break
     fi
 
@@ -399,8 +489,30 @@ echo "資料與比對結果: $HOST_RUN_DIR"
 case "$STATUS" in
     converged|max_iter)
         [[ "$STATUS" == "max_iter" ]] && echo "注意：沒有收斂，用的是最接近 real 的那一輪。"
+        if [[ "$FRICTION_MODEL" == "tire" ]]; then
+            # 自訂摩擦只在 session layer + Python 回呼裡, 存不進 USD -> 記成 JSON
+            "$PYTHON" - "$HOST_RUN_DIR/calibrated_tire.json" "$CUR_DYNAMIC" "$STATUS" \
+                "$HOST_RUN_DIR/run_config.json" <<'PY'
+import json, sys
+out, mu, status, cfg_path = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+cfg = json.load(open(cfg_path))
+t = cfg["tire"]
+res = {"mu": mu, "status": status, "lat_ratio": t["lat_ratio"], "front_share": t["front_share"],
+       "sim_usd": cfg["sim_usd"], "real_mu_truth": t["real_mu"]}
+json.dump(res, open(out, "w"), indent=2, ensure_ascii=False)
+print(f"自訂輪胎摩擦校正結果: μ {mu:.3f}  ({status})")
+if t["real_mu"] is not None:
+    e = mu - t["real_mu"]
+    print(f"  real 的真值 μ {t['real_mu']:g} -> 誤差 {e:+.3f} ({100 * e / t['real_mu']:+.1f}%)")
+print(f"已寫入 {out}")
+print(f"要在 Isaac GUI 用: 跑 scripts/isaac_tire_friction.py 之後, Script Editor 執行\n"
+      f"    import builtins; builtins.kros_tire.mu = {mu:.3f}")
+PY
+            echo "Isaac Sim 仍保持開啟狀態待命。"
+            exit 0
+        fi
         echo "sim 地面摩擦係數: static $CUR_STATIC, dynamic $CUR_DYNAMIC"
-        if isaac_job save "$SIM_USD_PATH" "$CUR_STATIC" "$CUR_DYNAMIC" "$CALIBRATED_USD"; then
+        if isaac_job save "$SIM_USD_PATH" "$CUR_STATIC" "$CUR_DYNAMIC" "" "$CALIBRATED_USD"; then
             echo "已另存校正後的 USD: $CALIBRATED_USD"
         else
             echo "另存 USD 失敗；請手動把 $GROUND_PRIM 的 staticFriction / dynamicFriction 設成上面的值。"

@@ -18,6 +18,11 @@ multicam_loc.launch.py** —— 那會多一個偵測節點 (2026-11-03 兩輪�
 天花板相機) 與 imu / wheel 兩條航位推算線預設不開 —— 控制跟分析都不用它們, 開了只是多吃
 CPU / GPU; 想一起比較定位品質就 camera:=true imu:=true wheel:=true (記得給 imu_initial_pose)。
 
+**模擬會一起開 actuator_model** (/joint_command -> /joint_command_isaac, 實體車的延遲 / 加速
+斜坡): kros_car*.usd 吃 joint_command_isaac, 沒開它車子完全不動。只在 use_sim_time:=true
+時開 (實體車不會開); actuator:=false 可以關掉。USD 還是舊的 joint_command 的話它的輸出沒人收,
+等於理想輪子, 沒有副作用。
+
 stage 沒有 8 台環境相機 (目前只有 kros_car_new.usd 有) 時 fusion 只剩 LiDAR + 遞推,
 給 multicam:=false 可以省下偵測節點的 GPU。
 
@@ -96,6 +101,9 @@ def generate_launch_description():
         DeclareLaunchArgument('room_x_max', default_value='4.58'),
         DeclareLaunchArgument('room_y_min', default_value='-2.58'),
         DeclareLaunchArgument('room_y_max', default_value='2.58'),
+        DeclareLaunchArgument('actuator', default_value='true',
+                              description='模擬時開 actuator_model (use_sim_time:=false 時一律不開)'),
+        DeclareLaunchArgument('actuator_delay', default_value='0.05'),
     ]
     sensor = PythonExpression(["'", lc('state_source'), "' == 'sensor'"])
 
@@ -120,6 +128,16 @@ def generate_launch_description():
             'wheel_scale': lc('wheel_scale'),
         }.items())
 
+    actuator = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(
+            get_package_share_directory('car_teleop'), 'launch', 'actuator_model.launch.py')),
+        condition=IfCondition(PythonExpression(
+            ["'", lc('actuator'), "' == 'true' and '", lc('use_sim_time'), "' == 'true'"])),
+        launch_arguments={
+            'use_sim_time': lc('use_sim_time'),
+            'delay': lc('actuator_delay'),
+        }.items())
+
     test = Node(
         package='calibrate_env_pkg', executable='calibrate_env_node',
         output='screen',
@@ -141,4 +159,4 @@ def generate_launch_description():
             'room_y_max': ParameterValue(lc('room_y_max'), value_type=float),
         }])
 
-    return LaunchDescription(args + [localization, test])
+    return LaunchDescription(args + [localization, actuator, test])

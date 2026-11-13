@@ -105,6 +105,10 @@ kros_car*.usd 的輪子沒綁物理材質 -> 用預設材質 0.5。所以 ground
   USD 讀不了 (沒有 pxr) 就用數字: --ref-ground-mu 0.5 [--wheel-mu 0.5 --combine average]
   真實世界沒有「輪子材質」這層, 直接看比值。
 
+  **自訂輪胎摩擦 (scripts/isaac_tire_friction.py) 用 `--combine direct`**: 那個模型不經過
+  PhysX 的材質, 摩擦力直接是 μ·N, 有效 mu 就是腳本的 mu (輪子材質不參與):
+    ./scripts/estimate_friction.py sim.csv real.csv --ref-ground-mu 0.5 --combine direct
+
 ────────────────────────────────────────────────────────────────────────
 訊號來源 (--source)
 ────────────────────────────────────────────────────────────────────────
@@ -722,12 +726,15 @@ def ground_mu(mu_eff, wheel_mu, mode):
         return mu_eff if mu_eff < wheel_mu else np.nan
     if mode == 'max':
         return mu_eff if mu_eff > wheel_mu else np.nan
+    if mode == 'direct':     # 自訂輪胎摩擦: 有效值就是 mu 本身
+        return mu_eff
     raise ValueError(mode)
 
 
 def effective_mu(mu_ground, wheel_mu, mode):
     return {'average': (mu_ground + wheel_mu) / 2, 'multiply': mu_ground * wheel_mu,
-            'min': min(mu_ground, wheel_mu), 'max': max(mu_ground, wheel_mu)}[mode]
+            'min': min(mu_ground, wheel_mu), 'max': max(mu_ground, wheel_mu),
+            'direct': mu_ground}[mode]
 
 
 # PhysX: 兩個材質的 combine mode 不同時, 取優先權高的 (average < min < multiply < max)
@@ -835,10 +842,16 @@ def ground_report(res, args, p=print):
     mode = ref['combine']
     s = args.ratio_scale
     p('═' * 78)
-    p(f'★ 目標環境地面摩擦係數   (PhysX combine={mode}, 輪子 static {ref["wheel"]["static"]:g} '
-      f'/ dynamic {ref["wheel"]["dynamic"]:g}' + (f', 比值校正 x{s:g}' if s != 1 else '') + ')')
+    if mode == 'direct':
+        p('★ 目標環境的摩擦係數   (自訂輪胎摩擦: 有效 mu = 腳本的 mu'
+          + (f', 比值校正 x{s:g}' if s != 1 else '') + ')')
+    else:
+        p(f'★ 目標環境地面摩擦係數   (PhysX combine={mode}, 輪子 static {ref["wheel"]["static"]:g} '
+          f'/ dynamic {ref["wheel"]["dynamic"]:g}' + (f', 比值校正 x{s:g}' if s != 1 else '') + ')')
     out = {}
     for term, attr, keys in GROUND_TERMS:
+        if mode == 'direct':
+            attr = f'輪胎 μ ({term})'
         key = next((k for k in keys if k in res), None)
         if key is None:
             p(f'  {attr:<26} 沒有可用的特徵 ({"/".join(keys)})')
@@ -1200,8 +1213,9 @@ def main():
                    help='輪子材質 mu (靜 / 動相同時的簡寫; 沒給 USD 時預設 0.5)')
     g.add_argument('--wheel-static', type=float, default=None)
     g.add_argument('--wheel-dynamic', type=float, default=None)
-    g.add_argument('--combine', default=None, choices=COMBINE_PRIORITY,
-                   help='friction combine mode (沒給 USD 時預設 average)')
+    g.add_argument('--combine', default=None, choices=COMBINE_PRIORITY + ['direct'],
+                   help='friction combine mode (沒給 USD 時預設 average); '
+                        'direct = 自訂輪胎摩擦 (有效 mu 就是給的 mu, 輪子材質不參與)')
     g.add_argument('--ratio-scale', type=float, default=1.0,
                    help='比值校正係數。用已知 mu 的環境量出系統性偏差後填 (真值比值 / 估計比值)')
     ap.add_argument('--plot', metavar='DIR', help='輸出逐 trial 散佈圖')

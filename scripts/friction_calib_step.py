@@ -43,7 +43,8 @@ STATUS:
 real 的 USD 兩個值一樣時這就是正解; 真的需要分開解再用 `--static-mode free`。
 
 * 只有一輪 sim (第 0 輪):  用 estimate_friction 的物理換算 (有效摩擦取平均、特徵 ∝ 有效
-  摩擦) 估 real 的地面值。
+  摩擦) 估 real 的地面值。自訂輪胎摩擦 (--combine direct) 時有效摩擦就是腳本的 mu,
+  --static / --dynamic 傳的就是那個 mu。
 * 兩輪以上:  **割線法**, 直接在「sim 地面係數 -> 量到的特徵」上內插 / 外插 real 的特徵值,
   取最靠近 real 的兩個點 (real 被夾在中間的那一對優先)。不需要任何物理模型 ——
   特徵對 mu 不是完全線性的 (接觸模型、輪胎變形), 割線法用的是實際量到的曲線,
@@ -286,7 +287,9 @@ def main():
     ap.add_argument('--mu-min', type=float, default=0.05)
     ap.add_argument('--mu-max', type=float, default=5.0)
     ap.add_argument('--wheel-mu', type=float, default=0.5, help='輪子材質 mu (PhysX 預設 0.5)')
-    ap.add_argument('--combine', default='average', choices=['average', 'min', 'multiply', 'max'])
+    ap.add_argument('--combine', default='average',
+                    choices=['average', 'min', 'multiply', 'max', 'direct'],
+                    help='direct = 自訂輪胎摩擦 (--static/--dynamic 就是腳本的 mu)')
     ap.add_argument('--static-mode', default='tied', choices=['tied', 'free'],
                     help='tied = static 跟著 dynamic 走 (預設, 見檔頭); free = 用 B2 分開解')
     ap.add_argument('--source', default=None, help='傳給 estimate_friction 的 --source')
@@ -341,9 +344,10 @@ def main():
                           f'{tag} 連輪速最低的那一檔自旋都馬達飽和 (四輪平均 '
                           f'{m.get("spin_torque_raw", float("nan")):.2f} N·m, 堵轉扭矩 '
                           f'{m.get("stall_torque", float("nan")):g} N·m): 再調低 spin_wheel_speed 也沒用, '
-                          '這個地面的摩擦力超出這台車量得到的範圍。整車 12.5 kg 時量得到的上限'
-                          '大約是地面 mu 1.5 (無頭 PhysX 實測 1.0 / 1.2 / 1.5 可以, 2.0 不行); '
-                          '車愈重上限愈低。把 real 那一份的地面摩擦設在範圍內, 或確認車重')
+                          '這個地面的摩擦力超出這台車量得到的範圍。PhysX 摩擦 (combine average, '
+                          '整車 12.5 kg) 的上限大約是地面 mu 1.5; 自訂輪胎摩擦 (11.7 kg, 後輪載重 6 成) '
+                          '的 mu 就是有效值, 上限大約 1.2 (spin_wheel_speed 6) ~ 1.4 (3)。'
+                          '車愈重上限愈低。把 real 那一份的摩擦設在範圍內, 或確認車重')
         if m.get('sat_frac', 0.0) > MAX_SAT_FRAC:
             return finish('failed', args.static, args.dynamic,
                           f'{tag} 有 {m.get("saturated")} 趟自旋馬達飽和 (扭矩貼著上限或輪速追不上): '

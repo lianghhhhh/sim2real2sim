@@ -98,7 +98,8 @@ bash run_isaac_gui.sh
 | --- | --- | --- | --- |
 | `kros_car_new.usd` | **有** | `/joint_command_isaac` | 日常用。方法五、六只有在這份上才有相機 |
 | `kros_car.usd` | 沒有 | `/joint_command_isaac` | 車的原始模型 (下面「kros_car.usd」那一節); `collect_car_pkg` 收動態資料用 |
-| `kros_car_05_sim.usd` / `kros_car_10_real.usd` / `kros_car_sim_calibrated.usd` | 沒有 | `/joint_command` | `run_car.sh` 摩擦力自動校正的預設輸入 (地面 mu 不一樣)。融合在這幾份上只剩 LiDAR + 遞推 |
+| `kros_car_sim.usd` / `kros_car_real.usd` | **有** | `/joint_command_isaac` | `run_car.sh` 摩擦力自動校正的預設輸入 (2026-11-11 起, 跟 `kros_car.usd` 同一份)。μ 由自訂輪胎摩擦設定, 不在 USD 裡 |
+| `kros_car_05_sim.usd` / `kros_car_10_real.usd` / `kros_car_sim_calibrated.usd` | 沒有 | `/joint_command` | 舊的 `run_car.sh --friction-model physx` 輸入 (地面 mu 不一樣)。融合在這幾份上只剩 LiDAR + 遞推 |
 | `car.usd` | 沒有 | `/joint_command` (effort) | 舊車, 現在的控制節點開不動它 (見下面「kros_car.usd」那一節) |
 
 **📦 輪子吃 `/joint_command_isaac` 的 USD, 一定要開致動器模型, 不然車子完全不動:**
@@ -486,9 +487,9 @@ commit `b029732` 刪掉, 要翻舊程式就 `git show 7c984df:src/<package>/...`
 * **車重。** `base_link` 的 `physics:mass` 目前是 5.0 kg (整車 12.5 kg), 那是為了讓車子轉得動
   先填的假設值, 要秤實車: 質量 = 整車重 - 7.51 kg, 慣量 = (0.1556, 0.2975, 0.3868) x 質量 / 37.56。
   自旋扭矩正比於「mu x 車重」, 車重錯多少, 校正出來的 mu 就反向錯多少。
-* **`run_car.sh` 的預設 USD (`kros_car_05_sim` / `kros_car_10_real` / `kros_car_sim_calibrated`)
-  沒有 8 台環境相機**, 而且輪子吃 `/joint_command` (理想輪子, 沒有致動器模型)。在它們上面融合只剩
-  LiDAR + 遞推。要有相機就得用 `kros_car_new.usd` 另存、各自改地面摩擦。
+* **`run_car.sh --friction-model physx` 用的舊 USD (`kros_car_05_sim` / `kros_car_10_real` /
+  `kros_car_sim_calibrated`) 沒有 8 台環境相機**, 而且輪子吃 `/joint_command` (理想輪子)。預設的
+  tire 模式用 `kros_car_sim.usd` / `kros_car_real.usd`, 沒有這個問題 (`friction_test.launch.py` 會開致動器模型)。
 * **天花板相機 (方法一) 的 yaw 在原地轉時是錯的** (速度方向推的, 車體沒位移就停在舊值; 低速時誤差中位
   53~105 度)。要換 OBB 定向框模型才解得了; 融合已經不吃天花板相機, 不受影響。
 * **多相機在慢速轉彎時誤差 3~4 cm**, 是方法五、六最大的誤差來源, 原因還沒找到 (側向滑動、相機台數
@@ -526,8 +527,13 @@ python3 scripts/calibrate_camera_ground.py car_run_data/sim_data.csv --write
 輪速控制下沒有「斷油滑行」, 舊的摩擦力特徵 (coast-down 的減速度、起轉 effort) 不存在。
 現在的主特徵是**等速原地轉時的輪子扭矩** (正比於 mu), 細節見
 [control_car_node.py](src/calibrate_env_pkg/calibrate_env_pkg/control_car_node.py) 與
-[scripts/estimate_friction.py](scripts/estimate_friction.py) 的檔頭。`run_car.sh` 預設用
-`kros_car_05_sim.usd` / `kros_car_10_real.usd`。
+[scripts/estimate_friction.py](scripts/estimate_friction.py) 的檔頭。
+
+`run_car.sh` (2026-11-11 起) 預設用**自訂輪胎摩擦** ([scripts/isaac_tire_friction.py](scripts/isaac_tire_friction.py)):
+sim = `kros_car_sim.usd` 從 μ 0.5 開始迭代, real = `kros_car_real.usd` 設 μ 1.0 (sim-to-sim 的真值; 這台車量得到的上限約 1.2, 2.0 會馬達飽和)。
+Isaac 每次載入 USD 之後、Play 之前由 `load_isaac_usd.py` 執行那支腳本再設 μ; 收斂的 μ 寫到
+`car_run_data/<run>/calibrated_tire.json` (自訂摩擦存不進 USD)。`--sim-tire-mu` / `--real-tire-mu` 換值,
+`--friction-model physx` 回到舊的改地面材質流程。
 
 **前提是馬達扭矩沒有飽和**, 而馬達出得了的扭矩隨轉速下降 (USD 的輪子關節現在有
 DDSM115 的扭矩-轉速曲線: 堵轉 2.0 N·m, 115 rpm 剩 0.96, 200 rpm 是 0)。所以自旋用比較低的

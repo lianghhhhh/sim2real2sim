@@ -7,12 +7,11 @@ services:
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
       - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-      - MPC_CONFIG_PATH=/workspaces/config.json
+      - MPC_CONFIG_PATH=/workspaces/model/mpc_config.json
     network_mode: host
     volumes:
       - ../../src:/workspaces/src
       - ../../model:/workspaces/model
-      - ../../config.json:/workspaces/config.json
     command:
       - bash
       - -l
