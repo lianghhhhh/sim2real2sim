@@ -1,6 +1,6 @@
 {
-    "model_path": "mu035_k100.pth",
-    "scaler_path": "scaler_mu035_k100.npz",
+    "model_path": "mu035_k100_slow10.pth",
+    "scaler_path": "scaler_mu035_k100_slow10.npz",
     "N_steps": 20,
     "dt": 0.05,
     "max_wheel_speed": 10.0,
