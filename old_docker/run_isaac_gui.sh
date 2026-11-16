@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# repo 根目錄 (這支在 old_docker/ 裡, 往上一層); 從哪裡執行都一樣
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 DOCKER_IMAGE="registry.screamtrumpet.csie.ncku.edu.tw/screamlab/sim2real2sim:v1"
 DOCKER_NETWORK="compose_my_bridge_network"
 XAUTH_FILE="/tmp/.docker.xauth"
@@ -47,10 +50,10 @@ docker run -it --rm \
     --name ros2_node \
     --gpus all \
     --network "$DOCKER_NETWORK" \
-    -v "$(pwd)/src/:/workspaces/src" \
-    -v "$(pwd)/scripts/:/workspaces/scripts" \
-    -v "$(pwd)/car_run_data/:/workspaces/car_run_data" \
-    -v "$(pwd)/../cameracalibration:/cameracalibration" \
+    -v "$ROOT_DIR/src/:/workspaces/src" \
+    -v "$ROOT_DIR/scripts/:/workspaces/scripts" \
+    -v "$ROOT_DIR/car_run_data/:/workspaces/car_run_data" \
+    -v "$ROOT_DIR/../cameracalibration:/cameracalibration" \
     -v "$XAUTH_FILE:/tmp/.docker.xauth:ro" \
     --shm-size=2048m \
     -e ROS_DOMAIN_ID=82 \

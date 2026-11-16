@@ -44,7 +44,7 @@ Isaac Sim 裡 KROS car (`kros_car_new.usd`) 的車輛定位。六種方法各自
 ## 標記說明
 
 * 🖥 = 在 **host** 上跑
-* 📦 = 在 **容器裡**跑 (`run_isaac_gui.sh` 開出來的那個 shell, 或 `docker exec -it ros2_node bash`)
+* 📦 = 在 **容器裡**跑 (`run_isaac_mpc.sh` 開出來的那個 shell, 或另開一個: `./run_isaac_mpc.sh shell`)
 
 ---
 
@@ -76,11 +76,27 @@ Isaac Sim 裡 KROS car (`kros_car_new.usd`) 的車輛定位。六種方法各自
 
 ```bash
 cd ~/sim2real2sim
-bash run_isaac_gui.sh
+./run_isaac_mpc.sh          # 開容器並進入 bash (容器已經在跑就直接進去)
+./run_isaac_mpc.sh shell    # 其他終端機: 再開一個 shell 到同一個容器
 ```
 
 容器叫 `ros2_node`, `ROS_DOMAIN_ID=82` (跟 USD 裡的 ROS2Context 一致)。
-`--rm`: 離開這個 shell 容器就沒了。
+`--rm`: 第一個終端機離開 shell, 容器就沒了。
+
+映像檔是 `registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v2` (公開, 不用登入),
+本機沒有的話第一次執行會自己 pull。它是 `sim2real2sim:v1` 加上 MPC 的工具 (acados、casadi、
+l4casadi、scikit-learn) 與 pandas, 定位、建圖、摩擦力校正、MPC 都在這一個容器裡跑, 不用再開
+另一個 MPC 容器。怎麼 build / 發布見根目錄的 [Dockerfile](Dockerfile)
+(它以 v1 為底; v1 本身是 [old_docker/Dockerfile.old](old_docker/Dockerfile.old) build 出來的)。
+`model/` 會掛到 `/workspaces/model`, MPC 的設定 `MPC_CONFIG_PATH=/workspaces/model/mpc_config.json`。
+
+容器裡的 GUI (rviz2、rqt、cv2 視窗) 靠 host 上的 `socat` 把 X11 轉出去, **host 要先裝**:
+`sudo apt install socat`。沒裝的話容器照樣開得起來, 但 GUI 程式一連 X 就 crash (core dump)。
+
+舊的東西都收在 [old_docker/](old_docker/), 不需要再用: `run_isaac_gui.sh` (映像檔 `sim2real2sim:v1`,
+沒有 MPC 工具)、`docker/scripts/mpc.sh` (另一個 MPC 容器)、build v1 的 `Dockerfile.old`, 以及
+`requirements.txt` (容器裡的 YOLO 套件清單) 與 `requirements-analysis.txt` (host 上跑分析腳本要的套件,
+`pip install -r old_docker/requirements-analysis.txt`)。
 
 **🖥 終端 B —— 開 Isaac Sim**
 
@@ -98,6 +114,7 @@ bash run_isaac_gui.sh
 | --- | --- | --- | --- |
 | `kros_car_new.usd` | **有** | `/joint_command_isaac` | 日常用。方法五、六只有在這份上才有相機 |
 | `kros_car.usd` | 沒有 | `/joint_command_isaac` | 車的原始模型 (下面「kros_car.usd」那一節); `collect_car_pkg` 收動態資料用 |
+| `kros_car_mpc.usd` | **有** | `/joint_command_isaac` | MPC 循跡 (下面「MPC 循跡」)。`/World/Room` 是關的, **沒有牆就沒有 `/scan`**, LiDAR 定位不能用 |
 | `kros_car_sim.usd` / `kros_car_real.usd` | **有** | `/joint_command_isaac` | `run_car.sh` 摩擦力自動校正的預設輸入 (2026-11-11 起, 跟 `kros_car.usd` 同一份)。μ 由自訂輪胎摩擦設定, 不在 USD 裡 |
 | `kros_car_05_sim.usd` / `kros_car_10_real.usd` / `kros_car_sim_calibrated.usd` | 沒有 | `/joint_command` | 舊的 `run_car.sh --friction-model physx` 輸入 (地面 mu 不一樣)。融合在這幾份上只剩 LiDAR + 遞推 |
 | `car.usd` | 沒有 | `/joint_command` (effort) | 舊車, 現在的控制節點開不動它 (見下面「kros_car.usd」那一節) |
@@ -117,7 +134,21 @@ ros2 launch car_teleop actuator_model.launch.py
 r          # = colcon build --symlink-install && source install/setup.bash
 ```
 
-之後要再開幾個容器 shell 就用 `tmux` (ctrl+b, shift+' 多開幾個終端)。
+之後要再開幾個容器 shell, 就在別的終端機跑 `./run_isaac_mpc.sh shell`, 或在容器裡用 `tmux`
+(ctrl+b, shift+' 多開幾個終端)。
+
+**📦 MPC 循跡 (只有模擬)**: Isaac 開 `kros_car_mpc.usd`。開檔時跳出「ScriptNode Warning」要按
+**Yes** —— 不按的話整個場景的 OmniGraph 都不會跑, 一個 topic 都沒有。按 Play 之後在 Stage 視窗
+同時選 `/kros_car/base_link` 和路線 (`/World/BasisCurves/BasisCurves`), 路線追蹤腳本才會開始發
+`/nearest_curve_point` (白色的點就是它算出來的前方 10 個目標點)。然後在容器裡:
+
+```bash
+ros2 launch car_teleop actuator_model.launch.py      # 一個終端
+ros2 run mlp_control_pkg mlp_control_node            # 另一個終端; 第一次會編 acados solver
+```
+
+參數在 `model/mpc_config.json` (改完重開節點就好, 不用 rebuild)。不開 Isaac 先驗模型與 solver:
+在暫存資料夾跑 `ros2 run mlp_control_pkg mpc_offline_check` (它會在目前目錄產生 `c_generated_code/`)。
 
 **先確認 Isaac 真的在發資料**:
 
@@ -587,4 +618,8 @@ ros2 launch bringup_pkg friction_test.launch.py use_sim_time:=false \
 | IMU / 輪速一開始就差很遠 | `imu_initial_pose` 沒對到出生點 |
 | CSV 裡 `cam_stamp` 比 `/odom` 多了上千秒 | 時鐘基準不一樣 (`eval_loc_csv.py` 會警告)。分析時要先扣掉; **開融合之前要先查** |
 | 車子按前進鍵一直加速 | `car_teleop` 的 bridge 沒起來, 或收不到 `/joint_states`+`/imu` 回授 |
-| Foxglove 連不上 | `run_isaac_gui.sh` 沒做 port mapping, 用容器 IP 直連或加 `-p 8765:8765` |
+| Foxglove 連不上 | `run_isaac_mpc.sh` 沒做 port mapping, 用容器 IP 直連或加 `-p 8765:8765` |
+| 容器裡開 rviz2 / rqt 一開就 crash (core dumped) | host 沒裝 `socat`, X11 轉不出去: `sudo apt install socat`, 再重開 `run_isaac_mpc.sh` |
+| 開了 `kros_car_mpc.usd` 按 Play, 一個 topic 都沒有 | 開檔時的「ScriptNode Warning」沒按 Yes, 整個場景的 OmniGraph 都被停掉了。重開檔案按 Yes |
+| MPC 一直印 `No path points yet (/nearest_curve_point)` | 沒在 Stage 同時選車 (`/kros_car/base_link`) 和路線。Play 中選也可以, 選好下一幀就會開始 (Isaac 的 log 印 `SUCCESS: Tracking`) |
+| `kros_car.usd` / `kros_car_mpc.usd` 沒有 `/scan` | 這兩份的 `/World/Room` 是關的, 雷射打不到東西就不發。要 LiDAR 就把 Room 打開 (Stage 裡勾 active) |

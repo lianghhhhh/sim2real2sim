@@ -71,9 +71,9 @@ SKIP_ISAAC_LAUNCH=0     # 1 = Isaac 已經用 load_isaac_usd.py 開著了, 不�
 PYTHON="${PYTHON:-python3}"   # 跑分析用的 python (要有 numpy / pandas)
 
 # 執行 ROS 2 指令的 docker container
-# run_isaac_gui.sh 裡是 `docker run --name ros2_node ...`，所以名稱固定是 ros2_node
+# run_isaac_mpc.sh (以及舊的 old_docker/run_isaac_gui.sh) 裡是 `docker run --name ros2_node ...`，所以名稱固定是 ros2_node
 CONTAINER_NAME="ros2_node"
-DOCKER_IMAGE="registry.screamtrumpet.csie.ncku.edu.tw/screamlab/sim2real2sim:v1"
+DOCKER_IMAGE="registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v2"
 DOCKER_NETWORK="compose_my_bridge_network"
 # 進 container 後、跑 ros2 launch 前的初始化：直接用你在 container 裡設定好的 alias `r`
 # （定義在 container 的 ~/.bashrc 裡：source /workspaces/rebuild_colcon.rc）
@@ -218,7 +218,7 @@ PY
 
 # ─────────────────────────────────────────────────────────────
 # ROS 2 container
-# - 已經有人手動跑了 run_isaac_gui.sh → 直接沿用那個 container
+# - 已經有人手動跑了 run_isaac_mpc.sh → 直接沿用那個 container
 # - 沒有 → 自己用背景模式 (-d) 起一個，跑完再自動關掉
 # ─────────────────────────────────────────────────────────────
 container_running() {

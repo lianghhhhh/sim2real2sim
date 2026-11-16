@@ -9,8 +9,8 @@
 
 bridge:=auto (預設) 的挑法: 有裝 foxglove_bridge 就用它 (port 8765, 點雲效能好
 很多), 沒有就退回 rosbridge_server (port 9090, 會順便起 rosapi, Foxglove 才列得
-出 topic 清單)。映像檔 `sim2real2sim:v1` 本身只有 rosbridge; Dockerfile 已經加了
-foxglove-bridge, 重 build 之後就會自動改用它。
+出 topic 清單)。映像檔 (run_isaac_mpc.sh 用的 v2, 以及 v1) 都有裝
+foxglove-bridge (old_docker/Dockerfile.old 加的), 所以預設就是用它。
 
 影像會順便壓成 <topic>/compressed (每個 topic 一個 image_compressor: 10 Hz、寬 960 px、
 JPEG q70), **原始影像不經過 bridge** —— /rgb 跟 /camera_loc/detections (YOLO 標註圖)
@@ -106,7 +106,7 @@ def _setup(context):
         f'  現成版面: {_layout_path()}',
         '  (Foxglove -> Layout -> Import from file)',
         '',
-        '  連不上的話: run_isaac_gui.sh 沒有做 port mapping, 所以要嘛用上面的',
+        '  連不上的話: run_isaac_mpc.sh 沒有做 port mapping, 所以要嘛用上面的',
         f'  容器 IP 直連 (Linux 上可以), 要嘛在 docker run 加 -p {port}:{port}',
         '=' * 68,
         '',

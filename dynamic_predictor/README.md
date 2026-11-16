@@ -123,7 +123,7 @@ python export_for_mpc.py                # 匯出給 MPC (見下面)
 ```bash
 python export_for_mpc.py           # -> ../model/<名稱>.pth, scaler_<名稱>.npz, 並更新 ../model/mpc_config.json
 ```
-scaler 轉成 npz 是因為 MPC 容器 (`compose-mpc_isaac`) 的 sklearn 版本跟訓練環境不同。之後在 MPC 容器裡先跑
+scaler 轉成 npz 是因為 MPC 容器 (`run_isaac_mpc.sh` 開的 `ros2_node`) 的 sklearn 版本跟訓練環境不同。之後在容器裡先跑
 `ros2 run mlp_control_pkg mpc_offline_check` (方向、CasADi 與 PyTorch 是否一致、閉迴路) 再上 Isaac。
 
 **改了模型格式** (`STATE_COLS`、`CONTROL_COLS`、`SEQ_LENGTH`、`ABS_STATE_MASK`、`BODY_FRAME_CONVENTION`、`DT`)

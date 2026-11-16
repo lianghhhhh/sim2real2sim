@@ -10,8 +10,9 @@ services:
       - MPC_CONFIG_PATH=/workspaces/model/mpc_config.json
     network_mode: host
     volumes:
-      - ../../src:/workspaces/src
-      - ../../model:/workspaces/model
+      # 路徑相對於這個 compose 檔 (old_docker/docker/compose/), 往上三層才是 repo 根目錄
+      - ../../../src:/workspaces/src
+      - ../../../model:/workspaces/model
     command:
       - bash
       - -l

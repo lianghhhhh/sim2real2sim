@@ -20,8 +20,8 @@ ros2 launch car_viz viz.launch.py image_topics:=/rgb                  # 只壓 /
 啟動後會把網址印出來 (`ws://<容器IP>:<port>`)。
 Foxglove Studio -> Open connection -> Foxglove WebSocket (或 Rosbridge) -> 貼上。
 
-映像檔 `sim2real2sim:v1` 本身只有 rosbridge; `Dockerfile` 已經加了
-`ros-humble-foxglove-bridge`, 重 build 之後 `auto` 就會改用它。
+`old_docker/Dockerfile.old` (build `sim2real2sim:v1` 的那份) 有裝 `ros-humble-foxglove-bridge`,
+所以 v1 與 `run_isaac_mpc.sh` 用的 v2 裡都有 foxglove_bridge, `auto` 會直接用它。
 
 ## 影像會自動壓縮
 
@@ -99,5 +99,5 @@ IMU 那條預設隱藏 (它會漂出房間, 把畫面拉得很遠), 要看再在
 
 ## 連不上
 
-`run_isaac_gui.sh` 沒有做 port mapping。Linux 上直接用 launch 印出來的容器 IP 連;
+`run_isaac_mpc.sh` 沒有做 port mapping。Linux 上直接用 launch 印出來的容器 IP 連;
 連不上就在 `docker run` 加 `-p 8765:8765` (rosbridge 則是 `-p 9090:9090`)。
