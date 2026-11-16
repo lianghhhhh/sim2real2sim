@@ -8,10 +8,19 @@
     "curvature_slowdown": 0.5,
     "path_point_spacing": 0.1,
     "weights": {
-        "cte": 10.0, "ate": 3.0, "head": 8.0, "speed": 10.0, "u": 0.2, "du": 0.5,
+        "cte": 10.0,
+        "ate": 3.0,
+        "head": 8.0,
+        "speed": 10.0,
+        "u": 0.2,
+        "du": 0.5,
         "terminal_scale": 1.5
     },
     "norms": {
-        "cte": 0.15, "ate": 0.5, "head": 0.2, "speed": 0.3, "du": 1.5
+        "cte": 0.15,
+        "ate": 0.5,
+        "head": 0.2,
+        "speed": 0.3,
+        "du": 1.5
     }
 }

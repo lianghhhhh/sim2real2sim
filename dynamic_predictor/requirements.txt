@@ -1,0 +1,9 @@
+# dynamic_predictor 訓練用的套件 (torch 另外裝, 要依 CUDA 版本選 index, 見 setup_env.sh)
+# 2026-11-12 訓練 mu035_k100 時的版本: python 3.12.16, torch 2.14.1+cu130, numpy 2.5.4,
+# pandas 3.1.1, scikit-learn 1.9.1, joblib 1.6.0, matplotlib 3.11.2, tensorboard 2.21.0
+numpy>=2.0
+pandas>=2.2
+scikit-learn>=1.5
+joblib>=1.4
+matplotlib>=3.8
+tensorboard>=2.16
