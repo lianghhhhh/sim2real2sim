@@ -26,7 +26,8 @@ Isaac Sim 裡 KROS car (`kros_car_new.usd`) 的車輛定位。六種方法各自
 | `bringup_pkg` | `collect_all.launch.py` (六條一起開)、`friction_test.launch.py` (摩擦力測試 + 定位)、`my_launch.launch.py` (只跑摩擦力腳本) | |
 | `car_imu_noise` | **只給模擬用**: 把真實 MEMS 的零偏與雜訊加到 Isaac 的 `/imu` 上 | [README](src/car_imu_noise/README.md) |
 | `collect_car_pkg` | **只給模擬用**: 隨機輪速指令開車, 收車輛動態模型的訓練資料 (給 `dynamic_predictor/`) | [README](src/collect_car_pkg/README.md) |
-| `mlp_control_pkg` | 用學到的動態模型做 MPC 循跡 (acados)。位姿吃 Isaac 的 `/odom`, 目前只能在模擬跑 | |
+| `mlp_control_pkg` | 用學到的動態模型做 MPC 循跡 (acados)。位姿吃 Isaac 的 `/odom`、目標點吃 Isaac ScriptNode 的 `/nearest_curve_point`, 只能在模擬跑 | |
+| `sensor_mpc_pkg` | **同一個 MPC, 但位姿吃感測器定位** (`/fusion_loc/odom`) 與輪速回授, 目標點由 ROS 端的 `path_tracker` (路徑 CSV) 算 —— 實體車用這個; 模擬也可以跑, 拿來量定位誤差吃掉多少循跡精度 | [README](src/sensor_mpc_pkg/README.md) |
 
 方法一到四**互不相干** —— 彼此不 import、不訂閱別人的 topic, 才能拿同一趟資料公平比較。
 方法五和方法六是**同一個節點類別** (`car_loc_multicam` 的 `multicam_fusion`): 都吃 8 台相機的

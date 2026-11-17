@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sensor_mpc_pkg</name>
+  <version>0.0.0</version>
+  <description>MPC path tracking driven by sensor-based localization (car_loc_fusion odom + wheel feedback) instead of Isaac ground truth; path tracker ported from the Isaac ScriptNode.</description>
+  <maintainer email="selenahuang0218@gmail.com">liangh</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>python3-numpy</depend>
+  <!-- MPC 的模型 / acados solver / 參考點建法直接 import mlp_control_pkg 的, 一份程式碼兩邊共用 -->
+  <depend>mlp_control_pkg</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>bringup_pkg</exec_depend>
+  <exec_depend>car_teleop</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
