@@ -7,9 +7,10 @@
     (要吃 Isaac 的 /nearest_curve_point 做 A/B 就 path_heading_relative:=true)
   * 定位不可信 (位姿 / 輪速斷、sigma 太大、絕對量測斷太久) 或路徑走完就送 0 停車;
     停超過一個 window (SEQ*dt) 再恢復時, 歷史重新用目前狀態填
-  * 循跡誤差同時記「對感測器位姿」與「對 GT」(模擬裡有給 gt_topic 時), 結束時存 CSV
+  * 循跡誤差同時記「對感測器位姿」與「對 GT」(模擬裡有給 gt_topic 時), 結束時存 CSV;
+    cte = 到整條路徑折線的距離 (path_error.py, 訂閱 path_tracker 的 /sensor_mpc/path)
   * offset-free: 每個週期比較模型預測的下一步與實際量到的, 低通後當成擾動加進 MPC 的預測
-    (disturbance.py; 修模型與車子不合造成的穩態誤差, 例如 2026-11-17 整路偏左 1.4 cm)
+    (disturbance.py; 修模型與車子不合造成的穩態誤差)
   * 圍籬: 車子 (感測器位姿) 跑出 geofence_x/y 的範圍、或進到 geofence_circles 的圓裡
     (柱子), 或 MPC 預測的前 geofence_horizon 秒會出去, 就送 0 並**鎖住**, 要呼叫
     ~/release_geofence 服務才會再動 (實體車上沒有牆的保護, 這是唯一的安全網)
@@ -26,6 +27,7 @@ import numpy as np
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray
 from std_srvs.srv import Trigger
@@ -35,14 +37,23 @@ from mlp_control_pkg.utils import (CUR, I_TH, NU, SEQ, createAcadosSolver, loadC
                                    loadModelFunc, snap_rpm)
 
 from .disturbance import N_DIST, DisturbanceEstimator
+from .path_error import PathError
 
 JOINT_NAMES = ['front_left_joint', 'front_right_joint', 'rear_left_joint', 'rear_right_joint']
 
+# cte / head_err (含 gt_): 到整條路徑折線的距離與切線 (path_error.py), err_src = 'path'。
+# 2026-11-18 以前是對參考軌跡第 0 列算的, 彎道有 0.1*0.2/(2R) 的偏差; 收不到 /sensor_mpc/path 時
+# 還是用舊算法, err_src = 'ref0'。ate 一直是對參考軌跡第 0 列 (速度跟不跟得上)。
+# path_s / path_kappa: 車子 (有 GT 就用 GT) 投影點的弧長與曲率 (左轉正), 拿來分直線 / 左轉 / 右轉。
 CSV_COLS = ['t', 'x', 'y', 'yaw', 'vx', 'vy', 'wz',
             'cte', 'ate', 'head_err',
             'gt_x', 'gt_y', 'gt_yaw', 'gt_cte', 'gt_ate', 'gt_head_err',
+            'path_s', 'path_kappa', 'err_src',
             'v_ref', 'cmd_l', 'cmd_r', 'solve_ms', 'ok', 'pose_age', 'lead', 'reason',
             'dist_vfwd', 'dist_vlat', 'dist_wz']
+
+LATCHED = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                     history=HistoryPolicy.KEEP_LAST, depth=1)
 
 
 def _track_err(x, y, th, ref0):
@@ -64,6 +75,7 @@ class SensorMpcNode(Node):
         p('mpc_config', '')                              # 空 = 環境變數 MPC_CONFIG_PATH
         p('path_topic', '/sensor_mpc/nearest_points')
         p('path_heading_relative', False)                # true = Isaac /nearest_curve_point 的相對航向
+        p('full_path_topic', '/sensor_mpc/path')         # 整條路徑 (latched), 算 cte 用; '' = 舊算法
         p('finished_topic', '/sensor_mpc/finished')
         p('joint_command_topic', '/joint_command')
         p('output_csv', '')                              # 空 = /tmp/sensor_mpc_tracking.csv
@@ -109,6 +121,10 @@ class SensorMpcNode(Node):
         self.pred_path_pub = self.create_publisher(Path, '/sensor_mpc/predicted_path_viz', 5)
         self.create_subscription(Float32MultiArray, str(g('path_topic')), self.on_path, 10)
         self.create_subscription(Bool, str(g('finished_topic')), self.on_finished, 10)
+        self.path_err = None           # PathError; None = 還沒收到整條路徑, cte 用舊算法
+        self._err_hint = {'est': None, 'gt': None}
+        if str(g('full_path_topic')):
+            self.create_subscription(Path, str(g('full_path_topic')), self.on_full_path, LATCHED)
 
         self.path_xy = None            # (n, 2)
         self.path_ang = None           # (n,) 絕對航向 rad (relative 模式存的是相對值)
@@ -159,6 +175,27 @@ class SensorMpcNode(Node):
         self.path_xy = pts[:, :2]
         self.path_ang = np.radians(pts[:, 2])
         self.t_path = self._now()
+
+    def on_full_path(self, msg: Path):
+        pts = [(ps.pose.position.x, ps.pose.position.y) for ps in msg.poses]
+        if len(pts) < 2:
+            return
+        self.path_err = PathError(pts)
+        self._err_hint = {'est': None, 'gt': None}
+        self.get_logger().info(f'整條路徑 {len(self.path_err.pts)} 點, {self.path_err.total:.1f} m, '
+                               f'{"封閉" if self.path_err.loop else "不封閉"}: cte 改量到路徑的距離')
+
+    def _path_err(self, key, x, y, yaw, ref0):
+        """-> (cross, along, head_err, s, kappa, src)。along 一直對 ref0。"""
+        _, along, _ = _track_err(x, y, yaw, ref0)
+        if self.path_err is None:
+            cross, _, head = _track_err(x, y, yaw, ref0)
+            return cross, along, head, float('nan'), float('nan'), 'ref0'
+        hint = self._err_hint[key]
+        win = None if hint is None else max(20, len(self.path_err.a) // 4)
+        r = self.path_err.query(x, y, yaw, hint, win)
+        self._err_hint[key] = r['seg']
+        return r['cross'], along, r['head_err'], r['s'], r['kappa'], 'path'
 
     def on_finished(self, msg: Bool):
         self.finished = bool(msg.data)
@@ -393,19 +430,20 @@ class SensorMpcNode(Node):
         self._cycle_count += 1
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        cte, ate, head = _track_err(state[0], state[1], state[2], ref[0])
+        cte, ate, head, ps, pk, src = self._path_err('est', state[0], state[1], state[2], ref[0])
         dps = d_param / self.dt
         row = dict(t=self._now(), x=state[0], y=state[1], yaw=state[2],
                    vx=state[3], vy=state[4], wz=state[5],
                    cte=cte, ate=ate, head_err=head, v_ref=v_ref,
+                   path_s=ps, path_kappa=pk, err_src=src,
                    cmd_l=u[0], cmd_r=u[1], solve_ms=elapsed_ms, ok=1,
                    pose_age=self.state_node.last_pose_age, lead=self.state_node.last_lead,
                    dist_vfwd=dps[0], dist_vlat=dps[1], dist_wz=dps[2])
         gt = self.state_node.gt
         if gt is not None:
-            gcte, gate, ghead = _track_err(gt[0], gt[1], gt[2], ref[0])
+            gcte, gate, ghead, gs, gk, _ = self._path_err('gt', gt[0], gt[1], gt[2], ref[0])
             row.update(gt_x=gt[0], gt_y=gt[1], gt_yaw=gt[2],
-                       gt_cte=gcte, gt_ate=gate, gt_head_err=ghead)
+                       gt_cte=gcte, gt_ate=gate, gt_head_err=ghead, path_s=gs, path_kappa=gk)
         self.rows.append(row)
 
         if elapsed_ms > self.dt * 1000.0:
@@ -433,13 +471,16 @@ class SensorMpcNode(Node):
                 return (f'{name}: mean={np.mean(v):+.4f}  mean_abs={np.mean(np.abs(v)):.4f}  '
                         f'rmse={np.sqrt(np.mean(v ** 2)):.4f}  max_abs={np.max(np.abs(v)):.4f}')
             log('===== Tracking Error Summary (對感測器位姿) =====')
+            srcs = {r.get('err_src') for r in ok}
+            log('Cross-track / Heading = ' + ('到路徑折線的距離與切線' if srcs == {'path'} else
+                f'有舊算法 (參考軌跡第 0 列, 彎道有偏差) 的週期: {sum(r.get("err_src") == "ref0" for r in ok)}'))
             log(f'Samples: {len(ok)}  (停車 {len(self.rows) - len(ok)} 個週期)')
             log(stats('Cross-track (m)', [r['cte'] for r in ok]))
             log(stats('Along-track (m)', [r['ate'] for r in ok]))
             log(stats('Heading (rad)', [r['head_err'] for r in ok]))
             gt = [r for r in ok if 'gt_cte' in r]
             if gt:
-                log('----- 同一組參考點, 對 GT -----')
+                log('----- 對 GT 位姿 -----')
                 log(stats('Cross-track (m)', [r['gt_cte'] for r in gt]))
                 log(stats('Along-track (m)', [r['gt_ate'] for r in gt]))
                 log(stats('Heading (rad)', [r['gt_head_err'] for r in gt]))

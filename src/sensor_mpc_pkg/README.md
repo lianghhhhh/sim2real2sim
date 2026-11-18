@@ -103,6 +103,41 @@ ros2 launch sensor_mpc_pkg sensor_mpc.launch.py use_sim_time:=false multicam:=fa
 (檔頭有用法, 它會把 CSV 寫進 `/World/BasisCurves/BasisCurves`; USD 要不要存自己決定 —— path_tracker
 只讀 CSV, 不讀 USD)。
 
+**`config/paths/` 多條測試路線** (2026-11-18, `scripts/make_paths.py` 產生, 總覽圖 `config/paths/overview.png`)。
+全部給 `kros_car_mpc_sensor.usd` 的房間, 都從出生點 (0, 0) 朝 +x 出發, 直線 + 圓弧接成; 離牆 >= 0.95 m、
+離圓柱中心 >= 1.3 m (圍籬圓 0.9 m)。要加新路線就在 `make_paths.py` 的 `PATHS` 加一個函式 (Turtle: `S` 直線、
+`L` / `R` 左右轉), 重跑會自己檢查接不接得起來、會不會碰牆。
+
+| 檔名 | 難度 | 內容 | 長度 | 最小半徑 | 封閉 |
+| --- | --- | --- | --- | --- | --- |
+| `e1_oval_ccw_r12` | 簡單 | 逆時針跑道, 只有左轉 | 14.7 m | 1.2 | 是 |
+| `e2_oval_cw_r10` | 簡單 | 順時針跑道, 只有右轉 | 12.1 m | 1.0 | 是 |
+| `e3_circle_ccw_r12` | 簡單 | 逆時針定圓 (穩態左轉) | 7.5 m | 1.2 | 是 |
+| `e4_circle_cw_r10` | 簡單 | 順時針定圓 (穩態右轉) | 6.3 m | 1.0 | 是 |
+| `e5_uturn_open` | 簡單 | 直線 + 180° 迴轉 + 直線 | 9.1 m | 1.0 | 否 |
+| `m1_figure8_r10` | 中等 | 8 字, 原點左右轉直接切換 | 12.6 m | 1.0 | 是 |
+| `m2_slalom_r07` | 中等 | 跑道 + 3 個 S 彎 | 15.0 m | 0.7 | 是 |
+| `m3_lshape_r08` | 中等 | L 形, 含一個右轉凹角 | 20.3 m | 0.8 | 是 |
+| `h1_serpentine_r04` | 困難 | 蛇行 4 車道 (間距 0.8 m), 髮夾彎 | 26.5 m | 0.4 | 是 |
+| `h2_lshape_r04` | 困難 | 跟 m3 同形狀, 圓角 R0.4 (接近直角) | 21.4 m | 0.4 | 是 |
+| `h3_spiral_open` | 困難 | 向內螺旋, 半徑 1.2 -> 0.4 | 11.3 m | 0.4 | 否 |
+| `h4_mixed_track` | 困難 | R1.4 大彎、R0.5 右髮夾、R0.5 S 彎 | 20.8 m | 0.5 | 是 |
+
+```bash
+ros2 launch sensor_mpc_pkg sensor_mpc.launch.py multicam:=false \
+    path_file:=/workspaces/src/sensor_mpc_pkg/config/paths/m1_figure8_r10.csv loop:=true \
+    output_csv:=/workspaces/car_run_data/mpc_m1_figure8.csv
+# 不封閉的 (e5, h3) 要 loop:=false, 開到終點會自己停
+```
+
+在 Isaac 裡看路線: `scripts/isaac_set_curve.py` 的 `set_curve(CSV)`; 不封閉的給 `closed=False`。
+車子每次都要放回 (0, 0) 朝 +x (Isaac Stop -> Play 就會回去)。
+
+離線試開 (`test/drive_paths_offline.py`, 受控體 = 動態模型自己, v_max 0.45, 2026-11-18): 12 條全部開完,
+沒碰圍籬、acados 沒失敗。到路徑的真正距離 RMS 0.09 到 0.29 cm、最大 1.08 cm (R0.4 的髮夾彎);
+輪速頂到上限的時間 `h2` 15%、`h1` 6%, 其他 <= 2.4%。這只證明幾何、速度、輪速上限和視界沒問題,
+模型在 R0.4 這麼小的半徑學得準不準要在 Isaac 上才看得出來。
+
 `config/path_kros_car_mpc.csv` 是從 `kros_car_mpc.usd` 的 `/World/BasisCurves/BasisCurves` 匯出的
 (39 個控制點, 間距 0.5 m, 封閉, 總長 19 m; 用的是**控制點連成的折線**, 跟 Isaac 的 ScriptNode 一樣)。
 路線在 GUI 裡被搬過就要重匯 (🖥 host 上, 不需要 Isaac 在跑):
@@ -178,8 +213,14 @@ PYTHONPATH=$E LD_LIBRARY_PATH=$E/bin:$HOME/isaac-sim/kit/python/lib \
 
 ### 輸出 CSV
 
-每個 MPC 週期一列: `t, x, y, yaw, vx, vy, wz` (餵給 MPC 的狀態)、`cte, ate, head_err` (對感測器位姿,
-相對這一週期的第 0 個參考點)、`gt_x, gt_y, gt_yaw, gt_cte, gt_ate, gt_head_err` (同一組參考點對 GT; 實體車空白)、
+每個 MPC 週期一列: `t, x, y, yaw, vx, vy, wz` (餵給 MPC 的狀態)、`cte, ate, head_err` (對感測器位姿)、
+`gt_x, gt_y, gt_yaw, gt_cte, gt_ate, gt_head_err` (對 GT; 實體車空白)、`path_s, path_kappa` (投影點的弧長與
+路徑曲率, 左轉正; 分直線 / 左轉 / 右轉用)、`err_src`。
+`cte` / `head_err` 是**到整條路徑折線的距離** (左正) 與跟路徑切線的角度差 (`sensor_mpc_pkg/path_error.py`,
+訂閱 path_tracker 的 `/sensor_mpc/path`, `err_src = path`)。2026-11-18 以前是對參考軌跡第 0 列算的: 那一點
+是從前方 0.1、0.2 m 兩個目標點往後延伸的, 在半徑 R 的彎道落在圓弧外側約 0.1 x 0.2 / (2R) (R1.2 時 0.83 cm),
+所以舊 CSV 的 cte 左轉偏正、右轉偏負 (`err_src` 空白或 `ref0`)。新舊 CSV 都可以用
+`scripts/eval_tracking.py` 重算 (`--path` 給跑的那條路線、`--markdown` 印表格)。`ate` 還是對第 0 個參考點。
 `v_ref, cmd_l, cmd_r, solve_ms, ok` (0 = 這一週期在停車或 solver 失敗, `reason` 寫原因)、
 `pose_age` (位姿訊息幾秒前的)、`lead` (實際外插了幾秒)。`t` 是 NaN 的列是 Isaac Stop / Play 的分段標記。
 **每一輪給不同的 `output_csv:=`**, 不然會互相覆寫。
@@ -188,57 +229,59 @@ PYTHONPATH=$E LD_LIBRARY_PATH=$E/bin:$HOME/isaac-sim/kit/python/lib \
 
 ```bash
 cd src/sensor_mpc_pkg && python3 test/test_path_tracker.py     # 秒級, host 就能跑
+python3 test/test_path_error.py                                 # 橫向誤差的定義 (path_error.py)
 # 容器裡 (要 torch / acados), 約 2 分鐘:
 cd /tmp && python3 /workspaces/src/sensor_mpc_pkg/test/test_offset_free.py
 ```
 
 `test_path_tracker`: 理想車沿路徑走兩圈 (偏離 0 m)、方向判斷、回歸曲線、不封閉路徑的終點。
 `test_offset_free`: 受控體 = 模型 + 固定擾動, 比較擾動估計開 / 關。改了 `mpc_config.json` 的權重先跑它。
+`drive_paths_offline` (容器裡): `config/paths/` 每條路線離線開一圈, 看開不開得完。
 
-## Isaac 實測 (2026-11-17, kros_car_mpc_sensor.usd, 這條路線, v_max 0.3)
+## Isaac 實測 (2026-11-17, kros_car_mpc_sensor.usd, 預設路線)
 
-| 位姿來源 | 輪胎摩擦 | 橫向誤差 RMS (對 GT) | 最大 | 定位誤差 |
-| --- | --- | --- | --- | --- |
-| Isaac GT `/odom` | 沒開 (PhysX 預設) | 1.97 cm | 5.95 cm | - |
-| 8 相機 + LiDAR 融合 | 沒開 | 2.60 cm | 6.89 cm | 車頭方向落後 5.4 cm |
-| 8 相機 + LiDAR 融合 | μ0.35 (= 模型的訓練條件) | **0.72 cm** | 3.12 cm | 車頭方向落後 6.4 cm |
-| LiDAR + IMU + 輪速 (`multicam:=false`, = 實體車的組合) | μ0.35 | 2.62 cm (平均 +1.5 cm 偏左) | 6.06 cm | **0.8 cm, 沒有落後** |
+完整的 17 輪參數與結果在 repo 根目錄的 `report_sensor_mpc_2026-11-17.md`。下面的橫向誤差都是到路徑的
+真正距離 (2026-11-18 用 `scripts/eval_tracking.py` 重算; 舊算法在彎道有 0.83 cm 的偏差, 見「輸出 CSV」)。
 
-* 輪胎摩擦要跟動態模型的訓練條件一樣 (`scripts/isaac_tire_friction.py`, μ0.35), 差 3.6 倍。
-* GT 位姿、LiDAR、相機補延遲三種位姿來源都是 RMS 約 2.5 cm、整路偏左 1.4 cm, 而且每一段的誤差
-  一模一樣 —— 是 MPC 本身的問題, 不是定位。8 相機沒補延遲那輪的 0.72 cm 是位姿落後剛好抵銷的巧合。
+| 位姿來源 | 輪胎摩擦 | head | v_max | 橫向 RMS | 最大 | 定位誤差 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8 相機 + LiDAR 融合 | 沒開 (PhysX 預設) | 8 | 0.30 | 2.77 cm | 6.89 cm | 車頭方向落後 5.4 cm |
+| GT `/odom` | μ0.35 (= 模型的訓練條件) | 8 | 0.30 | 2.04 cm | 3.93 cm | - |
+| LiDAR + IMU + 輪速 (`multicam:=false`, = 實體車的組合) | μ0.35 | 8 | 0.30 | 2.17 cm | 4.57 cm | 0.8 cm, 沒有落後 |
+| GT `/odom` | μ0.35 | **0.5** | 0.30 | **0.17 cm** | 0.56 cm | - |
+| LiDAR + 實體車 IMU 設定 + MEMS 雜訊 | μ0.35 | 0.5 | 0.30 | **0.48 cm** | 1.34 cm | 0.7 cm |
+| 同上 | μ0.35 | 0.5 | **0.45** | **0.48 cm** | 1.33 cm | 1.3 cm |
 
-### 偏左的原因與修正 (2026-11-17)
+* 輪胎摩擦要跟動態模型的訓練條件一樣 (`scripts/isaac_tire_friction.py`, μ0.35)。
+* head 8 時 GT 位姿、LiDAR、相機三種位姿來源都是 RMS 2.0~2.3 cm, 而且左轉偏左、右轉偏右 (都往彎道內側)
+  —— 是 MPC 本身的問題, 不是定位。
 
-離線 (`受控體 = 模型自己`, 沒有任何擾動) 也偏左 1.6 cm、RMS 2.2 cm, 所以是成本設計。滑移轉向車在
+### 切彎的原因與修正 (2026-11-17)
+
+離線 (`受控體 = 模型自己`, 沒有任何擾動) head 8 也一樣切內側 (左轉平均 +2.5 cm), 所以是成本設計。滑移轉向車在
 彎道裡車身會側滑, 車頭要偏離切線 2~3° (模型: 半徑 0.8 m 約 3°); `mpc_config.json` 的航向權重 8
-太重, MPC 硬把車頭轉回切線, 代價是整台車往彎道內側偏。逐項掃權重 (每一種設定一個程序跑):
+太重, MPC 硬把車頭轉回切線, 代價是整台車往彎道內側偏。逐項掃權重 (每一種設定一個程序跑, v_max 0.3,
+到路徑的真正距離):
 
 | `weights.head` | 橫向 RMS | 最大 | 指令變化量 |
 | --- | --- | --- | --- |
-| 8 (舊) | 2.23 cm | 4.84 cm | 0.76 rad/s/步 |
-| 2 | 1.31 cm | 2.85 cm | |
-| 1 | 0.99 cm | 2.29 cm | 0.28 |
-| **0.5 (現在)** | **0.74 cm** | **1.81 cm** | 0.20 |
-| 0.5, v_max 0.45 | 0.63 cm | 1.64 cm | 0.16 |
+| 8 (舊) | 1.72 cm | 3.57 cm | 0.76 rad/s/步 |
+| 2 | 0.77 cm | 1.61 cm | 0.38 |
+| 1 | 0.44 cm | 0.99 cm | 0.28 |
+| **0.5 (現在)** | **0.18 cm** | **0.52 cm** | 0.20 |
+| 0.25 | 0.09 cm | 0.30 cm | 0.15 |
+| 0.5, v_max 0.45 | 0.11 cm | 0.37 cm | 0.16 |
 
 試過沒用的: 參考點前視 (變差)、航向改成對行進方向 (變差)、降低 du 權重 (變差)。
 **`model/mpc_config.json` 的 `head` 已經從 8 改成 0.5** (`mlp_control_pkg` 共用這一份)。
 
-Isaac 驗證 (同一天, 摩擦開, 這條路線):
-
-| 位姿來源 | head 8 (舊) | head 0.5 + 擾動估計 |
-| --- | --- | --- |
-| GT `/odom` | RMS 2.55 cm, 最大 5.41, 平均 +1.39 | **RMS 0.79 cm, 最大 1.86, 平均 +0.40** |
-| LiDAR + 實體車 IMU 設定 (+ `car_imu_noise` 的 MEMS 雜訊) | 2.74 / 6.08 / +1.49 (沒加雜訊) | **0.95 / 2.49 / +0.58** |
-
-GT 位姿關掉擾動估計是 0.80 cm —— 模擬裡模型跟車子幾乎一樣, 估計器沒事做 (估到 wz −0.0125 rad/s,
+GT 位姿關掉擾動估計是 0.22 cm (開 0.17 cm) —— 模擬裡模型跟車子幾乎一樣, 估計器沒事做 (估到 wz −0.0125 rad/s,
 前進 +0.5 cm/s)。上實體車時這三個值就是「模型跟車差多少」的直接量測。
 
 另外加了 **offset-free MPC** (`disturbance.py`, 預設開, `disturbance:=false` 關掉): 每個週期比較模型
 預測的下一步與實際量到的, 低通 (tau 1 s) 後當成擾動加進 MPC 的預測。車子與模型不合 (實體車一定會)
 時把穩態偏差吃掉, 沒有不合時不影響。離線測試 (`test/test_offset_free.py`, 受控體多一個每秒往右轉
-0.03 rad 的擾動): 估計關 RMS 1.18 cm, 估計開 0.88 cm, 沒擾動 0.82 cm; 估到的擾動跟設定值一樣。
-CSV 多三欄 `dist_vfwd, dist_vlat, dist_wz` (估到的擾動, 每秒)。多一次模型計算, 每週期約 +5 ms。
+0.03 rad、往左滑 0.5 cm/s 的擾動, v_max 0.45): 估計關 RMS 0.34 cm, 估計開 0.12 cm, 沒擾動 0.11 cm;
+估到的擾動跟設定值一樣。CSV 多三欄 `dist_vfwd, dist_vlat, dist_wz` (估到的擾動, 每秒)。多一次模型計算, 每週期約 +5 ms。
 * vy 給 0: 動態模型的輸入有 vy, GT 微分出來的側向速度 RMS 只有 0.9 cm/s, 影響很小。
 * 實體車的場地地圖與路徑 CSV 都還沒有。

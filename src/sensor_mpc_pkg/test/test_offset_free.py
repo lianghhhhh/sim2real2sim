@@ -12,8 +12,9 @@
     C  受控體沒有擾動、估計開 (確認估計器不會自己製造偏差)
 通過條件: B 比 A 好, 而且 B 回到「沒有擾動」那一輪的水準 (RMS 差 < 1.5 mm); C 跟沒有擾動時一樣好。
 
-2026-11-17 結果 (mpc_config.json head 權重 0.5): A RMS 1.18 cm, B 0.88, 沒擾動 0.82, C 0.82;
-估到的擾動 wz -0.0300 rad/s、v_lat +0.50 cm/s (= 設定值)。
+橫向誤差 = 到路徑折線的真正距離 (path_error.py)。2026-11-18 結果 (head 0.5, v_max 0.45):
+A RMS 0.34 cm, B 0.12, 沒擾動 0.11, C 0.11; 估到 wz -0.0300 rad/s、v_lat +0.50 cm/s (= 設定值)。
+(2026-11-17 那版對參考軌跡第 0 列算, 彎道有 0.1*0.2/(2R) 的偏差: A 1.18, B 0.88, 沒擾動 0.82, C 0.82 cm。)
 """
 import os
 import sys
@@ -28,6 +29,7 @@ from mlp_control_pkg.utils import (CUR, NS, NU, SEQ, apply_body_delta_np,  # noq
                                    createAcadosSolver, loadConfig, loadModelFunc,
                                    loadTorchModel, snap_rpm)
 from sensor_mpc_pkg.disturbance import N_DIST, DisturbanceEstimator  # noqa: E402
+from sensor_mpc_pkg.path_error import PathError                      # noqa: E402
 from sensor_mpc_pkg.path_tracker import PathTracker, load_path_csv   # noqa: E402
 
 PATH = os.path.join(os.path.dirname(__file__), '..', 'config', 'path_kros_car_mpc_sensor.csv')
@@ -56,6 +58,8 @@ def run(name, cfg, model, func, solver, estimate, wz, vlat):
     v_max, k_curv = float(cfg.get('v_max', 0.3)), float(cfg.get('curvature_slowdown', 0.5))
     spacing = float(cfg.get('path_point_spacing', 0.1))
     tracker = PathTracker(load_path_csv(PATH), loop=True, spacing=spacing)
+    pe = PathError(load_path_csv(PATH), loop=True)
+    hint = None
     plant = DisturbedPlant(model, np.zeros(NS), dt, wz, vlat)   # 出生點 (0, 0) 朝 +x, 就在路徑起點
     est = DisturbanceEstimator(func, dt, tau=1.0, limit=(0.01, 0.005, 0.005))
     prev_x = prev_u = None
@@ -87,8 +91,9 @@ def run(name, cfg, model, func, solver, estimate, wz, vlat):
         prev_x = [solver.get(t, 'x') for t in range(N + 1)]
         prev_u = [solver.get(t, 'u') for t in range(N)]
         u = np.array([snap_rpm(v) for v in prev_u[0]])
-        x_t, y_t, s_t, c_t = ref[0]
-        ctes.append(-(s[0] - x_t) * s_t + (s[1] - y_t) * c_t)
+        e = pe.query(s[0], s[1], s[2], hint, None if hint is None else 20)
+        hint = e['seg']
+        ctes.append(e['cross'])                    # 到路徑折線的真正距離 (左正)
         last = (np.array(plant.S), np.array(plant.U + [u]))
         plant.step(u)
     c = np.array(ctes[int(5.0 / dt):])        # 去掉前 5 s (估計器還沒收斂)
