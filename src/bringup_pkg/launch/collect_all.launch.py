@@ -143,6 +143,14 @@ def generate_launch_description():
                               description='fus_ 的加速度過程雜訊; complementary 模式要 0.35'),
         DeclareLaunchArgument('wheel_scale', default_value='1.0',
                               description='whl_ / fus_ 的有效輪半徑比例 (實際輪徑 / 節點的 wheel_radius 0.051356)'),
+        # 絕對量測的常數延遲 (s), 加回量測的時戳上 (見 car_loc_fusion/sources.py 「時鐘偏移」那段:
+        # 時戳跟 /clock 不同基準時, 偏移鎖定會把真正的延遲一起吃掉, 只能這樣手動補)。
+        # 2026-11-17 kros_car_mpc_sensor.usd 上 8 台相機的融合位置落後 GT 約 5 cm, 但大部分是固定偏移
+        # (−5.25 cm − 0.045 s × v), 不是延遲 —— 車型 car_model.yaml 的問題, 補延遲只在等速時剛好對。
+        DeclareLaunchArgument('bbox_extra_delay', default_value='0.0',
+                              description='8 台相機車框的常數延遲 (s), fus_ 與 mc_ 都吃'),
+        DeclareLaunchArgument('lidar_extra_delay', default_value='0.0',
+                              description='/lidar_loc/odom 的常數延遲 (s)'),
     ]
     use_sim_time = LaunchConfiguration('use_sim_time')
     initial_pose = ParameterValue(
@@ -255,6 +263,10 @@ def generate_launch_description():
                 LaunchConfiguration('multicam'), value_type=bool),
             'lidar_enabled': ParameterValue(
                 LaunchConfiguration('lidar'), value_type=bool),
+            'bbox_extra_delay': ParameterValue(
+                LaunchConfiguration('bbox_extra_delay'), value_type=float),
+            'lidar_extra_delay': ParameterValue(
+                LaunchConfiguration('lidar_extra_delay'), value_type=float),
         }])
 
     # 方法六 (mc_): 同一個節點類別, 只差不吃 LiDAR —— 拿 mc_ 跟 fus_ 比就是「LiDAR 值多少」。
@@ -274,6 +286,8 @@ def generate_launch_description():
                 LaunchConfiguration('fusion_sigma_acc'), value_type=float),
             'lidar_enabled': False,
             'publish_markers': False,
+            'bbox_extra_delay': ParameterValue(
+                LaunchConfiguration('bbox_extra_delay'), value_type=float),
         }])
 
     # calibrate_env_node 會連 ControlCarNode 一起開 (車子自己跑摩擦力腳本, 跑完

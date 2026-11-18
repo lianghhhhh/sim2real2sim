@@ -150,7 +150,14 @@ def loadModelFunc(config):
 
 
 # ─────────────────────────────────────────────── acados
-def createAcadosSolver(nn_model_func, lib_dir, lib_name, config):
+N_DIST = 3                        # 擾動: 每一步的 (前進, 左側, theta) 差, 車體座標
+
+
+def createAcadosSolver(nn_model_func, lib_dir, lib_name, config, disturbance=False):
+    """disturbance=True: 參數多 N_DIST 個 [d_fwd, d_lat, d_th] (每一步, 車體座標), 加在模型預測的
+    位姿差上 (offset-free MPC; 由 sensor_mpc_pkg 的 DisturbanceEstimator 估)。預設 False = 舊的 5 個參數,
+    mlp_control_pkg 的節點不受影響。
+    注意: 同一個程序裡重建同名的 solver 會載到已經載入的舊 .so (acados), 改權重要換程序。"""
     N = int(config['N_steps'])
     dt = float(config['dt'])
     wmax = float(config.get('max_wheel_speed', 10.0))
@@ -161,10 +168,11 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, config):
     nrm.update(config.get('norms', {}))
 
     model = AcadosModel()
-    model.name = 'car_model'
+    model.name = 'car_model_dist' if disturbance else 'car_model'
+    n_p = 5 + (N_DIST if disturbance else 0)
     x = ca.MX.sym('x', NX)
     u = ca.MX.sym('u', NU)
-    p = ca.MX.sym('p', 5)              # [path x, path y, sin(path heading), cos(path heading), v_ref]
+    p = ca.MX.sym('p', n_p)            # [path x, path y, sin(path heading), cos(path heading), v_ref (, d_fwd, d_lat, d_th)]
 
     # 1. 擴增狀態 -> 模型輸入
     X = [x[i * NS:(i + 1) * NS] for i in range(SEQ)]
@@ -176,6 +184,8 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, config):
     delta = nn_model_func(ca.vertcat(*feats))
 
     # 2. 下一步: 目前狀態 + 預測的差, window 往前移一格
+    if disturbance:
+        delta = delta + ca.vertcat(p[5:5 + N_DIST], ca.MX.zeros(NS - N_DIST, 1))
     x_new = apply_body_delta(X[-1], delta)
     x_next = ca.vertcat(x[NS:SEQ * NS], x_new, x[SEQ * NS + NU:NX], u)
 
@@ -215,7 +225,7 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, config):
 
     # 4. 限制與 solver
     ocp.constraints.x0 = np.zeros(NX)
-    ocp.parameter_values = np.zeros(5)
+    ocp.parameter_values = np.zeros(n_p)
     ocp.constraints.lbu = -wmax * np.ones(NU)
     ocp.constraints.ubu = wmax * np.ones(NU)
     ocp.constraints.idxbu = np.arange(NU)
@@ -230,4 +240,4 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, config):
     ocp.solver_options.qp_tol = 1e-3
 
     os.environ['CFLAGS'] = '-O3 -ffast-math -march=native'
-    return AcadosOcpSolver(ocp, json_file='acados_ocp.json')
+    return AcadosOcpSolver(ocp, json_file=f'acados_ocp_{model.name}.json')
