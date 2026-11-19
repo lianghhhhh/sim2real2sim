@@ -14,13 +14,20 @@
 # (calibrate_env_pkg + bringup_pkg). car_loc_multicam is in it because the
 # fusion node lives there, and car_loc_camera because bringup_pkg depends on it;
 # their camera nodes stay off on the car (no environment cameras). car_viz is
-# left out: foxglove_bridge.sh does its job.
+# left out: foxglove_bridge.sh does its job. The MPC packages (mlp_control_pkg,
+# sensor_mpc_pkg, nav_mpc_pkg) need the acados / l4casadi / torch that
+# real/Dockerfile installs, so rebuild the image (build_image.sh) first.
+#
+# The MPC launch files default to the simulation container's paths, so the same
+# folders are also mounted there: ../model at /workspaces/model (MPC_CONFIG_PATH
+# default /workspaces/model/mpc_config.json) and ../car_run_data at
+# /workspaces/car_run_data (default output_csv / events_csv).
 set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S2R_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 NAME=s2r_real
-PACKAGES="${PACKAGES:-car_teleop car_loc_lidar car_loc_imu car_loc_wheel car_loc_fusion car_loc_multicam car_loc_camera calibrate_env_pkg bringup_pkg}"
+PACKAGES="${PACKAGES:-car_teleop car_loc_lidar car_loc_imu car_loc_wheel car_loc_fusion car_loc_multicam car_loc_camera calibrate_env_pkg bringup_pkg mlp_control_pkg sensor_mpc_pkg nav_mpc_pkg}"
 
 if docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
     exec docker exec -it "$NAME" bash --rcfile /s2r/.bashrc
@@ -48,6 +55,9 @@ exec docker run -it --rm \
     -v "$S2R_ROOT/src:/s2r/src" \
     -v "$S2R_ROOT/scripts:/s2r/scripts" \
     -v "$S2R_ROOT/car_run_data:/s2r/car_run_data" \
+    -v "$S2R_ROOT/model:/workspaces/model" \
+    -v "$S2R_ROOT/car_run_data:/workspaces/car_run_data" \
+    -e MPC_CONFIG_PATH=/workspaces/model/mpc_config.json \
     -w /s2r \
     --entrypoint bash \
     kros-car-new:latest \

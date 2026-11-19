@@ -155,8 +155,12 @@ ros2 launch nav_mpc_pkg nav_mpc.launch.py check_distance:=2.0 corridor_half_widt
 ## 實體車
 
 `kros-car-new` (Jazzy) 已經有完整 Nav2, launch 會依 `ROS_DISTRO` 自動換 plugin 名稱 (Humble 用
-`nav2_smac_planner/SmacPlannerHybrid`, Jazzy 用 `::`)。但 MPC 需要 acados / l4casadi, 那個 image 裡沒有
-(`real/scripts/sim2real2sim.sh` 也還沒 build sensor_mpc_pkg) —— 這一步要先解決, 跟 sensor_mpc_pkg 一樣。
+`nav2_smac_planner/SmacPlannerHybrid`, Jazzy 用 `::`)。MPC 需要的 acados / l4casadi / CPU torch 由
+`real/Dockerfile` 裝 (2026-11-19 起, 改完要 `real/scripts/build_image.sh` 重 build), `real/scripts/sim2real2sim.sh`
+預設會 build mlp_control_pkg / sensor_mpc_pkg / nav_mpc_pkg, 並把 `model/`、`car_run_data/` 掛到
+`/workspaces/` 底下 (launch 的預設路徑)。2026-11-19 在這個 image 裡用假世界 (`test/fake_world.py`) 跑過整條流程:
+Jazzy Nav2 規劃、遇箱子停車重新規劃、到達與對準都正常, MPC 每週期 9–10 ms (開發機, 不是車上電腦)。
+Jazzy 的 planner_server 啟動時會印一行 Smac「Inflation layer ... not set sufficiently」的 ERROR, 規劃照常, 可忽略。
 其他要改的: `map_path` (場地地圖, 規劃也用它)、`geofence_*`、實體車的定位參數 (見 sensor_mpc_pkg README 的實體車那一行),
 `use_sim_time:=false`。雷射外參從 TF 拿 (base_link -> scan 的 frame), 查不到就用 `laser_offset`。
 
