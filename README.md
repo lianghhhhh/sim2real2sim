@@ -84,7 +84,7 @@ cd ~/sim2real2sim
 容器叫 `ros2_node`, `ROS_DOMAIN_ID=82` (跟 USD 裡的 ROS2Context 一致)。
 `--rm`: 第一個終端機離開 shell, 容器就沒了。
 
-映像檔是 `registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v2` (公開, 不用登入),
+映像檔是 `registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v3` (公開, 不用登入),
 本機沒有的話第一次執行會自己 pull。它是 `sim2real2sim:v1` 加上 MPC 的工具 (acados、casadi、
 l4casadi、scikit-learn) 與 pandas, 定位、建圖、摩擦力校正、MPC 都在這一個容器裡跑, 不用再開
 另一個 MPC 容器。怎麼 build / 發布見根目錄的 [Dockerfile](Dockerfile)

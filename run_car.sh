@@ -73,7 +73,7 @@ PYTHON="${PYTHON:-python3}"   # 跑分析用的 python (要有 numpy / pandas)
 # 執行 ROS 2 指令的 docker container
 # run_isaac_mpc.sh (以及舊的 old_docker/run_isaac_gui.sh) 裡是 `docker run --name ros2_node ...`，所以名稱固定是 ros2_node
 CONTAINER_NAME="ros2_node"
-DOCKER_IMAGE="registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v2"
+DOCKER_IMAGE="registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v3"
 DOCKER_NETWORK="compose_my_bridge_network"
 # 進 container 後、跑 ros2 launch 前的初始化：直接用你在 container 裡設定好的 alias `r`
 # （定義在 container 的 ~/.bashrc 裡：source /workspaces/rebuild_colcon.rc）

@@ -1,5 +1,5 @@
 #!/bin/bash
-# 單一 container: registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v2
+# 單一 container: registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v3
 #   (= sim2real2sim:v1 + MPC 工具 + pandas, 見根目錄的 Dockerfile; 公開, 不用登入就能 pull)
 # 取代 old_docker/run_isaac_gui.sh (ros2_node) + old_docker/docker/scripts/mpc.sh (mpc_isaac) 兩個 container。
 #
@@ -12,7 +12,7 @@
 set -e
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DOCKER_IMAGE="${IMAGE:-registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v2}"
+DOCKER_IMAGE="${IMAGE:-registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v3}"
 DOCKER_NETWORK="compose_my_bridge_network"
 XAUTH_FILE="/tmp/.docker.xauth"
 NAME="ros2_node"

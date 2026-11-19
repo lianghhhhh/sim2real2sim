@@ -1,11 +1,12 @@
 # sim2real2sim:v1 (ROS/YOLO/定位, CUDA torch) + mpc_isaac_image 的 MPC 工具 (acados, casadi, l4casadi, sklearn)
+# + Nav2 規劃器 (nav_mpc_pkg, 2026-11-18 加; 推上去的 v2 還沒有, 要重 build)
 #
 # build (在 repo 根目錄):
 #   docker build -t sim2real2sim:combined .
 #   (這份沒有從 build context 複製檔案, BuildKit 不會把 car_run_data 之類的大資料夾傳進去)
 # 發布 (run_isaac_mpc.sh / run_car.sh 等預設用這個):
-#   docker tag sim2real2sim:combined registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v2
-#   docker push registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v2
+#   docker tag sim2real2sim:combined registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v3
+#   docker push registry.screamtrumpet.csie.ncku.edu.tw/liang/sim2real2sim:v3
 # BASE 必須留在 v1 (v2 就是從這裡 build 出來的)。
 #
 # 兩個原 image 都是 Ubuntu 22.04 + ROS humble + Python 3.10, 差別只在 MPC 工具。合併時要處理:
@@ -45,6 +46,14 @@ SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends cmake libblas-dev liblapack-dev && \
+    rm -rf /var/lib/apt/lists/* && apt-get clean
+
+# Nav2 的規劃器 + costmap (src/nav_mpc_pkg 用; 控制器是我們的 MPC, 所以不裝整套 navigation2)。
+# v1 只有 nav2_map_server / nav2_msgs / nav2_util。實體車的 kros-car-new (Jazzy) 已經有完整 Nav2。
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ros-humble-nav2-planner ros-humble-nav2-smac-planner ros-humble-nav2-navfn-planner \
+        ros-humble-nav2-costmap-2d ros-humble-nav2-lifecycle-manager ros-humble-nav2-map-server && \
     rm -rf /var/lib/apt/lists/* && apt-get clean
 
 # acados (與原 MPC image 同一個 commit)
