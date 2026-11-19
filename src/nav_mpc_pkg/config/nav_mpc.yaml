@@ -1,0 +1,62 @@
+# nav_mpc_manager 的參數 (模擬預設值)。launch 會疊上 use_sim_time / odom_topic / scan_topic / events_csv。
+# Nav2 (地圖、costmap、規劃器) 的參數在 nav2_params.yaml; MPC 的在 sensor_mpc_pkg/config/sensor_mpc.yaml
+# 與 model/mpc_config.json。
+nav_mpc_manager:
+  ros__parameters:
+    map_frame: map
+    base_frame: base_link
+    odom_topic: /fusion_loc/odom
+    scan_topic: /scan
+    goal_topic: /goal_pose                 # Foxglove "Publish pose" (3D 面板設定 Publish -> Pose topic 改成這個) / RViz 2D Goal Pose
+    initialpose_topic: /initialpose        # Foxglove "Publish pose estimate" (RViz: 2D Pose Estimate)
+    fusion_reset_service: /fusion_localizer/reset
+    initialpose_reset_dist: 0.3            # m
+    initialpose_reset_yaw_deg: 15.0
+    path_topic: /nav_mpc/path
+    hold_topic: /nav_mpc/hold
+    finished_topic: /sensor_mpc/finished
+    planner_action: /compute_path_to_pose
+    planner_id: SmacHybrid
+    fallback_planner_id: ''                # 'Grid' = Hybrid-A* 找不到時改用 2D A* (不管車頭方向)
+    planner_timeout: 10.0
+    path_spacing: 0.1                      # 要跟 path_tracker 的 spacing / mpc_config.json 的 path_point_spacing 一樣
+    hold_rate: 20.0
+    release_delay: 0.3
+    pose_timeout: 0.5
+    # ---- 障礙物 (掃描點落在「前方路徑的走廊」裡) ----
+    obstacle_check: true
+    # 從車子中心沿路徑往前看多遠。要夠遠, 停下來之後 Hybrid-A* (R0.5, 只往前) 才有空間繞過去:
+    # 偵測到時離障礙物 ~1.3 m, 煞停 (~0.1 m) 後障礙物膨脹出來的禁區 (0.45 m) 前面還有 ~0.7 m 可以轉彎。
+    check_distance: 1.5
+    corridor_half_width: 0.25              # 車寬一半 (~0.17) + 8 cm
+    min_points: 3
+    confirm_scans: 2                       # 10 Hz 雷射 = 0.2 s
+    footprint_box: [-0.30, 0.30, -0.22, 0.22]   # base_link 座標, 框裡的點當成打到自己
+    range_min: 0.05
+    range_max: 8.0
+    laser_offset: [0.045, 0.0, 0.0]        # 查不到 TF 時用 (kros_car.usd 的 laser_frame)
+    scan_timeout: 0.5
+    # ---- 重新規劃 ----
+    replan_wait: 1.0                       # s, 車停穩後等 costmap (5 Hz) 把障礙物畫上去
+    stop_speed: 0.03
+    stop_wait_max: 3.0
+    replan_period: 2.0                     # s, 規劃失敗 (例如整條路被堵死) 隔多久再試
+    max_replans: 0                         # 0 = 一直試到路通或給新目標
+    # ---- 用 Nav2 的 costmap 驗證剩下的路線 (看到障礙物的另一面時提早重新規劃) ----
+    validate_path: true
+    costmap_topic: /global_costmap/costmap
+    validate_distance: 4.0
+    validate_clearance: 0.35               # m, 路線離障礙物格子小於這個才重新規劃 (規劃用 0.45, 留 0.1 的遲滯)
+    # ---- 終點對準車頭 (原地旋轉, 見 nav_manager_node.py 檔頭) ----
+    align_heading: true
+    spin_topic: /nav_mpc/spin
+    align_tolerance_deg: 5.0
+    align_kp: 1.5
+    align_wz_max: 0.6                      # rad/s
+    align_wz_min: 0.2                      # rad/s (靜摩擦)
+    align_wheel_per_yaw: 5.7               # 輪速 / yaw rate = T_eff / (2 r), 實體車 0.59 / (2 x 0.0514)
+    align_settle: 0.5
+    align_timeout: 20.0
+    align_clearance: 0.30
+    align_only_dist: 0.2                   # m, 目標離車子這麼近就不規劃, 直接原地轉 (在 Foxglove 車子上點一個方向 = 只轉車頭)
+    events_csv: ''

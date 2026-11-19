@@ -1,0 +1,114 @@
+# Nav2 只開「地圖 + 全域 costmap + 規劃器」: 控制器是我們的 MPC, 不開 controller_server / bt_navigator。
+# launch (nav_mpc.launch.py) 讀這份, 換掉 use_sim_time、地圖路徑, 以及 Humble / Jazzy 不同的
+# plugin 名稱 (Humble 是 nav2_smac_planner/SmacPlannerHybrid, Jazzy 是 nav2_smac_planner::SmacPlannerHybrid;
+# 這裡寫 Jazzy 的, Humble 時 launch 自動換), 再寫成暫存檔給節點。
+
+# 地圖: 跟 LiDAR 定位同一份 (car_loc_lidar/maps/room.yaml), 但發在 /nav_mpc/map, 不跟
+# lidar_localizer 自己發的 /map 搶。想在規劃用的地圖上多畫禁區 (定位不受影響) 就另存一份給 nav_map:=
+nav_map_server:
+  ros__parameters:
+    yaml_filename: ''          # launch 填
+    topic_name: /nav_mpc/map
+    frame_id: map
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 1.0
+    planner_plugins: ["SmacHybrid", "Grid"]
+    # 主規劃器: Hybrid-A* (Dubins, 只往前)。會考慮起點的車頭方向與最小轉彎半徑, 出來的路線 MPC 跟得上。
+    # 2026-11-18 離線試開: MPC 在 R0.4 的髮夾彎還跟得上 (sensor_mpc_pkg README), 這裡留一點餘量取 0.5。
+    SmacHybrid:
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      downsample_costmap: true       # 地圖 0.025 m -> 規劃用 0.05 m
+      downsampling_factor: 2
+      tolerance: 0.25                # m, 目標點被擋住時可以停在這麼近的地方
+      allow_unknown: false
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 3.0         # s
+      motion_model_for_search: "DUBIN"
+      angle_quantization_bins: 72
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0
+      minimum_turning_radius: 0.5    # m
+      reverse_penalty: 2.0
+      change_penalty: 0.0
+      non_straight_penalty: 1.2
+      cost_penalty: 2.0              # 越大越往通道中間走 (離 inflation 遠)
+      retrospective_penalty: 0.015
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: false
+      smooth_path: true
+      debug_visualizations: false
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+        do_refinement: true
+        refinement_num: 2
+    # 備用: 2D A* (不管車頭方向)。路線一開始可能要原地大轉, MPC 不一定跟得好, 預設不用
+    # (nav_mpc.yaml 的 fallback_planner_id: Grid 才會在 Hybrid 失敗時試它)。
+    Grid:
+      plugin: "nav2_smac_planner::SmacPlanner2D"
+      tolerance: 0.25
+      downsample_costmap: true
+      downsampling_factor: 2
+      allow_unknown: false
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      cost_travel_multiplier: 2.0
+      use_final_approach_orientation: false
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      global_frame: map
+      robot_base_frame: base_link    # map -> base_link 是融合發的 (collect_all 的 tf_source:=fusion)
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      transform_tolerance: 0.5
+      # 規劃用的車子半徑。輪子外緣約 0.39 x 0.33 m (kros_car.usd 輪距 ±0.144 / ±0.135, 輪半徑 0.05),
+      # 半對角 ~0.26; 取大一點是因為 sensor_mpc_node 的圍籬:
+      # 圍籬 = 牆往內 0.4 m、圓柱外擴 0.4 m, 路線離牆 / 柱子至少要比 0.4 遠, 不然 MPC 會鎖住。
+      robot_radius: 0.45
+      resolution: 0.05               # 有 static_layer 時會改成地圖的解析度
+      track_unknown_space: true
+      always_send_full_costmap: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /nav_mpc/map
+        map_subscribe_transient_local: true
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+          max_obstacle_height: 2.0
+          min_obstacle_height: 0.0
+          clearing: true             # 障礙物拿走之後, 雷射掃過去就清掉
+          marking: true
+          raytrace_max_range: 6.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.2    # 打到自己車身的點不要
+          inf_is_valid: false
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 1.0
+        cost_scaling_factor: 3.0
+
+lifecycle_manager_nav_mpc:
+  ros__parameters:
+    autostart: true
+    node_names: ["nav_map_server", "planner_server"]
+    bond_timeout: 4.0
