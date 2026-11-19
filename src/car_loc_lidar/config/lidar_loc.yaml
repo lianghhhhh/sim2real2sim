@@ -44,6 +44,20 @@ lidar_localizer:
     inlier_dist: 0.30
     min_inlier_ratio: 0.50
     max_residual: 0.25
+    # 地圖上沒有的東西 (箱子、人): 第一次配準後落在房間內部 (牆圍起來的最大空區)、離牆 > occluder_dist
+    # 的點拿掉再配準一次, 殘差 / inlier / sigma 只算剩下的點。2026-11-18 Isaac: 車子前方 1.4 m 放一個
+    # 0.4 m 箱子, 沒拿掉時 inlier 92% -> 82%、殘差 1.2 -> 2.5 cm (箱子的點被 Huber 常數拉力拉偏位姿),
+    # 融合的 sigma 閘門 (2.5 mm) 一直擋 -> MPC 「絕對量測斷了」停車; 鎖死偵測 (下面) 每 3 秒誤判一次,
+    # 第 4 次全域定位真的鎖到 180 度反方向。牆外 / 柱子裡的點不拿 (位姿錯的證據)。
+    # 拿掉超過 occluder_max_ratio 就不拿 (位姿大概錯了, 照舊回報爛的指標)。0 = 關。
+    # 0.15 而不是 0.30: 離牆 0.13 m 的箱子, 0.30 時它朝外的那一面被當成牆, 位姿還是偏 8 cm,
+    # 0.15 時 1.7 cm (test/test_occluders.py C)。
+    occluder_dist: 0.15
+    # 50%: Isaac 的 RTX 雷射一圈只有 ~210~300 個有效點 (一半射線回 -1), 四個箱子就佔 39%;
+    # 30% 時那些幀整個退回舊行為、配準失敗 -> 追丟 -> 全域定位鎖到錯的解 (2026-11-18 第二輪)。
+    # 拿掉這麼多點會讓錯的位姿也看起來很乾淨, 所以靠 lock_see_through 擋 (錄下來的 Isaac 掃描:
+    # 錯解拿掉點後 inlier 100%, 但穿牆 4.7~20%, 全部抓得到; 對的位姿穿牆 0%)。
+    occluder_max_ratio: 0.50
     max_failures: 8
     # 掃描斷了超過這麼久 (s) 就重新全域定位, 不拿等速外推當預測。2026-11-03 Isaac 的
     # render 斷了 51 秒, 中間零星幾幀配到 4~5 m 外的局部解, sigma 卻只有 1.3 mm。
@@ -67,6 +81,12 @@ lidar_localizer:
     lock_inlier: 0.85
     lock_omega: 0.5
     lock_scans: 15
+    # 穿牆射線 > 3% 也算 (見 lidar_loc_node.py)。occluder_dist 拿掉箱子的點時, 180 度對稱解的柱子
+    # 對不上的點也一起被拿掉, 殘差 / inlier 判不出來; 穿牆不會被遮擋騙。
+    # test/test_occluders.py: 正確位姿 (含 1~3 個箱子) <= 0.7%, 鎖到 180 度 3.6~5.8%。
+    # **只在模擬的理想掃描量過**; Isaac / 實體車的值看 status 那行的「穿牆 x%」。
+    lock_see_through: 0.03
+    see_through_margin: 0.3
 
     # 配準失敗時先掃一圈角度再試一次。
     # **MS200 (10 Hz) 上預設關掉**, 這是量出來的結論 (test/test_matcher.py):

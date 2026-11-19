@@ -232,6 +232,31 @@ class GridMap:
         """離障礙至少 clearance 公尺的格 —— 全域初始化只在這些格裡找。"""
         return self.dist >= clearance
 
+    def interior_mask(self):
+        """房間內部: 不碰到地圖邊界的空格連通區裡最大的那一塊 (bool, 跟 occ 同形狀)。
+        牆外 (碰到邊界) 和柱子裡面 (小的封閉區) 都不算。牆沒有封閉 (全部連到邊界) -> None。"""
+        try:
+            from scipy import ndimage
+        except ImportError:
+            return None
+        lab, n = ndimage.label(~self.occ)
+        if n == 0:
+            return None
+        border = np.unique(np.r_[lab[0], lab[-1], lab[:, 0], lab[:, -1]])
+        sizes = np.bincount(lab.ravel(), minlength=n + 1)
+        sizes[0] = 0
+        sizes[border] = 0
+        if sizes.max() == 0:
+            return None
+        return lab == int(np.argmax(sizes))
+
+    def in_mask(self, mask: np.ndarray, pts_xy: np.ndarray) -> np.ndarray:
+        """每個點落在 mask 為 True 的格子裡嗎 (地圖外 = False)。"""
+        col, row, ok = self._to_cell(np.asarray(pts_xy, dtype=np.float64).reshape(-1, 2))
+        out = np.zeros(len(col), dtype=bool)
+        out[ok] = mask[row[ok], col[ok]]
+        return out
+
     def occupied_points(self) -> np.ndarray:
         row, col = np.nonzero(self.occ)
         return np.stack([self.origin[0] + (col + 0.5) * self.resolution,

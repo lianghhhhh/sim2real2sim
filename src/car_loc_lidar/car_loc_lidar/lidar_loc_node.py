@@ -124,6 +124,10 @@ class LidarLocalizer(Node):
         p('global_search_step', 0.30)
         p('global_search_clearance', 0.25)
         p('global_yaw_bins', 72)    # 5 度一格; 只有雷射的時候 yaw 也要搜
+        # 手動給初始位姿 (geometry_msgs/PoseWithCovarianceStamped, map frame): Foxglove 3D 面板的
+        # "Publish pose estimate" / RViz 的 2D Pose Estimate。收到就以它為起點做局部配準 (不做全域搜尋),
+        # 長方形房間的 180 度對稱解靠這個排除。配不上的話照舊 max_failures 次後全域定位。空 = 不訂閱
+        p('initialpose_topic', '/initialpose')
 
         # --- 配準 --------------------------------------------------------------
         p('huber', 0.10)
@@ -131,6 +135,11 @@ class LidarLocalizer(Node):
         p('inlier_dist', 0.30)
         p('min_inlier_ratio', 0.50)
         p('max_residual', 0.25)
+        # 地圖上沒有的東西 (箱子、人) 不拿來配準, 也不算進品質指標: 第一次配準後落在房間內部、
+        # 離牆 > occluder_dist 的點拿掉再配一次。拿掉的比例 > occluder_max_ratio 就不拿
+        # (位姿大概錯了)。0 = 關 (2026-11-18 以前的行為)。見 matcher.py / README「沒在地圖上的東西」。
+        p('occluder_dist', 0.15)
+        p('occluder_max_ratio', 0.50)
         p('max_failures', 8)        # 連續失敗這麼多次就重新全域定位
         # 掃描斷了超過這麼久 (s) 就不要再用等速外推當預測, 直接重新全域定位
         # (2026-11-03: 斷 16 秒之後的那一幀配到 4~5 m 外的局部解, 回報的 sigma 卻是 1.3 mm)
@@ -146,6 +155,13 @@ class LidarLocalizer(Node):
         p('lock_inlier', 0.85)
         p('lock_omega', 0.5)
         p('lock_scans', 15)
+        # 穿牆射線比例 (matcher.see_through_ratio) > 這個也算鎖死的徵兆。地圖上沒有的東西只會讓
+        # 量到的比地圖短, 量到比地圖長 (穿過牆 / 柱子) = 位姿錯了, 遮擋騙不了它。
+        # occluder_dist 把箱子的點拿掉之後, 鎖到 180 度時柱子那幾個對不上的點也被拿掉了,
+        # 殘差 / inlier 判不出來 —— 要靠這個 (test/test_occluders.py: 正確位姿 <= 0.7%,
+        # 180 度 3.6~5.8%, 看不到柱子的位置 0% = 那一刻本來就分不出來)。0 = 不用。
+        p('lock_see_through', 0.03)
+        p('see_through_margin', 0.3)    # m, 終點前這段不算 (斜掃過牆面的射線)
         # 配準失敗時先在預測位姿附近掃一圈角度再試一次, 才算真的失敗。
         # 沒有 IMU 的時候「下一幀朝哪」是外推的, 車子原地自旋到 20 rad/s 時
         # 一幀就轉過 57 度, 角加速度一變預測就差幾十度 —— 那已經超出 refine 的
@@ -229,6 +245,9 @@ class LidarLocalizer(Node):
         self.settle_left = 0
         self.lock_res = float(g('lock_residual').value)
         self.lock_inlier = float(g('lock_inlier').value)
+        self.lock_see_through = float(g('lock_see_through').value)
+        self.see_through_margin = float(g('see_through_margin').value)
+        self.last_see_through = float('nan')
         self.lock_omega = float(g('lock_omega').value)
         self.lock_scans = int(g('lock_scans').value)
         self.sweep_on_fail = bool(g('sweep_on_fail').value)
@@ -263,7 +282,18 @@ class LidarLocalizer(Node):
         self.matcher = ScanMatcher(self.map,
                                    huber=float(g('huber').value),
                                    max_iter=int(g('max_iter').value),
-                                   inlier_dist=float(g('inlier_dist').value))
+                                   inlier_dist=float(g('inlier_dist').value),
+                                   occluder_dist=float(g('occluder_dist').value),
+                                   occluder_max_ratio=float(g('occluder_max_ratio').value))
+        if float(g('occluder_dist').value) > 0:
+            if self.matcher.interior is None:
+                self.get_logger().warn('地圖的牆沒有圍成封閉的房間, 找不到「房間內部」, '
+                                       '地圖上沒有的東西 (occluder_dist) 不會被拿掉')
+            else:
+                area = float(self.matcher.interior.sum()) * self.map.resolution ** 2
+                self.get_logger().info(
+                    f'房間內部 {area:.1f} m²: 落在裡面、離牆 > {g("occluder_dist").value} m 的點 '
+                    f'當成地圖上沒有的東西, 不拿來配準 (最多 {g("occluder_max_ratio").value:.0%})')
 
         # --- 前端 --------------------------------------------------------------
         self.input_type = g('input_type').value
@@ -358,6 +388,9 @@ class LidarLocalizer(Node):
                                      self.on_scan, SENSOR_QOS)
             src = g('cloud_topic').value
         self.create_service(Trigger, '~/relocalize', self.on_relocalize)
+        if g('initialpose_topic').value:
+            self.create_subscription(PoseWithCovarianceStamped, g('initialpose_topic').value,
+                                     self.on_initialpose, 10)
         self.create_timer(float(g('status_period').value), self.status)
         self.get_logger().info(f'等 {src} ... (只用 LiDAR, 不吃 IMU / 相機)')
 
@@ -394,6 +427,26 @@ class LidarLocalizer(Node):
         res.message = '下一幀會重新做一次全域定位'
         self.get_logger().warn(res.message)
         return res
+
+    def on_initialpose(self, msg: PoseWithCovarianceStamped):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        x, y = msg.pose.pose.position.x, msg.pose.pose.position.y
+        if msg.header.frame_id and msg.header.frame_id != self.map_frame:
+            self.get_logger().warn(f'initialpose 的 frame 是 {msg.header.frame_id!r}, 不是 '
+                                   f'{self.map_frame!r}, 當成 {self.map_frame} 座標用')
+        # 從這個位姿開始追蹤 (下一幀做局部配準 + 掃角度); 剛設定的這幾幀跟全域定位剛成功一樣不可信
+        self.motion.set_pose(x, y, yaw)
+        self.motion.t = None             # 下一幀不要拿「跳過去」的位移差分出速度
+        self.located = True
+        self.relocalize_req = False
+        self.failures = 0
+        self.lock_count = 0
+        self.full_search = False
+        self.last_ok_t = None
+        self.settle_left = self.settle_scans
+        self.get_logger().warn(f'手動初始位姿: x={x:+.3f} y={y:+.3f} yaw={math.degrees(yaw):+.1f}°, '
+                               '從這裡開始局部配準')
 
     # ------------------------------------------------------------------
     def on_scan(self, msg):
@@ -451,6 +504,14 @@ class LidarLocalizer(Node):
             f.xy, step=self.global_step, clearance=self.global_clear,
             yaw_bins=self.global_bins, center=center, radius=radius)
         el = time.perf_counter() - t0
+        # 穿牆射線太多的候選不收 (鎖到對稱解; 地圖上沒有的東西不會造成穿牆)
+        st = (self.matcher.see_through_ratio(f.xy, r.t, r.theta, margin=self.see_through_margin)
+              if self.lock_see_through > 0 and np.isfinite(r.residual) else float('nan'))
+        if st > self.lock_see_through:
+            self.get_logger().warn(
+                f'全域定位的解 x={r.t[0]:+.2f} y={r.t[1]:+.2f} yaw={math.degrees(r.theta):+.0f}° '
+                f'穿牆 {st:.1%} > {self.lock_see_through:.0%}, 不收 (對稱解?)')
+            return
 
         if r.inlier_ratio >= self.min_inlier and r.residual <= self.max_residual:
             self.motion.set_pose(r.t[0], r.t[1], r.theta, f.t)
@@ -503,7 +564,7 @@ class LidarLocalizer(Node):
             self.n_ok += 1
             self.last_ok_t = f.t
             self.last_result = r
-            self._check_lock(r)
+            self._check_lock(r, f)
             return
 
         self.failures += 1
@@ -526,7 +587,7 @@ class LidarLocalizer(Node):
                     and r.residual <= self.max_residual
                     and np.isfinite(r.residual))
 
-    def _check_lock(self, r):
+    def _check_lock(self, r, f):
         """配準「成功」但其實鎖在 180 度對稱解 —— _good 擋不掉, 只能在這裡抓。
 
         轉彎時殘差本來就會變大 (補償誤差), 只在幾乎沒在轉的時候判斷;
@@ -534,7 +595,11 @@ class LidarLocalizer(Node):
         """
         if abs(self.motion.omega) >= self.lock_omega:
             return
-        if r.residual > self.lock_res or r.inlier_ratio < self.lock_inlier:
+        st = (self.matcher.see_through_ratio(f.xy, r.t, r.theta, margin=self.see_through_margin)
+              if self.lock_see_through > 0 else float('nan'))
+        self.last_see_through = st
+        if (r.residual > self.lock_res or r.inlier_ratio < self.lock_inlier
+                or st > self.lock_see_through):
             self.lock_count += 1
         else:
             self.lock_count = 0
@@ -542,8 +607,9 @@ class LidarLocalizer(Node):
         if self.lock_count >= self.lock_scans:
             self.get_logger().warn(
                 f'疑似鎖在對稱解: 連續 {self.lock_count} 幀殘差 '
-                f'{r.residual * 100:.1f} cm / inlier {r.inlier_ratio:.0%} '
-                f'(正常 < {self.lock_res * 100:.1f} cm / > {self.lock_inlier:.0%}), '
+                f'{r.residual * 100:.1f} cm / inlier {r.inlier_ratio:.0%} / 穿牆 {st:.1%} '
+                f'(正常 < {self.lock_res * 100:.1f} cm / > {self.lock_inlier:.0%} / '
+                f'< {self.lock_see_through:.0%}), '
                 f'整張地圖重新全域定位')
             self.located = False
             self.full_search = True
@@ -722,6 +788,10 @@ class LidarLocalizer(Node):
         r = self.last_result
         res = f'{r.residual * 100:.2f} cm' if r else 'n/a'
         inl = f'{r.inlier_ratio:.0%}' if r else 'n/a'
+        if r and r.n_occluded:
+            inl += f' (拿掉地圖外物體 {r.n_occluded} 點)'
+        if math.isfinite(self.last_see_through):
+            inl += f', 穿牆 {self.last_see_through:.1%}'
         state = '定位中' if self.located else '**追丟, 正在重新全域定位**'
         self.get_logger().info(
             f'{self.n_scan} 幀 (成功 {100.0 * self.n_ok / max(self.n_scan, 1):.0f}%, '
