@@ -11,6 +11,11 @@
     cte = 到整條路徑折線的距離 (path_error.py, 訂閱 path_tracker 的 /sensor_mpc/path)
   * offset-free: 每個週期比較模型預測的下一步與實際量到的, 低通後當成擾動加進 MPC 的預測
     (disturbance.py; 修模型與車子不合造成的穩態誤差)
+  * 上層停車訊號 (hold_topic, 預設不訂閱): nav_mpc_pkg 的導航管理節點看到前方有障礙物、或還在
+    規劃新路線時發 true, 這裡就送 0; hold_timeout > 0 時這條訊號斷太久也停 (上層掛了 = 沒人看路)
+  * 原地旋轉 (spin_topic, 預設不訂閱): hold 中收到新鮮的 (< spin_timeout) 旋轉輪速 u 時送 左 -u / 右 +u
+    (正 = 逆時針) 而不是 0。nav_mpc 到終點後用它對準車頭。輪速指令仍然只從這個節點發, 定位 / 圍籬 /
+    hold 斷線的檢查都在它前面, 而且一樣量化成整數 rpm、限制在 max_wheel_speed
   * 圍籬: 車子 (感測器位姿) 跑出 geofence_x/y 的範圍、或進到 geofence_circles 的圓裡
     (柱子), 或 MPC 預測的前 geofence_horizon 秒會出去, 就送 0 並**鎖住**, 要呼叫
     ~/release_geofence 服務才會再動 (實體車上沒有牆的保護, 這是唯一的安全網)
@@ -29,7 +34,7 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray
+from std_msgs.msg import Bool, Float32, Float32MultiArray, Float64MultiArray
 from std_srvs.srv import Trigger
 
 from mlp_control_pkg.path_reference import build_reference, curvature_ahead
@@ -81,6 +86,13 @@ class SensorMpcNode(Node):
         p('output_csv', '')                              # 空 = /tmp/sensor_mpc_tracking.csv
         p('rpm_step', 1.0)                               # 輪速量化成整數 rpm (實體車馬達只收整數)
         p('path_timeout', 0.5)                           # s, 目標點太久沒更新就停
+        # 上層停車訊號 (std_msgs/Bool, true = 停)。空 = 不訂閱 (= 舊的行為)。
+        # hold_timeout > 0: 訂閱了卻超過這麼久沒收到也當成 true (發訊號的節點掛了就停車)
+        p('hold_topic', '')
+        p('hold_timeout', 0.0)
+        # 原地旋轉 (std_msgs/Float32, 輪速 rad/s, 正 = 逆時針)。只在 hold 為 true 時有效。空 = 不訂閱
+        p('spin_topic', '')
+        p('spin_timeout', 0.3)
         # 圍籬 (map 座標, m)。x_min >= x_max 或 y_min >= y_max = 不檢查矩形。
         p('geofence_x_min', 0.0)
         p('geofence_x_max', 0.0)
@@ -114,6 +126,19 @@ class SensorMpcNode(Node):
                               if circ[i + 2] > 0.0]
         self.fence_horizon = float(g('geofence_horizon'))
         self._fence_latched = None       # 鎖住的原因 (字串); None = 沒鎖
+        self.hold_topic = str(g('hold_topic'))
+        self.hold_timeout = float(g('hold_timeout'))
+        self._hold_req = False
+        self._t_hold = None              # 上一則 hold 訊息的時刻
+        if self.hold_topic:
+            self.create_subscription(Bool, self.hold_topic, self.on_hold, 10)
+        self.spin_topic = str(g('spin_topic'))
+        self.spin_timeout = float(g('spin_timeout'))
+        self.max_wheel = float(config.get('max_wheel_speed', 10.0))
+        self._spin_u = 0.0
+        self._t_spin = None
+        if self.spin_topic:
+            self.create_subscription(Float32, self.spin_topic, self.on_spin, 10)
         self.create_service(Trigger, '~/release_geofence', self._on_release)
 
         self.cmd_pub = self.create_publisher(JointState, str(g('joint_command_topic')), 10)
@@ -164,6 +189,9 @@ class SensorMpcNode(Node):
                 + f', 預測 {self.fence_horizon} s')
         else:
             self.get_logger().warn('沒有設定圍籬 (geofence_*): 定位出錯時沒有東西會擋住車子')
+        if self.hold_topic:
+            self.get_logger().info(f'上層停車訊號 {self.hold_topic}'
+                                   + (f' (超過 {self.hold_timeout} s 沒訊息也停)' if self.hold_timeout > 0 else ''))
 
     # ───────────────────────────────────────── 輸入
     def on_path(self, msg: Float32MultiArray):
@@ -199,6 +227,39 @@ class SensorMpcNode(Node):
 
     def on_finished(self, msg: Bool):
         self.finished = bool(msg.data)
+
+    def on_hold(self, msg: Bool):
+        self._hold_req = bool(msg.data)
+        self._t_hold = self._now()
+
+    def on_spin(self, msg: Float32):
+        self._spin_u = float(msg.data)
+        self._t_spin = self._now()
+
+    def _spin_command(self):
+        """hold 中要原地旋轉的話回 [左, 右] 輪速, 否則 None。hold 訊號本身要是新鮮的 true。"""
+        if not self.spin_topic or self._t_spin is None or not self._hold_req:
+            return None
+        now = self._now()
+        if now - self._t_spin > self.spin_timeout:
+            return None
+        if self.hold_timeout > 0.0 and (self._t_hold is None or now - self._t_hold > self.hold_timeout):
+            return None
+        u = float(np.clip(self._spin_u, -self.max_wheel, self.max_wheel))
+        if self.rpm_step > 0:
+            u = snap_rpm(u, self.rpm_step)
+        return np.array([-u, u])
+
+    def _external_hold(self):
+        """None = 不用停; 否則回原因。"""
+        if not self.hold_topic:
+            return None
+        if self.hold_timeout > 0.0 and (self._t_hold is None
+                                        or self._now() - self._t_hold > self.hold_timeout):
+            return f'{self.hold_topic} 超過 {self.hold_timeout:.1f} s 沒訊息 (導航管理節點沒在跑?)'
+        if self._hold_req:
+            return f'上層要求停車 ({self.hold_topic})'
+        return None
 
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -295,9 +356,10 @@ class SensorMpcNode(Node):
             self.path_xy = None
             self.rows.append({'t': float('nan')})     # 分段標記
 
-    def _hold(self, reason, state=None):
-        """定位不可信 / 沒路徑 / 走完: 送 0, 記下停了多久。"""
-        self.publish_control_command(np.zeros(NU))
+    def _hold(self, reason, state=None, u=None):
+        """定位不可信 / 沒路徑 / 走完: 送 0 (或 u: 原地旋轉), 記下停了多久。"""
+        u = np.zeros(NU) if u is None else np.asarray(u, dtype=float)
+        self.publish_control_command(u)
         self._last_window = None
         now = self._now()
         if self._stopped_since is None:
@@ -306,7 +368,7 @@ class SensorMpcNode(Node):
             self.get_logger().warn(f'停車: {reason}')
             self._last_reason = reason
         self.prev_u = np.zeros(NU)
-        row = {'t': now, 'ok': 0, 'cmd_l': 0.0, 'cmd_r': 0.0, 'reason': reason,
+        row = {'t': now, 'ok': 0, 'cmd_l': float(u[0]), 'cmd_r': float(u[1]), 'reason': reason,
                'pose_age': self.state_node.last_pose_age, 'lead': self.state_node.last_lead}
         if state is not None:
             row.update(x=state[0], y=state[1], yaw=state[2], vx=state[3], vy=state[4], wz=state[5])
@@ -344,6 +406,14 @@ class SensorMpcNode(Node):
             self._fence_latched = viol
             self.get_logger().error(f'圍籬: {viol}, 停車並鎖住')
             self._hold(f'圍籬: {viol}', state)
+            return
+        held = self._external_hold()
+        if held is not None:
+            spin = self._spin_command()
+            if spin is not None:
+                self._hold('原地旋轉 (上層要求)', state, u=spin)
+            else:
+                self._hold(held, state)
             return
         if self.finished:
             self._hold('路徑走完', state)

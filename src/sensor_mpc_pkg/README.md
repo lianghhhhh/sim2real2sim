@@ -180,13 +180,15 @@ PYTHONPATH=$E LD_LIBRARY_PATH=$E/bin:$HOME/isaac-sim/kit/python/lib \
 | in | `abs_age_topic` (空 = `/fusion_loc/abs_age`) | `std_msgs/Float32` | 絕對量測多久沒進來 |
 | in | `gt_topic` (模擬 `/odom`; 實體車 `''`) | `nav_msgs/Odometry` | 只拿來記誤差, 不控制 |
 | in | `path_topic` | `Float32MultiArray` | 目標點; `path_heading_relative:=true` 可以直接吃 Isaac 的 `/nearest_curve_point` |
+| in | `hold_topic` (預設不訂閱) | `std_msgs/Bool` | true = 停車 (`nav_mpc_pkg` 的 `/nav_mpc/hold`); `hold_timeout` > 0 時這條斷太久也停 |
+| in | `spin_topic` (預設不訂閱) | `std_msgs/Float32` | hold 中收到新鮮的 (< 0.3 s) 輪速 u 就送 左 -u / 右 +u (原地旋轉, 正 = 逆時針; nav_mpc 終點對準用) |
 | out | `/joint_command` | `sensor_msgs/JointState` | 四輪輪速指令 |
 | out | `/sensor_mpc/predicted_path_viz` | `nav_msgs/Path` | MPC 預測的整條 horizon |
 | out | `/sensor_mpc/predicted_path` | `Float64MultiArray` | 前 3 個預測位姿 (跟舊節點一樣) |
 
 **什麼時候會停車 (送 0)**: 還沒收到位姿 / 輪速、位姿超過 `pose_timeout` (0.3 s) 沒更新、
 輪速超過 `wheel_timeout`、位姿 1-sigma > `pose_sigma_max` (0.3 m)、`abs_age` > `abs_age_max` (1 s)、
-目標點超過 `path_timeout` 沒更新、路徑走完、**出圍籬**。恢復時停超過一個 window (10 x 0.05 s) 就把 MPC 的歷史
+目標點超過 `path_timeout` 沒更新、路徑走完、**出圍籬**、`hold_topic` 說停 (或斷了超過 `hold_timeout`)。恢復時停超過一個 window (10 x 0.05 s) 就把 MPC 的歷史
 重新用目前狀態填, 不到的話補「停著沒動」。
 
 **圍籬 (geofence)**: 車子 (感測器位姿) 出了 `geofence_x/y_min/max` 的矩形、進了 `geofence_circles`

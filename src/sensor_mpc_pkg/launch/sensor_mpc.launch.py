@@ -58,6 +58,9 @@ def generate_launch_description():
                               description='路徑 CSV。預設是 kros_car_mpc_sensor.usd 房間用的 '
                                           '(scripts/make_path_kros_car_mpc_sensor.py); '
                                           'kros_car_mpc.usd 的舊路線是 path_kros_car_mpc.csv'),
+        DeclareLaunchArgument('path_topic', default_value='',
+                              description='nav_msgs/Path 來源 (收到就整條換掉); 給了要同時 path_file:=\'\'。'
+                                          'nav_mpc_pkg 用 /nav_mpc/path'),
         DeclareLaunchArgument('loop', default_value='true'),
         DeclareLaunchArgument('direction', default_value='auto'),
         DeclareLaunchArgument('mpc_config', default_value=EnvironmentVariable(
@@ -83,6 +86,12 @@ def generate_launch_description():
         DeclareLaunchArgument('geofence_horizon', default_value='0.5'),
         # offset-free MPC: 估計模型與車子的固定差 (見 sensor_mpc_pkg/disturbance.py)。false = 舊的行為
         DeclareLaunchArgument('disturbance', default_value='true'),
+        # 上層停車訊號 (std_msgs/Bool, true = 停; nav_mpc_pkg 用 /nav_mpc/hold)。空 = 不訂閱
+        DeclareLaunchArgument('hold_topic', default_value=''),
+        DeclareLaunchArgument('spin_topic', default_value='',
+                              description='原地旋轉輪速 (std_msgs/Float32, 只在 hold 時有效; nav_mpc 用 /nav_mpc/spin)'),
+        DeclareLaunchArgument('hold_timeout', default_value='0.0',
+                              description='s; > 0: hold_topic 這麼久沒訊息也停車'),
         DeclareLaunchArgument('disturbance_tau', default_value='1.0', description='s'),
         # ---- 定位那一組 (跟 friction_test.launch.py 同名) ----
         DeclareLaunchArgument('imu_topic', default_value='/imu', description='實體車 /imu/data'),
@@ -144,7 +153,8 @@ def generate_launch_description():
         parameters=[{
             **tracker_base,
             'use_sim_time': use_sim_time,
-            'path_file': lc('path_file'),
+            'path_file': ParameterValue(lc('path_file'), value_type=str),
+            'path_topic': ParameterValue(lc('path_topic'), value_type=str),
             'odom_topic': lc('odom_topic'),
             'loop': ParameterValue(lc('loop'), value_type=bool),
             'direction': lc('direction'),
@@ -172,6 +182,9 @@ def generate_launch_description():
             'geofence_horizon': ParameterValue(lc('geofence_horizon'), value_type=float),
             'disturbance_enabled': ParameterValue(lc('disturbance'), value_type=bool),
             'disturbance_tau': ParameterValue(lc('disturbance_tau'), value_type=float),
+            'hold_topic': ParameterValue(lc('hold_topic'), value_type=str),
+            'hold_timeout': ParameterValue(lc('hold_timeout'), value_type=float),
+            'spin_topic': ParameterValue(lc('spin_topic'), value_type=str),
             'mpc_config': lc('mpc_config'),
             'output_csv': lc('output_csv'),
         }])
