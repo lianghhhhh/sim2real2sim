@@ -76,6 +76,8 @@ def _nav2_and_manager(context):
         'align_heading': lc('align_heading').lower() in ('true', '1'),
         'align_tolerance_deg': float(lc('align_tolerance_deg')),
     })
+    hyb = nav2['planner_server']['ros__parameters'].get(lc('planner_id'), {})
+    mgr['planner_downsample'] = int(hyb.get('downsampling_factor', 1)) if hyb.get('downsample_costmap') else 1
 
     return [
         LogInfo(msg=f'[nav_mpc] 規劃地圖 {nav_map}, Nav2 參數 {tmp.name}'),
@@ -114,7 +116,8 @@ def generate_launch_description():
         DeclareLaunchArgument('align_tolerance_deg', default_value='5.0'),
         DeclareLaunchArgument('check_distance', default_value='1.5'),
         DeclareLaunchArgument('corridor_half_width', default_value='0.25'),
-        DeclareLaunchArgument('events_csv', default_value='/workspaces/car_run_data/nav_mpc_events.csv'),
+        DeclareLaunchArgument('events_csv', default_value='/workspaces/car_run_data/nav_mpc_events.csv',
+                              description='已存在就自動加 _<時間>, 不覆寫; 也可以寫 {time}'),
         DeclareLaunchArgument('output_csv', default_value='/workspaces/car_run_data/nav_mpc_tracking.csv',
                               description='sensor_mpc_node 的逐週期 CSV'),
         DeclareLaunchArgument('hold_timeout', default_value='0.5',

@@ -23,10 +23,10 @@
 | 狀態 | 車子 | 什麼時候離開 |
 | --- | --- | --- |
 | `IDLE` | 停 | 收到目標 |
-| `PLANNING` | 停 | 有路線 -> `DRIVING`; 沒路線 -> `WAIT_REPLAN` |
+| `PLANNING` | 停 | 有路線 -> `DRIVING`; 沒路線 -> 換車頭方向試 (見下), 找到起點換方向的 -> `ALIGNING` (先原地轉), 目標換方向的 -> `DRIVING`; 都沒有 -> `WAIT_REPLAN` |
 | `DRIVING` | MPC 循跡 | 走到 -> `ALIGNING` (車頭差 > 5°) 或 `ARRIVED`; 前方走廊有障礙物、或 costmap 說剩下的路線太靠近障礙物 -> `WAIT_REPLAN` |
-| `WAIT_REPLAN` | 停 | 車停穩 + `replan_wait` (1 s, 讓 costmap 畫上去) -> `PLANNING`; 規劃失敗則每 `replan_period` (2 s) 再試 |
-| `ALIGNING` | 原地旋轉 | 車頭差 < `align_tolerance_deg` (5°) 連續 0.5 s -> `ARRIVED`; 超過 20 s、或 0.30 m 內有東西 -> 放棄, 也是 `ARRIVED` |
+| `WAIT_REPLAN` | 停 | 車停穩 + `replan_wait` (走廊偵測 0.2 s / costmap 驗證 `replan_wait_invalid` 0 s) -> `PLANNING`; 新路線還穿過剛剛的掃描點 (costmap 沒跟上) 0.3 s 後再試, 最多 3 次; 規劃失敗則每 `replan_period` (2 s) 再試 |
+| `ALIGNING` | 原地旋轉 | 車頭差 < `align_tolerance_deg` (5°) 連續 0.5 s -> `ARRIVED` (換起點方向的那種轉: -> `PLANNING`); 超過 20 s、或 0.30 m 內有東西 -> 放棄, 也是 `ARRIVED` (換起點方向的: `WAIT_REPLAN`) |
 | `ARRIVED` | 停 | 新目標 |
 
 **終點對準**: path_tracker 在離終點 0.15 m 就算到了, Hybrid-A* 的路線又常在最後一小段才轉向目標方向,
@@ -35,6 +35,59 @@
 換成輪速發到 `/nav_mpc/spin`; `sensor_mpc_node` 在 hold 中送 左 -u / 右 +u (一樣量化成整數 rpm, 定位 / 圍籬
 檢查照舊)。**目標點在車子 0.2 m 內就不規劃, 直接原地轉** —— 在 Foxglove 車子上點一個方向 = 只轉車頭。
 `align_heading:=false` 關掉。
+
+**換車頭方向重新規劃** (2026-11-20, `alt_headings`): Hybrid-A* 只往前開、R0.5, 兩種情況會一直「沒有路線」:
+(1) 障礙物太近 —— 停下來時前面剩不到轉彎的空間 (11-20 Isaac: 箱子突然出現在 0.73 m, 停下後箱子正面在 0.60 m,
+膨脹出來的禁區從車前 0.2 m 就開始); (2) 目標的車頭方向被箱子 / 牆夾住開不進去 (11-18 Isaac 卡 2 分鐘那次)。
+但這台是滑移轉向, 可以原地轉, 所以主規劃器說沒有路線時, 從同一個位置再試:
+
+* 起點車頭 ±45° / ±90° / ±135° / 180° (`alt_offsets_deg`) —— 找到的話**先原地轉過去** (跟終點對準同一套),
+  轉好再從實際位姿正常規劃一次 (原地轉的中心會偏幾公分, 不直接用試出來的那條)。車子 `align_clearance` (0.30 m)
+  內有掃描點就不試這種 (轉會掃到); 還沒開出去之前累積原地轉的角度上限 `alt_max_turn_deg` (360°), 超過的起點方向
+  (含「一起換」) 不試。2026-11-20 以前是「最多轉 2 次」: Isaac 在 4 個箱子中間轉了 +45° 再 +90° 就不准轉,
+  一起換也跟著關掉, 只剩 7 種目標方向, 卡了 13.7 s 直到 costmap 剛好更新
+* 目標車頭換同樣的角度 —— 直接開過去, 到了 `ALIGNING` 轉回原本要的方向
+
+* (2026-11-20) 上面兩種**單邊**都失敗, 再試**起點 x 目標一起換** (7 x 7 = 49 種, 總轉角小的先試; `alt_combos`):
+  前面被擋 (要先轉) 而目標方向又只能從另一邊進去時需要 (11-20 Isaac 186~205 s 卡住那次很可能就是)。
+  先原地轉, 轉好直接用那個目標方向規劃, 到了再 `ALIGNING` 轉回來。
+  假世界: 車子面向西牆 (前面 0.2 m 就是禁區)、目標朝南但北邊有箱子 -> 單邊 14 種全失敗;
+  一起換 -> 試到第 63 種 (1.4 s) 找到「起點 -90° + 目標 +45°」-> 轉 3.0 s -> 到達 -> 轉回 -90° (誤差 3.4°)
+* 全部失敗 (`alt_failed`) 時存一份 **costmap 快照** `nav_fail_<t>.npz` (events_csv 的資料夾, 或 `fail_snapshot_dir`;
+  同一個目標、車子沒動只存一次; events: `fail_snapshot`), 畫圖:
+  `python3 src/nav_mpc_pkg/scripts/show_nav_fail.py car_run_data/nav_fail_<t>.npz` -> 同名 .png
+  (costmap、規劃器眼中的禁區 (紅, 2x2 降採樣後 >= 99)、雷射、車子 / 目標箭頭、試了幾種)
+
+單邊 14 種照轉角大小排, 分數 = 路線長 + `alt_turn_cost` (0.5 m/rad) x 起點多轉 + `alt_goal_turn_cost` (0.2 m/rad) x 終點多轉, 挑最小的
+(終點本來就要原地對準, 90° ~1 s, 所以比較便宜; 2026-11-20 從共用 0.5 拆開。假世界牆角目標 0.5 / 0.2 選的方向一樣, 只影響差不多長的路線之間怎麼選); 新路線一樣要通過前方
+走廊檢查。一次搜尋最多 `alt_budget` (5 s): 成功的規劃一次 ~2 ms, 失敗的 ~0.1~0.3 s。events CSV 記 `alt_path`
+(`start_off_deg` / `goal_off_deg`)、`turned`、`alt_failed`。要有 `align_heading` (原地轉靠它)。
+這種原地轉的穩定時間用 `turn_settle` (0.2 s, 終點對準是 `align_settle` 0.5 s): 轉好就從實際位姿重新規劃, 不用那麼準。
+
+**起點在規劃器的禁區邊緣** (2026-11-20 Isaac 卡住那次): 車子停在箱子側面 0.47 m, 只比 robot_radius (0.45) 多 2 cm,
+costmap 上那一格是 91; 但 SmacHybrid `downsample_costmap` 把 2x2 格取最大 (0.025 -> 0.05 m), 變成 99 ->
+「Starting point in lethal space」, 給什麼目標、換什麼方向都一樣失敗。現在規劃前用同樣的降採樣算起點那一格,
+>= 99 就改從 `start_shift_max` (0.15 m) 內最近、cost 最低的合法點規劃 (車頭不變, 路線起點偏幾公分, MPC 吃得下;
+events: `start_shift`)。`planner_downsample` 由 launch 從 nav2_params.yaml 自動填。
+假世界重現 (車子在箱子側面 0.46 m 起步): 關掉 -> 每 2 s「Starting point in lethal」+ 14 種全失敗 (跟 Isaac 一樣);
+打開 -> 移 2.5 cm, 一次規劃到達。
+
+**目標被障礙物佔住**: 規劃前先看目標那一格的 costmap, >= 99 (在障礙物或它膨脹 robot_radius 的禁區裡) 就不規劃、
+也不換方向試, log 報一次「目標 (x, y) 在障礙物的膨脹區裡 ... 換目標或把障礙物移開」(events: `goal_blocked`),
+之後每 `replan_period` 再看一次 (障礙物移開就會自己開始規劃)。
+
+假世界 (2026-11-20):
+
+| 場景 | 以前 | 現在 |
+| --- | --- | --- |
+| A: 開到一半, 箱子突然出現在正前方 0.97 m (停下後正面 0.62 m, 跟 Isaac 那次一樣) | 一直 `WAIT_REPLAN` | 14 種 21 ms -> 原地轉 -45° (2.1 s; `turn_settle` 0.2 之後 1.7 s) -> 新路線 3.30 m -> 到達, 離箱子最近 0.31 m |
+
+Isaac (2026-11-20, 4 個目標、箱子都在車子前方 ~0.8 m 才放): 9 次停車全部自己脫困 —— 主規劃器沒路線 -> 同一個週期
+找到 ±45° -> 原地轉 1.9~2.0 s (誤差 ≤ 1.6°) -> 繼續; 偵測 -> 重新動 2.95~3.15 s, 要轉兩次的 4.6 s。
+唯一失敗的是目標本身在箱子旁 15 cm (禁區裡), 正確 (現在會報 `goal_blocked`)。循跡 GT cte RMS 2.0 cm, 終點車頭 ≤ 1.1°。
+| B: 目標 (-2, -2.75) 朝南, 北邊 0.85 m 有箱子、南邊 0.65 m 是牆 (只往前開不進去) | 一直 `WAIT_REPLAN` | 14 種 1.2 s -> 目標車頭改 -45° 開過去 -> 原地轉回 -90° (誤差 3.6°) |
+| 目標在箱子裡面 (怎樣都到不了) | 每 2 s 重試 | 馬上報 `goal_blocked` (cost 99), 不規劃也不搜尋, 每 2 s 再看一次 |
+| 一般的停車重新規劃 (方塊 1.88 m) | - | 沒變 (主規劃器直接成功, 不會進搜尋); 偵測 -> 重新動 0.98 s |
 
 任何時候給新目標都會直接重新規劃。`ros2 service call /nav_mpc_manager/cancel std_srvs/srv/Trigger` 停車放棄目標;
 `.../replan` 用目前的目標重新規劃。
@@ -138,13 +191,30 @@ ros2 launch nav_mpc_pkg nav_mpc.launch.py check_distance:=2.0 corridor_half_widt
 | `check_distance` | 1.5 m | 停下來之後要有空間往前繞: 偵測到時離障礙物 ~1.3 m, 障礙物膨脹出來的禁區 (0.45 m) 前面還剩 ~0.7 m 可以轉。太短 -> 停太近, Hybrid-A* 找不到路 (只會一直 `WAIT_REPLAN`) |
 | `corridor_half_width` | 0.25 m | 車寬一半 ~0.17 + 8 cm。太寬 -> 路線旁邊的東西也會讓車停 |
 | `validate_clearance` | 0.35 m | 比 robot_radius 鬆 0.1 m (遲滯, 見上面「路線驗證」); 仍大於車子半對角 0.26 m |
-| `replan_wait` | 1 s | costmap 5 Hz 更新, 雷射 10 Hz; 太短 -> 新路線還穿過障礙物 (管理節點會檢查新路線前方的走廊, 擋住就算失敗再等) |
+| `replan_wait` | 0.2 s | 走廊偵測停車後, 停穩再等多久才規劃。planner_server 的 costmap 5 Hz 更新, 煞車本身就 ~0.46 s, 停穩時通常已經畫上去了 |
+| `replan_wait_invalid` | 0 s | costmap 驗證停車: costmap 已經畫上去才會觸發, 停穩就規劃 |
+| `stale_retry_wait` / `stale_retries` | 0.3 s / 3 次 | 新路線前方走廊還有掃描點 = costmap 還沒跟上: 很快再試, 用完才算規劃失敗 (隔 `replan_period` 2 s) |
+| `release_delay` | 0.1 s | 新路線發出後才放開 hold (path_tracker 50 Hz, 收到就換) |
+
+**停車時間 (2026-11-20 調)**: 11-18/19 Isaac 3 次實測共 15 次停車, 偵測 -> 輪子重新動平均 **2.04 s**
+(1.93~2.15): 煞停 0.46 s + `replan_wait` 1.0 s (固定) + 放行 0.37 s (`release_delay` 0.3) + 致動器 0.2 s。
+等 costmap 的 1 s 其實多數用不到, 改成上表的值。假世界同場景對照 (同一個方塊、同一個目標):
+
+| 場景 | 舊 (1.0 / 0.3 s) | 新 | 
+| --- | --- | --- |
+| (0,0) -> (3.5, 1.0, 0°) | 偵測 -> 重新動 2.05 s | **1.08 s** (停穩 -> 新路線 1.04 -> 0.27 s, 放行 0.37 -> 0.19 s) |
+| (0,0) -> (-3, -1.5, 180°) | 2.44 s | **1.36 s** (這次煞車較久 0.85 s, 轉彎中) |
+| 壓力測試: 偵測當下就規劃 (`replan_wait` 0, 不等停穩) | - | 第一條新路線還穿過方塊 -> `plan_stale` -> 0.35 s 後新路線 OK, 到達, 離方塊最近 0.41 m |
+
+整趟到達時間只差 0.1~1.4 s: 早一點規劃時車子停的位置 / costmap 看到的不完全一樣, 新路線長度會差幾公分到十幾公分。
+`plan_stale` 會記在 events CSV。Isaac 還沒重測。
 
 ## 已知限制
 
 * **終點對準是原地旋轉, 位置會偏一點**: 滑移轉向原地轉的中心不一定是 base_link, 假世界 180° 轉完中心偏 ~11 cm
   (只對準車頭, 不再修位置)。Isaac / 實體車還沒量。
-* **只會往前**: path_tracker / MPC 不倒車, 規劃器用 Dubins。停得離障礙物太近 (< robot_radius) 就規劃不出來,
+* **只會往前**: path_tracker / MPC 不倒車, 規劃器用 Dubins。前面空間不夠轉彎時靠「換車頭方向重新規劃」原地轉;
+  但車子**自己站在膨脹區裡** (離障礙物 < robot_radius 0.45 m) 規劃器根本不從那裡起步, 換方向也沒用,
   log 會寫「車子自己在障礙物的膨脹區裡」, 要把障礙物或車子移開 (或 `fallback_planner_id:=Grid` 試 2D A*)。
 * **箱子會干擾 LiDAR 定位** (2026-11-18 Isaac 第一次放箱子: 融合一直擋 LiDAR -> MPC「絕對量測斷了」停車,
   LiDAR 還一度鎖到 180 度反方向)。已在 car_loc_lidar 修 (地圖上沒有的點不拿來配準 + 穿牆射線鎖死偵測,
@@ -222,3 +292,9 @@ ros2 launch nav_mpc_pkg nav_mpc.launch.py use_sim_time:=false localization:=fals
 ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
     "{header: {frame_id: map}, pose: {position: {x: 3.5, y: 1.0}, orientation: {w: 1.0}}}"
 ```
+
+## 資料檔不覆寫 (2026-11-20)
+
+`events_csv` (預設 `/workspaces/car_run_data/nav_mpc_events.csv`) 跟追蹤的 `output_csv` 一樣: 同名檔已經存在就自動存成
+`nav_mpc_events_<台灣時間>.csv`, 啟動時印「事件記錄: ...」; 檔名裡也可以直接寫 `{time}`。以前每一輪都蓋掉上一輪。
+

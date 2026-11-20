@@ -8,7 +8,8 @@
                               ^  │ (規劃失敗 / 新路線前面還是擋住)        │
                               │  v                                       │ (走廊裡有掃描點,
                            WAIT_REPLAN <──────────────────────────────────┘  連續 confirm_scans 幀)
-                    (車停穩 + 等 replan_wait 秒, 讓 costmap 把障礙物畫上去, 再規劃一次)
+                    (車停穩 -> 走廊偵測停的再等 replan_wait 秒 / costmap 驗證停的不用等 -> 規劃;
+                     新路線還穿過剛剛的掃描點 = costmap 還沒畫上去, 隔 stale_retry_wait 秒再試, 最多 stale_retries 次)
 
 * 停車是靠 /nav_mpc/hold (std_msgs/Bool, hold_rate Hz 一直發): 不是 DRIVING 就發 true,
   sensor_mpc_node 收到 true 就送 0。這個節點掛了 -> 訊號斷 -> MPC 的 hold_timeout 也會停車
@@ -30,6 +31,15 @@
   換成輪速 u = yaw rate x align_wheel_per_yaw 發到 /nav_mpc/spin, sensor_mpc_node 在 hold 中送 左 -u / 右 +u。
   誤差在 align_tolerance 內連續 align_settle 秒就 ARRIVED; 超過 align_timeout、或雷射看到東西在車子
   align_clearance 以內 (原地轉會掃到) 就放棄 (一樣 ARRIVED, events 記 align_abort)
+* 換車頭方向重新規劃 (alt_headings): Hybrid-A* 只往前開、R0.5, 障礙物太近 (停下來時前面不到轉彎的空間) 或
+  目標方向被夾住時會一直沒路線。但車子是滑移轉向, 可以原地轉。所以主規劃器「沒有路線」時, 再試
+  (a) 起點車頭 +-alt_offsets_deg (先原地轉過去再走; 車子 align_clearance 內有東西就不試) 與
+  (b) 目標車頭 +-alt_offsets_deg (開到之後 ALIGNING 轉回原本的方向; 要 align_heading),
+  分數 = 路線長 + alt_turn_cost x 起點多轉的角度 + alt_goal_turn_cost x 終點多轉的角度, 挑最小的。(a) 轉好之後從實際位姿正常再規劃一次。
+  (a)(b) 都失敗 (例如前面被擋、目標方向又只能從另一邊進去) 才試 (c) 起點 x 目標一起換 (7 x 7 種):
+  先原地轉, 轉好直接用那個目標方向規劃。
+  一次搜尋最多 alt_budget 秒; 還沒開出去前累積原地轉的角度不超過 alt_max_turn_deg (360°), 超過的起點方向不試。events: alt_path / alt_failed / turned
+  全部失敗時存一份 costmap 快照 (events_csv 旁邊的 nav_fail_*.npz; src/nav_mpc_pkg/scripts/show_nav_fail.py 畫圖)
 * 初始位姿 (/initialpose, Foxglove "Publish pose estimate"): LiDAR 定位自己會訂閱並從那裡局部配準;
   這裡負責停車, 並在融合位姿跟給的差太多時叫 /fusion_localizer/reset (融合會用下一則絕對量測當起點)
 """
@@ -38,6 +48,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import rclpy
@@ -70,6 +81,19 @@ IDLE, PLANNING, DRIVING, WAIT_REPLAN, ALIGNING, ARRIVED = (
     'IDLE', 'PLANNING', 'DRIVING', 'WAIT_REPLAN', 'ALIGNING', 'ARRIVED')
 EVENT_COLS = ['t', 'event', 'state', 'x', 'y', 'yaw', 'goal_x', 'goal_y', 'goal_yaw',
               'path_len', 'plan_ms', 'obstacle_along', 'n_hits', 'detail']
+
+
+def _unique_path(path, stamp):
+    """檔案已經存在就在副檔名前加 _<時間> (再撞到就加 _2, _3 ...), 不覆寫舊資料。"""
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    if not root.endswith(stamp):
+        root = f'{root}_{stamp}'
+    cand, k = root + ext, 2
+    while os.path.exists(cand):
+        cand, k = f'{root}_{k}{ext}', k + 1
+    return cand
 
 
 def _pose_msg(x, y, yaw, frame, stamp):
@@ -107,7 +131,9 @@ class NavMpcManager(Node):
         p('planner_timeout', 10.0)                    # s
         p('path_spacing', 0.1)                        # m, 重取樣間距 (跟 path_tracker 的 spacing 一樣)
         p('hold_rate', 20.0)                          # Hz
-        p('release_delay', 0.3)                       # s, 新路線發出後過這麼久才放行 (path_tracker 先換好)
+        # s, 新路線發出後過這麼久才放行 (path_tracker 先換好)。path_tracker 50 Hz、收到路線就換,
+        # 0.1 s = 5 個週期。2026-11-20 從 0.3 降 (11-18/19 Isaac 15 次停車, 這段平均佔 0.37 s)
+        p('release_delay', 0.1)
         p('pose_timeout', 0.5)                        # s
         # ---- 障礙物 ----
         p('obstacle_check', True)
@@ -127,11 +153,43 @@ class NavMpcManager(Node):
         p('validate_distance', 4.0)                   # m, 車子前方這麼長的路線要驗證
         p('validate_clearance', 0.35)                 # m, 路線離障礙物格子 (cost 100) 小於這個才算擋住
         # ---- 重新規劃 ----
-        p('replan_wait', 1.0)                         # s, 車停穩後再等這麼久才規劃 (costmap 更新)
+        # s, 走廊偵測停車: 車停穩後再等這麼久才規劃 (讓 costmap 把障礙物畫上去)。planner_server 的 costmap
+        # 5 Hz 更新, 煞車本身就要 ~0.46 s (Isaac 實測), 停穩時通常已經更新過 2 次; 沒趕上的話新路線會穿過
+        # 剛剛的掃描點, 由下面的 stale_retry 補救。2026-11-20 從 1.0 降 (那 1 s 佔每次停車 2.04 s 的一半)
+        p('replan_wait', 0.2)
+        # s, costmap 驗證停車 (path_invalid): costmap 本來就已經畫上去了才會觸發, 停穩就規劃
+        p('replan_wait_invalid', 0.0)
+        # 新路線前方走廊還有掃描點 (= costmap 還沒跟上): 隔 stale_retry_wait 秒再試, 最多 stale_retries 次,
+        # 用完才當成一般的規劃失敗 (隔 replan_period 再試)。不算進 max_replans
+        p('stale_retry_wait', 0.3)
+        p('stale_retries', 3)
         p('stop_speed', 0.03)                         # m/s, |v| 低於這個算停穩
         p('stop_wait_max', 3.0)                       # s, 等停穩最多等這麼久
         p('replan_period', 2.0)                       # s, 規劃失敗後隔多久再試
         p('max_replans', 0)                           # 一個目標最多重新規劃幾次; 0 = 不限
+        # ---- 換車頭方向重新規劃 (主規劃器沒有路線時) ----
+        p('alt_headings', True)                       # 要 align_heading (原地轉靠它)
+        p('alt_offsets_deg', [45.0, 90.0, 135.0, 180.0])   # 每個都試 +-, 180 只試一次
+        p('alt_turn_cost', 0.5)                       # m / rad, 起點多轉: 先原地轉 (轉 0.6 rad/s vs 開 ~0.3 m/s)
+        # m / rad, 終點多轉 (目標換方向, 到了 ALIGNING 轉回來)。比起點便宜: 終點本來就要對準、原地轉 90° ~1 s。
+        # 2026-11-20 Isaac: 牆角目標 (離兩面牆 0.7 m、朝東) 用同一個 0.5, 每次都選「目標 -45°」, 那個方向要從很窄的
+        # 斜角開進去, 一路碰到箱子就越繞越遠 (103 s / 20.5 m, 直線 5.4 m)
+        p('alt_goal_turn_cost', 0.2)
+        p('alt_budget', 5.0)                          # s, 一次搜尋最多花這麼久 (失敗的規劃一次 ~0.1 s)
+        # 還沒開出去 (接受新路線) 之前, 累積原地轉的角度上限 (度)。超過的起點方向 (含起點 x 目標一起換) 就不試。
+        # 2026-11-20 以前是「最多轉 2 次」: Isaac 轉了 +45° 再 +90° 就不准轉, 也連帶關掉一起換, 卡了 13.7 s
+        p('alt_max_turn_deg', 360.0)
+        p('alt_combos', True)                         # 單邊換都失敗時, 試起點 x 目標一起換
+        # 換方向也失敗時存 costmap 快照 (npz) 的資料夾; '' = events_csv 的資料夾 (沒有 events_csv 就不存)
+        p('fail_snapshot_dir', '')
+        # s, 換起點方向那種原地轉的穩定時間 (轉好就從實際位姿重新規劃, 不用像終點對準那麼準)
+        p('turn_settle', 0.2)
+        # ---- 起點在規劃器的禁區邊緣 ----
+        # SmacHybrid 的 downsample_costmap: 2x2 格取最大 (0.025 -> 0.05 m), 車子停在膨脹區外 1~2 cm 時起點那一格
+        # 會變成禁區 -> "Starting point in lethal space", 換什麼方向都沒用 (2026-11-20 Isaac: 箱子在車子側面 0.47 m)。
+        # 這時改從 start_shift_max 內最近的合法點規劃 (路線起點偏幾公分, MPC 吃得下)。
+        p('planner_downsample', 2)                    # 要跟 nav2_params.yaml 的 SmacHybrid downsampling_factor 一樣 (launch 自動填)
+        p('start_shift_max', 0.15)                    # m; 0 = 不移
         # ---- 終點對準車頭 (原地旋轉) ----
         p('align_heading', True)
         p('spin_topic', '/nav_mpc/spin')              # -> sensor_mpc_node 的 spin_topic
@@ -146,7 +204,7 @@ class NavMpcManager(Node):
         p('align_timeout', 20.0)                      # s
         p('align_clearance', 0.30)                    # m, 原地轉的時候車子中心這麼近有掃描點就不轉
         p('align_only_dist', 0.2)                     # m, 目標離車子這麼近就不規劃, 直接原地轉 (只改車頭)
-        p('events_csv', '')                           # 事件紀錄 (停車 / 規劃 / 到達); '' = 不存
+        p('events_csv', '')                           # 事件紀錄 (停車 / 規劃 / 到達); '' = 不存; 已存在就加時間, 可寫 {time}
         g = lambda n: self.get_parameter(n).value  # noqa: E731
 
         self.frame = str(g('map_frame'))
@@ -170,6 +228,9 @@ class NavMpcManager(Node):
         self.laser_fallback = (lo[0], lo[1], math.radians(lo[2]))
         self.scan_timeout = float(g('scan_timeout'))
         self.replan_wait = float(g('replan_wait'))
+        self.replan_wait_invalid = float(g('replan_wait_invalid'))
+        self.stale_retry_wait = float(g('stale_retry_wait'))
+        self.stale_retries = int(g('stale_retries'))
         self.stop_speed = float(g('stop_speed'))
         self.stop_wait_max = float(g('stop_wait_max'))
         self.replan_period = float(g('replan_period'))
@@ -196,6 +257,8 @@ class NavMpcManager(Node):
         self.replans = 0
         self.next_plan_t = None
         self.stop_t = None              # 開始等停穩的時刻
+        self.stop_wait = 0.0            # 停穩之後還要等多久才規劃 (看是哪種停車)
+        self.stale_left = 0             # 這次停車還能「costmap 沒跟上」快速重試幾次
         self.plan_seq = 0               # 每次送規劃 +1, 舊的回應丟掉
         self.plan_t0 = None
         self.goal_handle = None
@@ -230,6 +293,31 @@ class NavMpcManager(Node):
         self.align_only_dist = float(g('align_only_dist'))
         self.align_t0 = None
         self.align_in_band = None       # 誤差進到容許範圍的時刻
+        self.align_yaw = None           # 原地轉的目標航向; None = 目標點的航向 (終點對準)
+        self.align_then = None          # None = 轉好就 ARRIVED; 'plan' = 轉好重新規劃 (換起點方向)
+        self.alt_on = bool(g('alt_headings'))
+        offs = []
+        for d in g('alt_offsets_deg'):
+            d = abs(float(d))
+            offs += [math.radians(d)] if abs(d - 180.0) < 1e-6 else [math.radians(d), -math.radians(d)]
+        self.alt_offsets = sorted(offs, key=abs)
+        self.alt_turn_cost = float(g('alt_turn_cost'))
+        self.alt_goal_turn_cost = float(g('alt_goal_turn_cost'))
+        self.alt_budget = float(g('alt_budget'))
+        self.alt_max_turn = math.radians(float(g('alt_max_turn_deg')))
+        self.turn_settle = float(g('turn_settle'))
+        self.alt_combos = bool(g('alt_combos'))
+        self.turn_goal_off = 0.0        # 起點 x 目標一起換: 轉好之後用這個目標方向規劃
+        self.snap_dir = str(g('fail_snapshot_dir')) or (
+            os.path.dirname(os.path.abspath(str(g('events_csv')))) if str(g('events_csv')) else '')
+        self.snap_key = None            # 同一個情況只存一次
+        self.planner_ds = max(1, int(g('planner_downsample')))
+        self.start_shift_max = float(g('start_shift_max'))
+        self.goal_blocked_warned = False  # 這個目標已經報過「在障礙物裡」了
+        self.plan_start = None          # 最近一次規劃用的起點 (可能移過)
+        self.alt = None                 # 搜尋中的狀態 (dict)
+        self.alt_turned = 0.0           # 還沒開出去之前累積原地轉了多少 (rad)
+        self.plan_cb = None             # 目前這個規劃要求的回呼 (ok, 路線點 / 原因, plan_ms)
         self.create_subscription(Odometry, str(g('odom_topic')), self.on_odom, ODOM_QOS)
         self.create_subscription(LaserScan, str(g('scan_topic')), self.on_scan, qos_profile_sensor_data)
         self.create_subscription(PoseStamped, str(g('goal_topic')), self.on_goal, 10)
@@ -247,8 +335,13 @@ class NavMpcManager(Node):
         self.events_csv = str(g('events_csv'))
         self._events = None
         if self.events_csv:
-            os.makedirs(os.path.dirname(os.path.abspath(self.events_csv)), exist_ok=True)
+            # 不覆寫 (2026-11-20 以前每一輪都蓋掉上一輪): 檔名裡的 {time} 換成啟動的台灣時間; 同名檔已經存在
+            # 就在後面加 _<時間> (跟 sensor_mpc 的 output_csv 一樣)
+            stamp = datetime.now(timezone(timedelta(hours=8))).strftime('%Y%m%d_%H%M%S')
+            self.events_csv = _unique_path(os.path.abspath(self.events_csv.replace('{time}', stamp)), stamp)
+            os.makedirs(os.path.dirname(self.events_csv), exist_ok=True)
             self._events_f = open(self.events_csv, 'w', newline='')
+            self.get_logger().info(f'事件記錄: {self.events_csv}')
             self._events = csv.DictWriter(self._events_f, fieldnames=EVENT_COLS, restval='',
                                           extrasaction='ignore')
             self._events.writeheader()
@@ -311,6 +404,9 @@ class NavMpcManager(Node):
         q = msg.pose.orientation
         self.goal = (msg.pose.position.x, msg.pose.position.y, yaw_of(q))
         self.replans = 0
+        self.alt_turned = 0.0
+        self.goal_blocked_warned = False
+        self.turn_goal_off = 0.0
         self.get_logger().info(f'新目標: x={self.goal[0]:+.2f} y={self.goal[1]:+.2f} '
                                f'yaw={math.degrees(self.goal[2]):+.0f}°')
         self.pub_goal.publish(_pose_msg(*self.goal, self.frame, self.get_clock().now().to_msg()))
@@ -328,9 +424,7 @@ class NavMpcManager(Node):
             err = self._heading_error()
             self._event('arrived', detail=f'heading_err_deg={math.degrees(err):+.1f}' if err is not None else '')
             if self.align and err is not None and abs(err) > self.align_tol:
-                self.align_t0 = self._now()
-                self.align_in_band = None
-                self._set_state(ALIGNING, f'走到目標, 車頭差 {math.degrees(err):+.0f}°, 原地旋轉對準')
+                self._start_align(f'走到目標, 車頭差 {math.degrees(err):+.0f}°, 原地旋轉對準')
             else:
                 self._set_state(ARRIVED, '走到目標')
 
@@ -365,8 +459,11 @@ class NavMpcManager(Node):
         return res
 
     # ───────────────────────────────────────── 規劃
-    def _cancel_plan(self):
+    def _cancel_plan(self, clear_alt=True):
         self.plan_seq += 1                   # 還在路上的回應作廢
+        self.plan_cb = None
+        if clear_alt:
+            self.alt = None
         if self.goal_handle is not None:
             try:
                 self.goal_handle.cancel_goal_async()
@@ -374,7 +471,51 @@ class NavMpcManager(Node):
                 pass
             self.goal_handle = None
 
-    def _request_plan(self, why, planner_id=None):
+    def _send_plan(self, start, goal, pid, cb):
+        """送一個 ComputePathToPose; 結果呼叫 cb(ok, 路線點 (N, 2) 或失敗原因, plan_ms)。舊的要求作廢。"""
+        self._cancel_plan(clear_alt=False)
+        msg = ComputePathToPose.Goal()
+        stamp = self.get_clock().now().to_msg()
+        msg.goal = _pose_msg(*goal, self.frame, stamp)
+        msg.start = _pose_msg(*start, self.frame, stamp)
+        msg.use_start = True
+        msg.planner_id = pid
+        seq = self.plan_seq
+        self.plan_cb = cb
+        self.plan_t0 = self._now()
+        fut = self.planner.send_goal_async(msg)
+        fut.add_done_callback(lambda f: self._on_goal_accepted(f, seq))
+
+    def _on_goal_accepted(self, fut, seq):
+        if seq != self.plan_seq:
+            return
+        gh = fut.result()
+        if gh is None or not gh.accepted:
+            self._finish_plan(False, 'planner_server 拒絕這個要求', None)
+            return
+        self.goal_handle = gh
+        gh.get_result_async().add_done_callback(lambda f: self._on_plan_result(f, seq))
+
+    def _on_plan_result(self, fut, seq):
+        if seq != self.plan_seq:
+            return
+        self.goal_handle = None
+        res = fut.result()
+        plan_ms = (self._now() - self.plan_t0) * 1000.0
+        if res is None or res.status != GoalStatus.STATUS_SUCCEEDED or len(res.result.path.poses) < 2:
+            code = getattr(res.result, 'error_code', None) if res is not None else None
+            self._finish_plan(False, f'沒有路線 (status {getattr(res, "status", "?")}'
+                              + (f', error_code {code}' if code else '') + ')', plan_ms)
+            return
+        raw = np.array([[ps.pose.position.x, ps.pose.position.y] for ps in res.result.path.poses])
+        self._finish_plan(True, raw, plan_ms)
+
+    def _finish_plan(self, ok, res, plan_ms):
+        cb, self.plan_cb = self.plan_cb, None
+        if cb is not None:
+            cb(ok, res, plan_ms)
+
+    def _request_plan(self, why, planner_id=None, goal_off=0.0):
         self._cancel_plan()
         self.next_plan_t = None
         if self.goal is None:
@@ -389,59 +530,59 @@ class NavMpcManager(Node):
             # 目標就在車子這裡 (只想改車頭方向): 規劃器會給太短的路線, 直接原地轉
             err = self._heading_error()
             if self.align and abs(err) > self.align_tol:
-                self.align_t0 = self._now()
-                self.align_in_band = None
-                self._set_state(ALIGNING, f'目標就在車子這裡, 只轉車頭 {math.degrees(err):+.0f}°')
+                self._start_align(f'目標就在車子這裡, 只轉車頭 {math.degrees(err):+.0f}°')
             else:
                 self._set_state(ARRIVED, '已經在目標上')
             return
+        gc = self._goal_cost()
+        if gc is not None and gc >= 99:
+            # 目標在障礙物 (或它膨脹出來的禁區) 裡: 規劃器、換車頭方向都不可能成功, 直接說清楚, 不白跑
+            msg = (f'目標 ({self.goal[0]:+.2f}, {self.goal[1]:+.2f}) 在障礙物的膨脹區裡 (cost {gc}, '
+                   '離障礙物 < robot_radius), 到不了 —— 換目標或把障礙物移開')
+            if not self.goal_blocked_warned:
+                self.goal_blocked_warned = True
+                self.get_logger().warn(msg)
+                self._event('goal_blocked', detail=f'cost {gc}')
+            self._retry_later('目標被障礙物佔住')
+            return
+        self.goal_blocked_warned = False      # 障礙物移開了; 之後又被佔住會再報一次
         pid = self.planner_id if planner_id is None else planner_id
         self._set_state(PLANNING, why)
-        goal = ComputePathToPose.Goal()
-        stamp = self.get_clock().now().to_msg()
-        goal.goal = _pose_msg(*self.goal, self.frame, stamp)
-        goal.start = _pose_msg(*self.pose, self.frame, stamp)
-        goal.use_start = True
-        goal.planner_id = pid
-        self.plan_seq += 1
-        seq = self.plan_seq
-        self.plan_t0 = self._now()
-        fut = self.planner.send_goal_async(goal)
-        fut.add_done_callback(lambda f: self._on_goal_accepted(f, seq, pid))
+        self.plan_start = self._plan_start(self.pose)
+        goal = (self.goal[0], self.goal[1], wrap_pi(self.goal[2] + goal_off))
+        tag = pid + (f' 目標車頭 {math.degrees(goal_off):+.0f}°' if goal_off else '')
+        self._send_plan(self.plan_start, goal, pid,
+                        lambda ok, res, ms: self._on_main_plan(pid, ok, res, ms, tag))
 
-    def _on_goal_accepted(self, fut, seq, pid):
-        if seq != self.plan_seq:
+    def _on_main_plan(self, pid, ok, res, plan_ms, tag=None):
+        if not ok:
+            # 只有「規劃器說沒有路線」才值得換方向試; 被拒絕 / 逾時是 Nav2 本身的問題
+            self._plan_failed(pid, res + self._start_cost_hint(), plan_ms, try_alt=res.startswith('沒有路線'))
             return
-        gh = fut.result()
-        if gh is None or not gh.accepted:
-            self._plan_failed(pid, 'planner_server 拒絕這個要求')
-            return
-        self.goal_handle = gh
-        gh.get_result_async().add_done_callback(lambda f: self._on_plan_result(f, seq, pid))
-
-    def _on_plan_result(self, fut, seq, pid):
-        if seq != self.plan_seq:
-            return
-        self.goal_handle = None
-        res = fut.result()
-        plan_ms = (self._now() - self.plan_t0) * 1000.0
-        if res is None or res.status != GoalStatus.STATUS_SUCCEEDED or len(res.result.path.poses) < 2:
-            code = getattr(res.result, 'error_code', None) if res is not None else None
-            self._plan_failed(pid, f'沒有路線 (status {getattr(res, "status", "?")}'
-                              + (f', error_code {code}' if code else '') + ')' + self._start_cost_hint(),
-                              plan_ms)
-            return
-        raw = np.array([[ps.pose.position.x, ps.pose.position.y] for ps in res.result.path.poses])
-        pts = resample_polyline(raw, self.spacing)
+        pts = resample_polyline(res, self.spacing)
         if len(pts) < 2:
             self._plan_failed(pid, '路線太短 (已經在目標上?)', plan_ms)
             return
         prog = PathProgress(pts)
         n_hits, along = self._blocked_on(prog)
+        if n_hits >= self.min_points and self.stale_left > 0:
+            # 通常是 planner_server 的 costmap 還沒把剛看到的障礙物畫上去: 很快再試, 不走一般失敗的 2 s
+            self.stale_left -= 1
+            self.get_logger().info(f'[{pid}] 新路線前方 {along:.2f} m 還有 {n_hits} 個掃描點 (costmap 還沒跟上?), '
+                                   f'{self.stale_retry_wait:.1f} s 後再規劃 (還剩 {self.stale_left} 次)')
+            self._event('plan_stale', plan_ms=plan_ms, obstacle_along=along, n_hits=n_hits, detail=pid)
+            self.stop_t = None
+            self.next_plan_t = self._now() + self.stale_retry_wait
+            self._set_state(WAIT_REPLAN, f'新路線還穿過障礙物, {self.stale_retry_wait:.1f} s 後再試')
+            return
         if n_hits >= self.min_points:
             self._plan_failed(pid, f'新路線前方 {along:.2f} m 還是有 {n_hits} 個掃描點 '
                               '(costmap 還沒畫上去? 或障礙物在規劃器看不到的高度)', plan_ms)
             return
+        self._accept_path(pts, prog, plan_ms, tag or pid)
+
+    def _accept_path(self, pts, prog, plan_ms, detail):
+        self.alt_turned = 0.0                # 開得出去了
         self.path_pts = pts
         self.progress = prog
         self.path_baseline = self._baseline(prog)
@@ -453,19 +594,157 @@ class NavMpcManager(Node):
         self._publish_path(pts)
         self.release_t = self._now() + self.release_delay
         L = prog.total
-        self.get_logger().info(f'[{pid}] 路線 {L:.2f} m, {len(pts)} 點 (原始 {len(raw)}), '
-                               f'規劃 {plan_ms:.0f} ms')
-        self._event('path', path_len=L, plan_ms=plan_ms, detail=pid)
+        self.get_logger().info(f'[{detail}] 路線 {L:.2f} m, {len(pts)} 點, 規劃 {plan_ms:.0f} ms')
+        self._event('path', path_len=L, plan_ms=plan_ms, detail=detail)
         self._set_state(DRIVING, f'路線 {L:.2f} m')
 
-    def _plan_failed(self, pid, why, plan_ms=None):
+    def _plan_failed(self, pid, why, plan_ms=None, try_alt=False):
         self.get_logger().warn(f'[{pid}] 規劃失敗: {why}')
         self._event('plan_failed', plan_ms=plan_ms, detail=f'{pid}: {why}')
+        if try_alt and pid == self.planner_id and self._start_alt_search(why):
+            return
         if self.fallback_id and pid != self.fallback_id:
             self.get_logger().info(f'改用 {self.fallback_id} 試一次')
             self._request_plan(f'{pid} 失敗', planner_id=self.fallback_id)
             return
         self._retry_later(why)
+
+    # ───────────────────────────────────────── 換車頭方向重新規劃
+    def _rotation_clear(self):
+        """原地轉會不會掃到東西 (跟 ALIGNING 同一個檢查): 最新掃描 align_clearance 內沒有點。"""
+        if self.world_pts is None or not len(self.world_pts):
+            return True
+        return np.linalg.norm(self.world_pts - np.asarray(self.pose[:2]), axis=1).min() >= self.align_clear
+
+    def _start_alt_search(self, why):
+        """主規劃器沒有路線: 試起點 / 目標換車頭方向。有東西可以試 -> True (結果非同步回來)。"""
+        if not (self.alt_on and self.align) or not self._pose_ok() or self.goal is None:
+            return False
+        clear = self._rotation_clear()
+        left = self.alt_max_turn - self.alt_turned                 # 還能轉多少
+        turns = [o for o in self.alt_offsets if abs(o) <= left + 1e-6] if clear else []
+        cands = []
+        for off in self.alt_offsets:                       # 小角度先試 (轉得少的分數低)
+            if off in turns:
+                cands.append((off, 0.0))
+            cands.append((0.0, off))
+        if not clear:
+            why_no_turn = f' (車子 {self.align_clear} m 內有東西, 不能原地轉, 只試目標方向)'
+        elif len(turns) < len(self.alt_offsets):
+            why_no_turn = (f' (已經累積原地轉 {math.degrees(self.alt_turned):.0f}°, '
+                           f'起點只試 {math.degrees(left):.0f}° 以內的)' if turns else
+                           f' (已經累積原地轉 {math.degrees(self.alt_turned):.0f}°, 這次不試起點)')
+        else:
+            why_no_turn = ''
+        combos = []
+        if turns and self.alt_combos:                      # 第二輪: 起點 x 目標一起換, 總轉角小的先試
+            combos = sorted(((so, go) for so in turns for go in self.alt_offsets),
+                            key=lambda c: abs(c[0]) + abs(c[1]))
+        start = getattr(self, 'plan_start', None) or self.pose      # 可能是移過的起點 (_plan_start)
+        self.alt = dict(queue=cands, combos=combos, best=None, t0=self._now(), pose=start, n=0, why=why,
+                        tried=[])
+        self.get_logger().info(f'換車頭方向試 {len(cands)} 種{why_no_turn}')
+        self._set_state(PLANNING, f'沒有路線, 換車頭方向試{why_no_turn}')
+        self._alt_next()
+        return True
+
+    def _alt_score(self, so, go, length=0.0):
+        return length + self.alt_turn_cost * abs(so) + self.alt_goal_turn_cost * abs(go)
+
+    def _alt_next(self):
+        a = self.alt
+        if a is None:
+            return
+        # 光是轉角的分數就比目前最好的大 -> 不用試
+        if a['best'] is not None:
+            a['queue'] = [c for c in a['queue'] if self._alt_score(*c) < a['best'][0]]
+        elif not a['queue'] and a['combos']:
+            # 單邊換方向全失敗: 第二輪試起點 x 目標一起換
+            a['queue'], a['combos'] = a['combos'], []
+            self.get_logger().info(f"單邊換方向 {a['n']} 種都沒有路線, 再試起點 x 目標一起換 {len(a['queue'])} 種")
+        q = a['queue']
+        if not q or self._now() - a['t0'] > self.alt_budget:
+            self._alt_finish()
+            return
+        so, go = q.pop(0)
+        a['n'] += 1
+        x, y, yaw = a['pose']
+        gx, gy, gyaw = self.goal
+        self._send_plan((x, y, wrap_pi(yaw + so)), (gx, gy, wrap_pi(gyaw + go)), self.planner_id,
+                        lambda ok, res, ms: self._on_alt_plan(so, go, ok, res, ms))
+
+    def _on_alt_plan(self, so, go, ok, res, plan_ms):
+        a = self.alt
+        if a is None:
+            return
+        a['tried'].append((so, go, bool(ok)))
+        if ok:
+            pts = resample_polyline(res, self.spacing)
+            if len(pts) >= 2:
+                prog = PathProgress(pts)
+                n_hits, _ = self._blocked_on(prog)
+                score = self._alt_score(so, go, prog.total)
+                if n_hits < self.min_points and (a['best'] is None or score < a['best'][0]):
+                    a['best'] = (score, so, go, pts, prog, plan_ms)
+        self._alt_next()
+
+    def _alt_finish(self):
+        a, self.alt = self.alt, None
+        el = self._now() - a['t0']
+        if a['best'] is None:
+            why = f"{a['why']}; 換車頭方向 {a['n']} 種也都沒有路線 ({el:.1f} s)"
+            self._event('alt_failed', detail=f"{a['n']} 種, {el:.1f} s")
+            self._save_fail_snapshot(a)
+            if self.fallback_id:
+                self.get_logger().info(f'改用 {self.fallback_id} 試一次')
+                self._request_plan(why, planner_id=self.fallback_id)
+                return
+            self._retry_later(why)
+            return
+        score, so, go, pts, prog, plan_ms = a['best']
+        desc = ' + '.join(([f'起點車頭 {math.degrees(so):+.0f}° (先原地轉)'] if so else [])
+                          + ([f'目標車頭 {math.degrees(go):+.0f}° (到了再轉回來)'] if go else []))
+        self.get_logger().info(f'換車頭方向找到路線: {desc}, 路線 {prog.total:.2f} m, '
+                               f"試了 {a['n']} 種, {el:.1f} s")
+        self._event('alt_path', path_len=prog.total, plan_ms=el * 1000.0,
+                    detail=f'start_off_deg={math.degrees(so):+.0f} goal_off_deg={math.degrees(go):+.0f} tried={a["n"]}')
+        if so:
+            # 先原地轉到那個方向, 轉好再從實際位姿正常規劃 (原地轉中心會偏幾公分, 不直接用這條)
+            self.alt_turned += abs(so)
+            self.turn_goal_off = go                # 一起換的話, 轉好之後直接用這個目標方向規劃
+            self._start_align(f'原地轉 {math.degrees(so):+.0f}° 再走', yaw=wrap_pi(a['pose'][2] + so), then='plan')
+            # (起點移過的話, 轉好之後 _request_plan 會從實際位姿再找一次合法起點)
+            return
+        # 目標換方向: 直接開這條; path_tracker 說到了以後, ALIGNING 會轉回目標原本的方向
+        self._accept_path(pts, prog, plan_ms, f'{self.planner_id} 目標車頭 {math.degrees(go):+.0f}°')
+
+    def _save_fail_snapshot(self, a):
+        """換方向也全失敗: 存 costmap + 位姿 + 目標 + 掃描 + 試過哪些, 事後用 scripts/show_nav_fail.py 畫。
+        同一個目標、車子沒動 (5 cm / 10°) 只存一次 (之後每 2 s 重試不會一直存)。"""
+        if not self.snap_dir or self.costmap is None or self.pose is None or self.goal is None:
+            return
+        k = self.snap_key
+        if (k is not None and np.allclose(k[0], self.goal, atol=1e-3)
+                and math.hypot(self.pose[0] - k[1][0], self.pose[1] - k[1][1]) < 0.05
+                and abs(wrap_pi(self.pose[2] - k[1][2])) < math.radians(10)):
+            return
+        self.snap_key = (tuple(self.goal), tuple(self.pose))
+        grid, res, ox, oy = self.costmap
+        path = os.path.join(self.snap_dir, f'nav_fail_{self._now():.1f}.npz')
+        try:
+            os.makedirs(self.snap_dir, exist_ok=True)
+            np.savez_compressed(
+                path, grid=grid, res=res, origin=np.array([ox, oy]), pose=np.array(self.pose),
+                plan_start=np.array(a['pose']), goal=np.array(self.goal),
+                scan=self.world_pts if self.world_pts is not None else np.zeros((0, 2)),
+                old_path=self.path_pts if self.path_pts is not None else np.zeros((0, 2)),
+                tried=np.array(a['tried'], dtype=float).reshape(-1, 3), planner_downsample=self.planner_ds,
+                robot_radius_hint=0.45, why=str(a['why']))
+            self.get_logger().warn(f'換方向也規劃不出來, costmap 快照存在 {path} '
+                                   f'(python3 src/nav_mpc_pkg/scripts/show_nav_fail.py {path})')
+            self._event('fail_snapshot', detail=path)
+        except Exception as ex:                                  # noqa: BLE001
+            self.get_logger().warn(f'存快照失敗: {ex!r}')
 
     def _retry_later(self, why):
         self.replans += 1
@@ -476,6 +755,13 @@ class NavMpcManager(Node):
         self.next_plan_t = self._now() + self.replan_period
         self.stop_t = None
         self._set_state(WAIT_REPLAN, f'{why}; {self.replan_period:.0f} s 後再試')
+
+    def _stop_for_replan(self, wait):
+        """障礙物 / costmap 驗證要停車: 先等車停穩, 再等 wait 秒才規劃 (tick 裡做)。"""
+        self.stop_t = self._now()
+        self.stop_wait = wait
+        self.next_plan_t = None
+        self.stale_left = self.stale_retries
 
     def _publish_path(self, pts):
         msg = Path()
@@ -502,8 +788,7 @@ class NavMpcManager(Node):
             self.get_logger().warn(f'costmap: 路線前方 {along:.2f} m 離障礙物 < {self.validate_clearance} m '
                                    '(看到障礙物的另一面了?), 停車, 等重新規劃')
             self._event('path_invalid', obstacle_along=along)
-            self.stop_t = self._now()
-            self.next_plan_t = None
+            self._stop_for_replan(self.replan_wait_invalid)
             self._set_state(WAIT_REPLAN, f'路線前方 {along:.2f} m 被 costmap 擋住')
 
     def _cost_at(self, xy):
@@ -569,13 +854,63 @@ class NavMpcManager(Node):
             return None
         return float(ss[sel][int(np.argmax(bad))] - s0)
 
+    def _goal_cost(self):
+        """目標點那一格的 costmap 值 (/global_costmap/costmap, 2 Hz); 沒有 costmap -> None。"""
+        if self.costmap is None or self.goal is None:
+            return None
+        return int(self._cost_at(np.array([self.goal[:2]]))[0])
+
+    def _planner_cost(self, xy):
+        """(M, 2) -> 規劃器看到的 cost: costmap 降採樣 planner_downsample 倍 (每塊取最大) 後那一格。"""
+        grid, res, ox, oy = self.costmap
+        f = self.planner_ds
+        ix = np.floor((xy[:, 0] - ox) / res).astype(int) // f * f
+        iy = np.floor((xy[:, 1] - oy) / res).astype(int) // f * f
+        out = np.full(len(xy), -1, dtype=int)
+        for di in range(f):
+            for dj in range(f):
+                i, j = ix + di, iy + dj
+                ok = (i >= 0) & (j >= 0) & (i < grid.shape[1]) & (j < grid.shape[0])
+                c = np.full(len(xy), -1, dtype=int)
+                c[ok] = grid[j[ok], i[ok]]
+                out = np.maximum(out, c)
+        return out
+
+    def _plan_start(self, pose):
+        """規劃起點: 車子那一格在規劃器眼中是禁區 (>= 99) 的話, 改用 start_shift_max 內最近、cost 最低的合法點
+        (車頭方向不變)。找不到 / 不用移 -> 原本的位姿。"""
+        if self.costmap is None or self.start_shift_max <= 0:
+            return pose
+        c0 = int(self._planner_cost(np.array([pose[:2]]))[0])
+        if 0 <= c0 < 99:
+            return pose
+        res = self.costmap[1]
+        ang = np.linspace(0.0, 2.0 * math.pi, 24, endpoint=False)
+        for r in np.arange(res, self.start_shift_max + 1e-9, res):
+            pts = np.column_stack([pose[0] + r * np.cos(ang), pose[1] + r * np.sin(ang)])
+            c = self._planner_cost(pts)
+            ok = (c >= 0) & (c < 99)
+            if ok.any():
+                k = int(np.argmin(np.where(ok, c, 1000)))
+                x, y = pts[k]
+                self.get_logger().info(
+                    f'起點那一格在規劃器眼中是禁區 (cost {c0}; 車子在膨脹區邊緣, 規劃器 {self.planner_ds}x{self.planner_ds} '
+                    f'降採樣取最大), 改從 {r * 100:.1f} cm 外的 ({x:+.3f}, {y:+.3f}) 規劃 (cost {int(c[k])})')
+                self._event('start_shift', detail=f'{r * 100:.1f} cm, cost {c0} -> {int(c[k])}')
+                return (float(x), float(y), pose[2])
+        return pose
+
     def _start_cost_hint(self):
-        """規劃失敗時看車子自己站的格子: 在膨脹區裡的話 Hybrid-A* 不會從這裡起步。"""
-        if self.costmap is None or self.pose is None:
+        """規劃失敗時看車子自己站的格子 (規劃器看到的, 降採樣後): 在禁區裡的話 Hybrid-A* 不會從這裡起步。"""
+        # 用實際送給規劃器的起點 (可能已經移過) 判斷; 2026-11-20 以前用車子原本的位置, 起點明明移到合法的地方了
+        # 還是印「15 cm 內也找不到合法起點」, 誤導
+        start = self.plan_start or self.pose
+        if self.costmap is None or start is None:
             return ''
-        c = int(self._cost_at(np.array([self.pose[:2]]))[0])
+        c = int(self._planner_cost(np.array([start[:2]]))[0])
         if c >= 99:
-            return (f'; 車子自己在障礙物的膨脹區裡 (cost {c}, 離障礙物 < robot_radius), 規劃器不會從這裡起步 —— '
+            return (f'; 車子自己在障礙物的膨脹區裡 (規劃器看到 cost {c}, 離障礙物 < robot_radius), '
+                    f'{self.start_shift_max * 100:.0f} cm 內也找不到合法起點 —— '
                     '把障礙物或車子移開, 或調小 robot_radius / 調大 check_distance')
         return ''
 
@@ -624,8 +959,7 @@ class NavMpcManager(Node):
             self.hit_streak = 0
             self.get_logger().warn(f'前方 {along:.2f} m 有障礙物 ({n_hits} 個掃描點), 停車, 等重新規劃')
             self._event('obstacle', obstacle_along=along, n_hits=n_hits)
-            self.stop_t = self._now()
-            self.next_plan_t = None
+            self._stop_for_replan(self.replan_wait)
             self._set_state(WAIT_REPLAN, f'前方 {along:.2f} m 有障礙物')
 
     def _blocked_on(self, prog, update=False):
@@ -666,8 +1000,11 @@ class NavMpcManager(Node):
         self.pub_hold.publish(m)
 
         if self.state == PLANNING and self.plan_t0 is not None and now - self.plan_t0 > self.planner_timeout:
-            self._cancel_plan()
-            self._plan_failed(self.planner_id, f'超過 {self.planner_timeout:.0f} s 沒回應')
+            self.plan_t0 = None
+            cb = self.plan_cb
+            self._cancel_plan(clear_alt=False)      # 晚到的回應作廢
+            if cb is not None:
+                cb(False, f'超過 {self.planner_timeout:.0f} s 沒回應', None)
 
         if self.state == WAIT_REPLAN:
             if self.next_plan_t is None:
@@ -676,8 +1013,8 @@ class NavMpcManager(Node):
                     self.stop_t = now
                 stopped = self.speed < self.stop_speed or now - self.stop_t > self.stop_wait_max
                 if stopped:
-                    self.next_plan_t = now + self.replan_wait
-            elif now >= self.next_plan_t:
+                    self.next_plan_t = now + self.stop_wait
+            if self.next_plan_t is not None and now >= self.next_plan_t:   # 不用等的話同一個 tick 就規劃
                 self._request_plan('重新規劃')
 
         if self.state == ALIGNING:
@@ -695,6 +1032,21 @@ class NavMpcManager(Node):
             return None
         return wrap_pi(self.goal[2] - self.pose[2])
 
+    def _start_align(self, why, yaw=None, then=None):
+        """原地轉: yaw=None 轉到目標點的方向 (終點對準); 否則轉到 yaw, then='plan' 轉好就重新規劃。"""
+        self.align_yaw = yaw
+        self.align_then = then
+        self.align_t0 = self._now()
+        self.align_in_band = None
+        self._set_state(ALIGNING, why)
+
+    def _align_error(self):
+        if self.align_yaw is None:
+            return self._heading_error()
+        if self.pose is None:
+            return None
+        return wrap_pi(self.align_yaw - self.pose[2])
+
     def _spin(self, u):
         m = Float32()
         m.data = float(u)
@@ -702,11 +1054,21 @@ class NavMpcManager(Node):
 
     def _align_done(self, event, why, warn=False):
         self._spin(0.0)
-        err = self._heading_error()
+        err = self._align_error()
+        then, self.align_then, self.align_yaw = self.align_then, None, None
+        if then == 'plan':
+            event = 'turned' if event == 'aligned' else 'turn_abort'
         detail = (f'heading_err_deg={math.degrees(err):+.1f}' if err is not None else '') + f' {why}'
         self._event(event, detail=detail.strip())
         (self.get_logger().warn if warn else self.get_logger().info)(
             f'{why}' + (f', 車頭差 {math.degrees(err):+.1f}°' if err is not None else ''))
+        if then == 'plan':
+            go, self.turn_goal_off = self.turn_goal_off, 0.0
+            if event == 'turned':
+                self._request_plan('原地轉好了, 重新規劃', goal_off=go)
+            else:
+                self._retry_later(why)
+            return
         self._set_state(ARRIVED, why)
 
     def _align_step(self, now):
@@ -720,12 +1082,12 @@ class NavMpcManager(Node):
             if d < self.align_clear:
                 self._align_done('align_abort', f'車子 {d:.2f} m 內有東西, 原地轉會掃到, 不轉了', warn=True)
                 return
-        err = self._heading_error()
+        err = self._align_error()
         if abs(err) <= self.align_tol:
             self._spin(0.0)
             if self.align_in_band is None:
                 self.align_in_band = now
-            elif now - self.align_in_band >= self.align_settle:
+            elif now - self.align_in_band >= (self.turn_settle if self.align_then == 'plan' else self.align_settle):
                 self._align_done('aligned', f'車頭對準了 ({now - self.align_t0:.1f} s)')
             return
         self.align_in_band = None

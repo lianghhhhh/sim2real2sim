@@ -65,7 +65,9 @@ def generate_launch_description():
         DeclareLaunchArgument('direction', default_value='auto'),
         DeclareLaunchArgument('mpc_config', default_value=EnvironmentVariable(
             'MPC_CONFIG_PATH', default_value='/workspaces/model/mpc_config.json')),
-        DeclareLaunchArgument('output_csv', default_value='/workspaces/car_run_data/sensor_mpc_tracking.csv'),
+        DeclareLaunchArgument('output_csv', default_value='',
+                              description='空 = <工作區>/car_run_data/sensor_mpc_{time}.csv; {time} 換成啟動時間 '
+                                          '(台灣, 例 20261119_153012); 同名檔已存在就自動在檔名後加時間, 不覆寫'),
         DeclareLaunchArgument('gt_topic', default_value='/odom',
                               description='模擬裡對答案用的 GT; 實體車給空字串'),
         DeclareLaunchArgument('velocity_source', default_value='twist'),
@@ -186,7 +188,7 @@ def generate_launch_description():
             'hold_timeout': ParameterValue(lc('hold_timeout'), value_type=float),
             'spin_topic': ParameterValue(lc('spin_topic'), value_type=str),
             'mpc_config': lc('mpc_config'),
-            'output_csv': lc('output_csv'),
+            'output_csv': ParameterValue(lc('output_csv'), value_type=str),
         }])
 
     return LaunchDescription(args + [localization, actuator, tracker, mpc])

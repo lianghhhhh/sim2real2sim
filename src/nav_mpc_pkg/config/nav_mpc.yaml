@@ -21,7 +21,7 @@ nav_mpc_manager:
     planner_timeout: 10.0
     path_spacing: 0.1                      # 要跟 path_tracker 的 spacing / mpc_config.json 的 path_point_spacing 一樣
     hold_rate: 20.0
-    release_delay: 0.3
+    release_delay: 0.1                     # s, 新路線發出後才放行 (path_tracker 50 Hz); 2026-11-20 從 0.3 降
     pose_timeout: 0.5
     # ---- 障礙物 (掃描點落在「前方路徑的走廊」裡) ----
     obstacle_check: true
@@ -37,11 +37,28 @@ nav_mpc_manager:
     laser_offset: [0.045, 0.0, 0.0]        # 查不到 TF 時用 (kros_car.usd 的 laser_frame)
     scan_timeout: 0.5
     # ---- 重新規劃 ----
-    replan_wait: 1.0                       # s, 車停穩後等 costmap (5 Hz) 把障礙物畫上去
+    replan_wait: 0.2                       # s, 走廊偵測停車: 車停穩後再等 (costmap 5 Hz; 煞車 ~0.46 s 時已更新過)
+    replan_wait_invalid: 0.0               # s, costmap 驗證停車: costmap 已經畫上去了, 停穩就規劃
+    stale_retry_wait: 0.3                  # s, 新路線還穿過剛剛的掃描點 (costmap 沒跟上) -> 這麼快再試
+    stale_retries: 3                       # 最多快速重試幾次, 用完才算規劃失敗 (隔 replan_period)
     stop_speed: 0.03
     stop_wait_max: 3.0
     replan_period: 2.0                     # s, 規劃失敗 (例如整條路被堵死) 隔多久再試
     max_replans: 0                         # 0 = 一直試到路通或給新目標
+    # ---- 換車頭方向重新規劃 (主規劃器「沒有路線」時; 要 align_heading) ----
+    # 起點換方向 = 先原地轉過去 (車子 align_clearance 內有東西就不試); 目標換方向 = 到了再 ALIGNING 轉回來
+    alt_headings: true
+    alt_offsets_deg: [45.0, 90.0, 135.0, 180.0]   # 每個都試 +-, 180 只試一次 -> 起點 7 + 目標 7 種
+    alt_turn_cost: 0.5                     # m / rad, 起點多轉 (先原地轉) 的成本; 分數 = 路線長 + 轉角成本
+    alt_goal_turn_cost: 0.2                # m / rad, 終點多轉 (到了 ALIGNING 轉回來) 的成本, 比起點便宜
+    alt_budget: 5.0                        # s, 一次搜尋最多花這麼久
+    alt_max_turn_deg: 360.0                # 還沒開出去前累積原地轉的上限 (度); 超過的起點方向就不試
+    turn_settle: 0.2                       # s, 換起點方向那種原地轉的穩定時間 (終點對準是 align_settle 0.5)
+    alt_combos: true                       # 單邊換都失敗時, 再試起點 x 目標一起換 (7 x 7)
+    fail_snapshot_dir: ''                  # 換方向也失敗時存 costmap 快照; '' = events_csv 的資料夾
+    # 車子停在膨脹區邊緣時, 規劃器 (2x2 降採樣取最大) 會說起點在禁區: 改從這麼近內的合法點規劃
+    planner_downsample: 2                  # = nav2_params.yaml SmacHybrid downsampling_factor (launch 會自動覆蓋)
+    start_shift_max: 0.15                  # m; 0 = 不移
     # ---- 用 Nav2 的 costmap 驗證剩下的路線 (看到障礙物的另一面時提早重新規劃) ----
     validate_path: true
     costmap_topic: /global_costmap/costmap

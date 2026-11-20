@@ -46,7 +46,7 @@ sensor_mpc_node:
     path_heading_relative: false          # true 只在吃 Isaac 的 /nearest_curve_point 時
     finished_topic: /sensor_mpc/finished
     joint_command_topic: /joint_command
-    output_csv: /workspaces/car_run_data/sensor_mpc_tracking.csv
+    output_csv: ''                        # 空 = <工作區>/car_run_data/sensor_mpc_{time}.csv; {time} = 啟動時間 (台灣); 同名已存在自動加時間
     rpm_step: 1.0                         # 輪速量化成整數 rpm; 0 = 不量化
     path_timeout: 0.5
     # 圍籬 (map 座標, m): 出了矩形、進了圓、或 MPC 預測 geofence_horizon 秒內會出去 -> 送 0 並鎖住,

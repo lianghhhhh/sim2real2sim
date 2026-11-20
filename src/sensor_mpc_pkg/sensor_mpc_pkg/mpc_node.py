@@ -27,6 +27,7 @@ import math
 import os
 import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 from nav_msgs.msg import Path
@@ -61,6 +62,36 @@ LATCHED = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=Durabili
                      history=HistoryPolicy.KEEP_LAST, depth=1)
 
 
+TW = timezone(timedelta(hours=8))                  # 台灣時間 (沒有夏令時間, 不靠容器的 tzdata)
+
+
+def _default_csv_dir():
+    """<工作區>/car_run_data。工作區從這個套件的 install 位置往上找 (/workspaces 或實體車的 /s2r)。"""
+    try:
+        from ament_index_python.packages import get_package_prefix
+        prefix = os.path.abspath(get_package_prefix('sensor_mpc_pkg'))   # <ws>/install/sensor_mpc_pkg
+        parts = prefix.split(os.sep)
+        if 'install' in parts:
+            ws = os.sep.join(parts[:len(parts) - 1 - parts[::-1].index('install')]) or os.sep
+            return os.path.join(ws, 'car_run_data')
+    except Exception:
+        pass
+    return os.path.join(os.getcwd(), 'car_run_data')
+
+
+def _unique_csv(path, stamp):
+    """檔案已經存在就在副檔名前加 _<時間> (再撞到就加 _2, _3 ...), 絕不覆寫舊資料。"""
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    if not root.endswith(stamp):
+        root = f'{root}_{stamp}'
+    cand, k = root + ext, 2
+    while os.path.exists(cand):
+        cand, k = f'{root}_{k}{ext}', k + 1
+    return cand
+
+
 def _track_err(x, y, th, ref0):
     """(cross, along, heading) 相對參考點 ref0 = [x, y, sin psi, cos psi]。"""
     x_t, y_t, s_t, c_t = ref0
@@ -83,7 +114,7 @@ class SensorMpcNode(Node):
         p('full_path_topic', '/sensor_mpc/path')         # 整條路徑 (latched), 算 cte 用; '' = 舊算法
         p('finished_topic', '/sensor_mpc/finished')
         p('joint_command_topic', '/joint_command')
-        p('output_csv', '')                              # 空 = /tmp/sensor_mpc_tracking.csv
+        p('output_csv', '')                              # 空 = <工作區>/car_run_data/sensor_mpc_{time}.csv
         p('rpm_step', 1.0)                               # 輪速量化成整數 rpm (實體車馬達只收整數)
         p('path_timeout', 0.5)                           # s, 目標點太久沒更新就停
         # 上層停車訊號 (std_msgs/Bool, true = 停)。空 = 不訂閱 (= 舊的行為)。
@@ -117,7 +148,12 @@ class SensorMpcNode(Node):
         self.rel_heading = bool(g('path_heading_relative'))
         self.rpm_step = float(g('rpm_step'))
         self.path_timeout = float(g('path_timeout'))
-        self.output_csv = str(g('output_csv')) or '/tmp/sensor_mpc_tracking.csv'
+        # 檔名裡的 {time} 換成節點啟動的台灣時間; 沒給檔名 = <工作區>/car_run_data/sensor_mpc_{time}.csv;
+        # 同名檔案已經存在就自動加時間 (存檔時再檢查一次), 每一輪都是新檔
+        self.csv_stamp = datetime.now(TW).strftime('%Y%m%d_%H%M%S')
+        name = str(g('output_csv')) or os.path.join(_default_csv_dir(), 'sensor_mpc_{time}.csv')
+        self.output_csv = _unique_csv(os.path.abspath(name.replace('{time}', self.csv_stamp)), self.csv_stamp)
+        self.get_logger().info(f'這一輪的資料會存到 {self.output_csv} (Ctrl-C 時寫入)')
         self.fence = (float(g('geofence_x_min')), float(g('geofence_x_max')),
                       float(g('geofence_y_min')), float(g('geofence_y_max')))
         self.fence_box = self.fence[0] < self.fence[1] and self.fence[2] < self.fence[3]
@@ -568,6 +604,7 @@ class SensorMpcNode(Node):
             log('==================================================')
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.output_csv)), exist_ok=True)
+            self.output_csv = _unique_csv(self.output_csv, self.csv_stamp)   # 跑的期間別人可能寫了同名檔
             with open(self.output_csv, 'w', newline='') as f:
                 w = csv.DictWriter(f, fieldnames=CSV_COLS, restval='', extrasaction='ignore')
                 w.writeheader()

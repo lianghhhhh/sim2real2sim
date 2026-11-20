@@ -47,7 +47,7 @@ launch 會開: `collect_all.launch.py` 的 fusion 那一組 (多相機偵測 + L
 偵測節點第一次要暖機 ~30 s, 期間 MPC 會印「停車: 還沒收到位姿」, 正常。
 
 開始前讓車停一秒 (融合要做靜止校正); 車子要在路線附近 (離路徑 > 1.5 m 會走回歸曲線接回去)。
-Ctrl-C 會先送輪速 0, 印誤差統計, 逐週期資料存到 `output_csv` (預設 `car_run_data/sensor_mpc_tracking.csv`)。
+Ctrl-C 會先送輪速 0, 印誤差統計, 逐週期資料存到 `output_csv` (沒給 = `<工作區>/car_run_data/sensor_mpc_{time}.csv`, `{time}` = 啟動時的台灣時間, 例 `sensor_mpc_20261119_153012.csv`; 給的檔名已經存在就自動在後面加時間, 不覆寫; 啟動時會印出這一輪的檔名)。
 
 常用開關:
 
@@ -225,7 +225,7 @@ PYTHONPATH=$E LD_LIBRARY_PATH=$E/bin:$HOME/isaac-sim/kit/python/lib \
 `scripts/eval_tracking.py` 重算 (`--path` 給跑的那條路線、`--markdown` 印表格)。`ate` 還是對第 0 個參考點。
 `v_ref, cmd_l, cmd_r, solve_ms, ok` (0 = 這一週期在停車或 solver 失敗, `reason` 寫原因)、
 `pose_age` (位姿訊息幾秒前的)、`lead` (實際外插了幾秒)。`t` 是 NaN 的列是 Isaac Stop / Play 的分段標記。
-**每一輪給不同的 `output_csv:=`**, 不然會互相覆寫。
+不會互相覆寫: 沒給 `output_csv:=` 用 `sensor_mpc_{時間}.csv`; 給了但同名檔已存在, 自動存成 `<原檔名>_{時間}.csv`。檔名裡也可以直接寫 `{time}`, 例 `output_csv:=/workspaces/car_run_data/mpc_h4_{time}.csv`。
 
 ## 離線測試 (不需要 ROS / Isaac)
 
