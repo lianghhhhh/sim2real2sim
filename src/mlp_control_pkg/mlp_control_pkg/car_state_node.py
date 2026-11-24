@@ -18,8 +18,9 @@ def wrap(a):
 
 
 class CarStateNode(Node):
-    """/odom + /joint_states -> 模型的 10 維狀態
-    [x, y, theta, vx, vy, wz, wFL, wFR, wRL, wRR] (見 utils.py 檔頭)。"""
+    """/odom -> 模型的 6 維狀態 [x, y, theta, vx, vy, wz] (見 utils.py 檔頭)。
+    舊版是 /odom + /joint_states -> 10 維 (後面加 wFL, wFR, wRL, wRR); 模型改成不含輪速後,
+    輪速那段先註解掉 (還是訂閱 /joint_states, 只是不用)。"""
 
     def __init__(self):
         super().__init__('car_state_node')
@@ -37,13 +38,15 @@ class CarStateNode(Node):
 
     def get_car_state(self):
         js, od = self.latest_joint_state, self.latest_odom
-        if js is None or od is None:
-            return None
-        try:
-            idx = [js.name.index(n) for n in WHEELS]
-        except ValueError:
-            return None
-        if len(js.velocity) <= max(idx):
+        # if js is None or od is None:          # 舊版: 狀態要輪速, 沒有 /joint_states 就不能算
+        #     return None
+        # try:
+        #     idx = [js.name.index(n) for n in WHEELS]
+        # except ValueError:
+        #     return None
+        # if len(js.velocity) <= max(idx):
+        #     return None
+        if od is None:
             return None
 
         pose, twist = od.pose.pose, od.twist.twist
@@ -55,5 +58,5 @@ class CarStateNode(Node):
         return np.array([
             pose.position.x, pose.position.y, self._theta,
             twist.linear.x, twist.linear.y, twist.angular.z,
-            *[js.velocity[i] for i in idx],
+            # *[js.velocity[i] for i in idx],   # 四輪輪速 (模型已不含)
         ], dtype=float)

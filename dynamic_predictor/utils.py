@@ -30,14 +30,15 @@ STATE_COLS = [
     'car_position_x', 'car_position_y',
     'theta',
     'car_linear_velocity_x', 'car_linear_velocity_y', 'car_angular_velocity_z',
-    'front_left_velocity', 'front_right_velocity',
-    'rear_left_velocity', 'rear_right_velocity',
+    # 'front_left_velocity', 'front_right_velocity',
+    # 'rear_left_velocity', 'rear_right_velocity',
 ]
 
 # Wheel speeds come from /joint_states (their own stamp); everything else in
 # STATE_COLS comes from /odom.
-WHEEL_VEL_COLS = ['front_left_velocity', 'front_right_velocity',
-                  'rear_left_velocity', 'rear_right_velocity']
+# WHEEL_VEL_COLS = ['front_left_velocity', 'front_right_velocity',
+#                   'rear_left_velocity', 'rear_right_velocity']
+WHEEL_VEL_COLS = []
 
 # Absolute x/y position and heading are meaningless as *features* (on flat
 # ground the dynamics don't depend on where the car is or which way it

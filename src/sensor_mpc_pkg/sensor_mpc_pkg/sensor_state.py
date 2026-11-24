@@ -1,13 +1,15 @@
-"""感測器定位 + 輪速回授 -> MPC 的 10 維狀態, 外加「現在能不能信」的判斷。
+"""感測器定位 -> MPC 的 6 維狀態, 外加「現在能不能信」的判斷。
 
-狀態 (跟 mlp_control_pkg/utils.py 的 STATE 一樣): [x, y, theta, vx, vy, wz, wFL, wFR, wRL, wRR]
+狀態 (跟 mlp_control_pkg/utils.py 的 STATE 一樣): [x, y, theta, vx, vy, wz]
+  (舊版是 10 維, 後面加四輪輪速 wFL, wFR, wRL, wRR; 模型改成不含輪速後, 輪速那段先註解掉。
+   joint_states_topic 還是會訂閱 (n_joint 計數), 但不再用來組狀態, 也不再擋 get_state)
 
 | 分量 | 來源 | 備註 |
 | --- | --- | --- |
 | x, y, theta | odom_topic 的 pose (/fusion_loc/odom) | theta 在這裡 unwrap 成連續的 (MPC 的 CasADi 不 wrap) |
 | vx, wz | odom 的 twist.linear.x / angular.z | 融合節點給的是車頭方向速度與 (扣零偏的) gyro |
 | vy | 預設 0 | 融合不估側向速度; vy_source:=diff 用位姿差分算 (旋到車體座標 + 低通) |
-| 四輪輪速 | joint_states_topic (模擬 /joint_states, 實體車 /wheel_feedback) | 用關節名字對, 順序無所謂 |
+| ~~四輪輪速~~ | ~~joint_states_topic (模擬 /joint_states, 實體車 /wheel_feedback)~~ | 已註解掉 (模型不含輪速) |
 
 velocity_source:=diff 時 vx, wz 也改用位姿差分 (拿來跟 twist 版本比較用; 平常用 twist)。
 
@@ -21,7 +23,7 @@ velocity_source:=diff 時 vx, wz 也改用位姿差分 (拿來跟 twist 版本�
   LiDAR 單獨那條沒有落後。
 
 能不能信 (get_state() 回 (state, None) 才可以用, 否則 (None, 原因)):
-  * 位姿 / 輪速超過 pose_timeout / wheel_timeout 沒更新
+  * 位姿超過 pose_timeout 沒更新 (輪速的 wheel_timeout 檢查已註解掉)
   * 位姿 1-sigma (sqrt(cov_xx + cov_yy)) > pose_sigma_max
   * 絕對量測 (相機 / LiDAR) 斷超過 abs_age_max (融合的 abs_age topic; 收不到就不檢查,
     跟 calibrate_env_pkg 的 control_car_node 同一套規則 —— 這一條比 sigma 可靠)
@@ -189,12 +191,12 @@ class SensorStateNode(Node):
         now = self._now()
         if self.latest_odom is None:
             return f'還沒收到位姿 {self.odom_topic}'
-        if self.latest_joint is None:
-            return '還沒收到輪速回授'
+        # if self.latest_joint is None:        # 舊版: 狀態要輪速
+        #     return '還沒收到輪速回授'
         if now - self.t_odom > self.pose_timeout:
             return f'位姿 {now - self.t_odom:.2f} s 沒更新'
-        if now - self.t_joint > self.wheel_timeout:
-            return f'輪速回授 {now - self.t_joint:.2f} s 沒更新'
+        # if now - self.t_joint > self.wheel_timeout:
+        #     return f'輪速回授 {now - self.t_joint:.2f} s 沒更新'
         if self.pose_sigma_max > 0 and self.pose_sigma > self.pose_sigma_max:
             return f'位姿 sigma {self.pose_sigma:.2f} m > {self.pose_sigma_max}'
         age = self.abs_age_now()
@@ -203,17 +205,17 @@ class SensorStateNode(Node):
         return None
 
     def get_state(self):
-        """回 (state (10,), None) 或 (None, 原因)。"""
+        """回 (state (6,), None) 或 (None, 原因)。 (舊版 (10,), 含四輪輪速)"""
         reason = self.health()
         if reason is not None:
             return None, reason
         js, od = self.latest_joint, self.latest_odom
-        try:
-            idx = [js.name.index(n) for n in WHEELS]
-        except ValueError:
-            return None, f'輪速回授的關節名字對不上 {WHEELS} (收到 {list(js.name)})'
-        if len(js.velocity) <= max(idx):
-            return None, '輪速回授沒有 velocity'
+        # try:                                   # 舊版: 狀態要四輪輪速
+        #     idx = [js.name.index(n) for n in WHEELS]
+        # except ValueError:
+        #     return None, f'輪速回授的關節名字對不上 {WHEELS} (收到 {list(js.name)})'
+        # if len(js.velocity) <= max(idx):
+        #     return None, '輪速回授沒有 velocity'
 
         pose, twist = od.pose.pose, od.twist.twist
         yaw = yaw_of(pose.orientation)
@@ -245,5 +247,5 @@ class SensorStateNode(Node):
         return np.array([
             x, y, th,
             vx, vy, wz,
-            *[js.velocity[i] for i in idx],
+            # *[js.velocity[i] for i in idx],   # 四輪輪速 (模型已不含)
         ], dtype=float), None

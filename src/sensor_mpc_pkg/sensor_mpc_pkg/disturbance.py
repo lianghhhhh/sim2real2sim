@@ -17,7 +17,7 @@ MPC 自己量出這個差。(2026-11-17 Isaac 上一度以為整路偏左 1.4 cm
     d  夾在 ±limit 裡
 
 d 當成 acados 的參數, 在整個 horizon 裡加到模型預測的位姿差上 (mlp_control_pkg.utils 的
-createAcadosSolver(disturbance=True))。速度那幾維不修: 模型的輸入還是量到的速度 / 輪速。
+createAcadosSolver(disturbance=True))。速度那幾維不修: 模型的輸入還是量到的速度 (舊版還有輪速)。
 
 tau 是取捨: 太小 = 把定位雜訊當成擾動 (MPC 會抖), 太大 = 彎道的暫態跟不上。
 """
