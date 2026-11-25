@@ -15,7 +15,7 @@
         │                 (路徑 CSV)        /sensor_mpc/path, /sensor_mpc/targets (給 Foxglove)
         v                           │
   sensor_mpc_node  <────────────────┘
-  ├─ sensor_state_node: odom + 輪速回授 -> 10 維狀態; 判斷定位能不能信
+  ├─ sensor_state_node: odom -> 6 維狀態 (舊版 + 輪速回授 -> 10 維); 判斷定位能不能信
   └─ sensor_mpc_node:   acados MPC (mlp_control_pkg.utils) -> /joint_command (四輪 rad/s)
                                                           -> /sensor_mpc/predicted_path_viz
 ```
@@ -186,8 +186,8 @@ PYTHONPATH=$E LD_LIBRARY_PATH=$E/bin:$HOME/isaac-sim/kit/python/lib \
 | out | `/sensor_mpc/predicted_path_viz` | `nav_msgs/Path` | MPC 預測的整條 horizon |
 | out | `/sensor_mpc/predicted_path` | `Float64MultiArray` | 前 3 個預測位姿 (跟舊節點一樣) |
 
-**什麼時候會停車 (送 0)**: 還沒收到位姿 / 輪速、位姿超過 `pose_timeout` (0.3 s) 沒更新、
-輪速超過 `wheel_timeout`、位姿 1-sigma > `pose_sigma_max` (0.3 m)、`abs_age` > `abs_age_max` (1 s)、
+**什麼時候會停車 (送 0)**: 還沒收到位姿、位姿超過 `pose_timeout` (0.3 s) 沒更新、
+(~~輪速超過 `wheel_timeout`~~ 模型不含輪速後已註解掉)、位姿 1-sigma > `pose_sigma_max` (0.3 m)、`abs_age` > `abs_age_max` (1 s)、
 目標點超過 `path_timeout` 沒更新、路徑走完、**出圍籬**、`hold_topic` 說停 (或斷了超過 `hold_timeout`)。恢復時停超過一個 window (10 x 0.05 s) 就把 MPC 的歷史
 重新用目前狀態填, 不到的話補「停著沒動」。
 
@@ -285,5 +285,12 @@ GT 位姿關掉擾動估計是 0.22 cm (開 0.17 cm) —— 模擬裡模型跟�
 時把穩態偏差吃掉, 沒有不合時不影響。離線測試 (`test/test_offset_free.py`, 受控體多一個每秒往右轉
 0.03 rad、往左滑 0.5 cm/s 的擾動, v_max 0.45): 估計關 RMS 0.34 cm, 估計開 0.12 cm, 沒擾動 0.11 cm;
 估到的擾動跟設定值一樣。CSV 多三欄 `dist_vfwd, dist_vlat, dist_wz` (估到的擾動, 每秒)。多一次模型計算, 每週期約 +5 ms。
+
+**h4_mixed_track 的 A/B (2026-11-24, 無輪速模型, Isaac + 融合定位, GT 量誤差)**:
+* 蛇行 (約 0.45 Hz 左右擺) 是 `du` 權重太小造成的, 不是擾動估計: 擾動估計開著時, `du` 0.5 / 1.5 的圓弧中段差速擺動
+  2.4~2.7 rad/s、航向 RMS 5.5~6.0°; `du` 5.0 降到 1.25 rad/s、3.8°。(0.5 -> 1.5 沒有效果, 要調到 5.0 才有。)
+* `du` 5.0 下擾動估計開 / 關 (各 4 圈): 循跡 RMS 1.38 / 1.44 cm、p95 2.67 / 2.91 cm、直線偏移 +0.08 / +0.61 cm
+  (開著把固定偏差吃掉); 代價是指令較抖: 每步差速變化 0.33 / 0.23 rad/s、航向 3.8 / 3.4°。所以維持預設開。
+* 這個模型在閉迴路估到的 yaw rate 差穩定在約 +0.043 rad/s (融合位姿 + vy 給 0), 偶爾 (1.4%) 碰到上限 0.1。
 * vy 給 0: 動態模型的輸入有 vy, GT 微分出來的側向速度 RMS 只有 0.9 cm/s, 影響很小。
 * 實體車的場地地圖與路徑 CSV 都還沒有。

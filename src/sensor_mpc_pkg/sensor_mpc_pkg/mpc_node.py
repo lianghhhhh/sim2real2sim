@@ -2,7 +2,7 @@
 
 跟 mlp_control_pkg/car_control_node.py 同一套 MPC (模型、solver、參考點的建法都直接 import
 那邊的), 差在:
-  * 狀態來自 SensorStateNode (感測器定位 + 輪速回授), 不是 Isaac 的 /odom
+  * 狀態來自 SensorStateNode (感測器定位; 輪速回授已不進狀態), 不是 Isaac 的 /odom
   * 目標點來自 path_tracker (ROS 節點), 不是 Isaac 裡的 ScriptNode; 航向是絕對值
     (要吃 Isaac 的 /nearest_curve_point 做 A/B 就 path_heading_relative:=true)
   * 定位不可信 (位姿 / 輪速斷、sigma 太大、絕對量測斷太久) 或路徑走完就送 0 停車;

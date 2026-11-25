@@ -1,21 +1,23 @@
 """MPC 用的動態模型 (dynamic_predictor 訓練出來的 MLP) 與 acados solver。
 
 模型格式 (要跟 dynamic_predictor/utils.py 一模一樣, 重新訓練改了這些就要一起改):
-  * 狀態 STATE (NS = 10):  [x, y, theta, vx, vy, wz, wFL, wFR, wRL, wRR]
+  * 狀態 STATE (NS = 6):  [x, y, theta, vx, vy, wz]
       x, y, theta = /odom 的世界座標位姿 (theta 不取負號, 在節點裡 unwrap 成連續的)
       vx, vy, wz  = /odom 的車體速度 (kros_car 車頭朝 +x, 不翻號)
-      wXX         = /joint_states 的輪速 (rad/s)
+      # 舊版 (NS = 10) 狀態後面還有四輪輪速 wFL, wFR, wRL, wRR (/joint_states, rad/s);
+      # 2026-11-23 模型改成不含輪速 (dynamic_predictor/utils.py 的 STATE_COLS 註解掉了)
   * 控制 (NU = 2): [左輪, 右輪] 輪速指令 (rad/s), 前後同側相同
-  * 模型輸入: SEQ = 10 步, 每步 NF = 19 個特徵
-        [控制 2, 絕對狀態 7 (vx, vy, wz, 4 輪速; 不含 x, y, theta), 跟前一步的差 10]
+  * 模型輸入: SEQ = 10 步, 每步 NF = 11 個特徵
+        [控制 2, 絕對狀態 3 (vx, vy, wz; 不含 x, y, theta), 跟前一步的差 6]
+        # 舊版: NF = 19 = [控制 2, 絕對狀態 7 (vx, vy, wz, 4 輪速), 差 10]
     「差」的位置分量是前一步車體座標下的 (前進, 左側) —— BODY_FRAME_CONVENTION 'A':
         forward = cos(th)*dx + sin(th)*dy,  lateral = -sin(th)*dx + cos(th)*dy
     window 第一步的差 = 0 (跟 make_delta_buffer 一樣)
-  * 模型輸出: 下一步的差 (10), 同樣是車體座標
+  * 模型輸出: 下一步的差 (6), 同樣是車體座標   # 舊版 10
   * 時間步 DT = 0.05 s (模擬時間)
 
 MPC 的狀態是「擴增狀態」: 最近 10 步的狀態 + 最近 9 步的控制
-    x_aug = [STATE_{k-9}, ..., STATE_k, U_{k-9}, ..., U_{k-1}]   (NX = 118)
+    x_aug = [STATE_{k-9}, ..., STATE_k, U_{k-9}, ..., U_{k-1}]   (NX = 78; 舊版有輪速時 118)
 這一步的控制 u = U_k 是決策變數, 跟歷史湊成完整的 10 步 window。
 """
 import json
@@ -33,13 +35,14 @@ from mlp_control_pkg.car_dynamic_model import CarDynamicModel
 torch.backends.mkldnn.enabled = False
 
 SEQ = 10                          # 模型看幾步歷史
-NS = 10                           # 每步狀態維度
+# NS = 10                         # 每步狀態維度 (舊版: 含四輪輪速)
+NS = 6                            # 每步狀態維度 [x, y, theta, vx, vy, wz] (不含輪速)
 NU = 2                            # 控制維度 (左, 右)
 N_ABS = NS - 3                    # 絕對狀態特徵 = 去掉 x, y, theta
-NF = NU + N_ABS + NS              # 每步特徵 19
-NX = SEQ * NS + (SEQ - 1) * NU    # 擴增狀態 118
-CUR = slice((SEQ - 1) * NS, SEQ * NS)          # 目前狀態在擴增狀態裡的位置 (90:100)
-PREV_U = slice(NX - NU, NX)                    # 上一步的控制 (116:118)
+NF = NU + N_ABS + NS              # 每步特徵 11 (舊版 19)
+NX = SEQ * NS + (SEQ - 1) * NU    # 擴增狀態 78 (舊版 118)
+CUR = slice((SEQ - 1) * NS, SEQ * NS)          # 目前狀態在擴增狀態裡的位置 (54:60; 舊版 90:100)
+PREV_U = slice(NX - NU, NX)                    # 上一步的控制 (76:78; 舊版 116:118)
 I_X, I_Y, I_TH, I_VX, I_VY, I_WZ = range(6)
 RPM = 2.0 * math.pi / 60.0
 
