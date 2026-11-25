@@ -114,6 +114,11 @@ private:
   std::chrono::steady_clock::time_point wheel_io_start_{};
   bool wheel_drive_blocked_{false};
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr wheel_feedback_pub_;
+  // Clock for the /wheel_feedback stamps. It must be the ROS clock of the
+  // hardware node (the one every other node uses): the component's own
+  // get_clock() is a steady clock, whose stamps cannot be compared with
+  // /imu or /scan.
+  rclcpp::Clock::SharedPtr wheel_stamp_clock_;
 };
 
 }  // namespace kros_car

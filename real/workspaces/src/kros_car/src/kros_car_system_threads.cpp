@@ -63,7 +63,7 @@ void KrosCarSystem::wheel_handle_line(const std::string & line)
   }
 
   const auto now_steady = std::chrono::steady_clock::now();
-  const rclcpp::Time now_ros = get_clock()->now();
+  const rclcpp::Time now_ros = wheel_stamp_clock_->now();
   // Time the frame was sent, on the host clock, without the USB jitter.
   const double sent_s = wheel_clock_mapper_.update(frame.esp_ms, now_ros.seconds());
 

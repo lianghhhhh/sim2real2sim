@@ -38,7 +38,7 @@ The wheel motors run in their built-in **speed loop**. The ESP32 firmware (`wild
 | `/joint_command` | `sensor_msgs/msg/JointState` | sub | Per-wheel speed command, when `wheel_velocity_controller` is active. Wheel speed [rad/s] in `velocity`, looked up by joint name |
 | `/base_controller/odom` | `nav_msgs/msg/Odometry` | pub | Wheel odometry from the measured wheel positions; no `odom -> base_link` TF is published by the controller |
 | `/joint_states` | `sensor_msgs/msg/JointState` | pub | All joints at the controller rate. Wheels: measured position, velocity and effort |
-| `/wheel_feedback` | `sensor_msgs/msg/JointState` | pub | Wheel position, velocity and effort, one message per feedback line from the ESP32 (50 Hz), stamped with the time the ESP32 sent it |
+| `/wheel_feedback` | `sensor_msgs/msg/JointState` | pub | Wheel position, velocity and effort, one message per feedback line from the ESP32 (50 Hz), stamped on the ROS clock with the time the ESP32 sent it (only the wheels that answered are in each message) |
 
 ### Wheel feedback
 

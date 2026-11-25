@@ -224,7 +224,11 @@ hardware_interface::CallbackReturn KrosCarSystem::on_activate(
     return CallbackReturn::ERROR;
   }
 
+  // Stamp /wheel_feedback on the ROS clock (system time, or /clock with
+  // use_sim_time). Without the hardware node, system time is the same clock.
+  wheel_stamp_clock_ = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
   if (auto node = get_node()) {
+    wheel_stamp_clock_ = node->get_clock();
     wheel_feedback_pub_ = node->create_publisher<sensor_msgs::msg::JointState>(
       "/wheel_feedback", rclcpp::SensorDataQoS());
   } else {
