@@ -54,6 +54,7 @@ def _nav2_and_manager(context):
     gc['obstacle_layer']['scan']['topic'] = lc('scan_topic')
     if lc('robot_radius'):
         gc['robot_radius'] = float(lc('robot_radius'))
+    robot_radius = float(gc['robot_radius'])
     for node in ('nav_map_server', 'planner_server', 'lifecycle_manager_nav_mpc'):
         nav2[node]['ros__parameters']['use_sim_time'] = use_sim_time
     gc['use_sim_time'] = use_sim_time
@@ -75,8 +76,16 @@ def _nav2_and_manager(context):
         'events_csv': lc('events_csv'),
         'align_heading': lc('align_heading').lower() in ('true', '1'),
         'align_tolerance_deg': float(lc('align_tolerance_deg')),
+        'robot_radius': robot_radius,
+        'start_align_deg': float(lc('start_align_deg')),
     })
-    hyb = nav2['planner_server']['ros__parameters'].get(lc('planner_id'), {})
+    # 路線驗證的門檻跟著規劃用的半徑走 (預設 = 半徑 - 0.1 m 的遲滯, 見 nav_manager_node.py 檔頭)。
+    # 只改 robot_radius 不改這個的話: 半徑 0.35 時驗證也是 0.35, 剛規劃好、貼著膨脹區邊走的路線一出發就被判擋住。
+    if lc('validate_clearance'):
+        mgr['validate_clearance'] = float(lc('validate_clearance'))
+    elif lc('robot_radius'):
+        mgr['validate_clearance'] = round(max(0.0, robot_radius - 0.1), 3)
+    hyb =nav2['planner_server']['ros__parameters'].get(lc('planner_id'), {})
     mgr['planner_downsample'] = int(hyb.get('downsampling_factor', 1)) if hyb.get('downsample_costmap') else 1
 
     return [
@@ -109,7 +118,13 @@ def generate_launch_description():
         DeclareLaunchArgument('minimum_turning_radius', default_value='',
                               description='Hybrid-A* 的最小轉彎半徑 (m); 空 = nav2_params.yaml (0.5)'),
         DeclareLaunchArgument('robot_radius', default_value='',
-                              description='costmap 的車子半徑 (m); 空 = nav2_params.yaml (0.45)'),
+                              description='costmap 的車子半徑 (m); 空 = nav2_params.yaml (0.45)。'
+                                          '實體車 lab 用 0.40 (0.45 會把 ~1 m 寬的通道封死)'),
+        DeclareLaunchArgument('validate_clearance', default_value='',
+                              description='路線驗證的門檻 (m); 空 = 有給 robot_radius 就用 robot_radius - 0.1, '
+                                          '否則 nav_mpc.yaml (0.35)'),
+        DeclareLaunchArgument('start_align_deg', default_value='45.0',
+                              description='新路線起點方向跟車頭差超過這個 (度) 就先原地轉再走; 0 = 不檢查'),
         DeclareLaunchArgument('obstacle_check', default_value='true'),
         DeclareLaunchArgument('align_heading', default_value='true',
                               description='到終點後原地旋轉對準目標方向'),

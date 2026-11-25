@@ -141,6 +141,14 @@ def generate_launch_description():
                               description='實體車用 gyro'),
         DeclareLaunchArgument('fusion_sigma_acc', default_value='0.05',
                               description='fus_ 的加速度過程雜訊; complementary 模式要 0.35'),
+        # 2026-11-23 實體車 lab.yaml: LiDAR 正常追蹤時回報的 sigma 中位數 2.3~3.4 mm (p90 最高 4.4 mm),
+        # 比模擬的 ~1.5 mm 大, 預設 2.5 mm 會擋掉 36~100% 的量測 (融合等不到起點 -> 沒有 map TF)。
+        # 追丟時是 14.5 mm (模擬) / 70 mm (實體車全域定位中)。
+        # 2026-11-24 實體車給 0.006 不夠: 配準殘差 4.9 cm (sigma 跟殘差成正比) 時 sigma ~6.6 mm, 融合擋掉 68%
+        # (sigma擋 1313 / 用 625), 車子停著的位置一直超標 -> MPC「絕對量測斷了」停 103 s。改 0.012 後 0 s。
+        # 實體車給 0.012: 仍遠低於追丟的 70 mm (另外還有 lidar_lock_* 的鎖死偵測與融合的卡方閘門)。
+        DeclareLaunchArgument('fusion_lidar_sigma_max', default_value='0.0025',
+                              description='fus_ 擋 LiDAR 量測的 sigma 上限 (m); 0 = 不擋'),
         DeclareLaunchArgument('wheel_scale', default_value='1.0',
                               description='whl_ / fus_ 的有效輪半徑比例 (實際輪徑 / 節點的 wheel_radius 0.051356)'),
         # 絕對量測的常數延遲 (s), 加回量測的時戳上 (見 car_loc_fusion/sources.py 「時鐘偏移」那段:
@@ -151,6 +159,20 @@ def generate_launch_description():
                               description='8 台相機車框的常數延遲 (s), fus_ 與 mc_ 都吃'),
         DeclareLaunchArgument('lidar_extra_delay', default_value='0.0',
                               description='/lidar_loc/odom 的常數延遲 (s)'),
+        # 2026-11-19 實體車 lab.yaml: 正確位姿的穿牆比例就有 4.7~10.9% (地圖的牆是稀疏的雜物點,
+        # 射線從縫隙穿過去), 預設 3% 會把每個全域定位的解都擋掉、追蹤中也一直判成鎖死。
+        # 實體車給 0.0 關掉 (lidar_localizer 退回只看殘差 / inlier)。
+        DeclareLaunchArgument('lidar_lock_see_through', default_value='0.03',
+                              description='lidar_localizer 的 lock_see_through; 0 = 不檢查穿牆射線'),
+        # 2026-11-23 實體車 lab.yaml: 正確位姿的殘差 2.7~5 cm (11/19 是 0.5~2 cm, 現場跟建圖時不一樣),
+        # 預設 2.5 cm 在 2 分鐘內誤判鎖死 75 次 -> 每次整張地圖重新全域定位 + 10 幀 sigma 5 cm
+        # -> 融合擋掉 -> MPC「絕對量測斷了」停了 47 s。實體車給 lidar_lock_residual:=0.06
+        # lidar_lock_inlier:=0.80: 那 75 次只剩開機頭 2 秒 3 次 (殘差 7.2~8.0 cm, 位置真的偏了 0.6 m)。
+        # 模擬裡真的鎖到 180 度是 inlier 52~77%, 0.80 仍抓得到。
+        DeclareLaunchArgument('lidar_lock_residual', default_value='0.025',
+                              description='lidar_localizer 的 lock_residual (m): 殘差連續超過就判鎖死'),
+        DeclareLaunchArgument('lidar_lock_inlier', default_value='0.85',
+                              description='lidar_localizer 的 lock_inlier: inlier 連續低於就判鎖死'),
     ]
     use_sim_time = LaunchConfiguration('use_sim_time')
     initial_pose = ParameterValue(
@@ -198,6 +220,12 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'map_path': LaunchConfiguration('map_path'),
             'publish_tf': owns_tf('lidar'),
+            'lock_see_through': ParameterValue(
+                LaunchConfiguration('lidar_lock_see_through'), value_type=float),
+            'lock_residual': ParameterValue(
+                LaunchConfiguration('lidar_lock_residual'), value_type=float),
+            'lock_inlier': ParameterValue(
+                LaunchConfiguration('lidar_lock_inlier'), value_type=float),
         }])
 
     imu = Node(
@@ -263,6 +291,8 @@ def generate_launch_description():
                 LaunchConfiguration('multicam'), value_type=bool),
             'lidar_enabled': ParameterValue(
                 LaunchConfiguration('lidar'), value_type=bool),
+            'lidar_sigma_max': ParameterValue(
+                LaunchConfiguration('fusion_lidar_sigma_max'), value_type=float),
             'bbox_extra_delay': ParameterValue(
                 LaunchConfiguration('bbox_extra_delay'), value_type=float),
             'lidar_extra_delay': ParameterValue(

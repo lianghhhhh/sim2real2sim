@@ -64,6 +64,8 @@ nav_mpc_manager:
     costmap_topic: /global_costmap/costmap
     validate_distance: 4.0
     validate_clearance: 0.35               # m, 路線離障礙物格子小於這個才重新規劃 (規劃用 0.45, 留 0.1 的遲滯)
+                                           # launch 給了 robot_radius 就自動改成 robot_radius - 0.1 (或用 validate_clearance:= 指定)
+    robot_radius: 0.45                     # 只用在提示訊息 / 快照; launch 自動填 nav2_params.yaml (或 robot_radius:=) 的值
     # ---- 終點對準車頭 (原地旋轉, 見 nav_manager_node.py 檔頭) ----
     align_heading: true
     spin_topic: /nav_mpc/spin
@@ -76,4 +78,7 @@ nav_mpc_manager:
     align_timeout: 20.0
     align_clearance: 0.30
     align_only_dist: 0.2                   # m, 目標離車子這麼近就不規劃, 直接原地轉 (在 Foxglove 車子上點一個方向 = 只轉車頭)
+    # ---- 起點方向檢查: 路線起點方向跟車頭差太多 (Grid 不管車頭方向) 就先原地轉再發路線 ----
+    start_align_deg: 45.0                  # 度; 0 = 不檢查 (launch 參數 start_align_deg 會蓋掉)
+    start_heading_dist: 0.3                # m, 路線起點方向 = 起點 -> 往前這麼遠那一點
     events_csv: ''
